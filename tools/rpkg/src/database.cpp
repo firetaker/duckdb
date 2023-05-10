@@ -40,12 +40,8 @@ static bool CastRstringToVarchar(Vector &source, Vector &result, idx_t count, Ca
 	for (auto it = confignames.begin(); it != confignames.end(); ++it) {
 		std::string key = *it;
 		std::string val = cpp11::as_cpp<std::string>(configsexp[key]);
-		auto config_property = DBConfig::GetOptionByName(key);
-		if (!config_property) {
-			cpp11::stop("rapi_startup: Unrecognized configuration property '%s'", key.c_str());
-		}
 		try {
-			config.SetOption(*config_property, Value(val));
+			config.SetOptionByName(key, Value(val));
 		} catch (std::exception &e) {
 			cpp11::stop("rapi_startup: Failed to set configuration option: %s", e.what());
 		}
@@ -56,10 +52,10 @@ static bool CastRstringToVarchar(Vector &source, Vector &result, idx_t count, Ca
 	try {
 		wrapper = new DBWrapper();
 
-		auto data = make_unique<ArrowScanReplacementData>();
+		auto data = make_uniq<ArrowScanReplacementData>();
 		data->wrapper = wrapper;
 		config.replacement_scans.emplace_back(ArrowScanReplacement, std::move(data));
-		wrapper->db = make_unique<DuckDB>(dbdirchar, &config);
+		wrapper->db = make_uniq<DuckDB>(dbdirchar, &config);
 	} catch (std::exception &e) {
 		cpp11::stop("rapi_startup: Failed to open database: %s", e.what());
 	}

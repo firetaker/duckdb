@@ -8,8 +8,7 @@
 
 #pragma once
 
-#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
-#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/main/extension_util.hpp"
 #include "json_common.hpp"
 
 namespace duckdb {
@@ -18,6 +17,9 @@ class TableRef;
 struct ReplacementScanData;
 class CastFunctionSet;
 struct CastParameters;
+struct CastLocalStateParameters;
+struct JSONScanInfo;
+class BuiltinFunctions;
 
 // Scalar function stuff
 struct JSONReadFunctionData : public FunctionData {
@@ -51,9 +53,11 @@ public:
 
 struct JSONFunctionLocalState : public FunctionLocalState {
 public:
+	explicit JSONFunctionLocalState(Allocator &allocator);
 	explicit JSONFunctionLocalState(ClientContext &context);
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
 	                                           FunctionData *bind_data);
+	static unique_ptr<FunctionLocalState> InitCastLocalState(CastLocalStateParameters &parameters);
 	static JSONFunctionLocalState &ResetAndGet(ExpressionState &state);
 
 public:
@@ -62,36 +66,45 @@ public:
 
 class JSONFunctions {
 public:
-	static vector<CreateScalarFunctionInfo> GetScalarFunctions();
-	static vector<CreateTableFunctionInfo> GetTableFunctions();
+	static vector<ScalarFunctionSet> GetScalarFunctions();
+	static vector<PragmaFunctionSet> GetPragmaFunctions();
+	static vector<TableFunctionSet> GetTableFunctions();
 	static unique_ptr<TableRef> ReadJSONReplacement(ClientContext &context, const string &table_name,
 	                                                ReplacementScanData *data);
-	static void RegisterCastFunctions(CastFunctionSet &casts);
+	static TableFunction GetReadJSONTableFunction(shared_ptr<JSONScanInfo> function_info);
+	static CopyFunction GetJSONCopyFunction();
+	static void RegisterSimpleCastFunctions(CastFunctionSet &casts);
+	static void RegisterJSONCreateCastFunctions(CastFunctionSet &casts);
+	static void RegisterJSONTransformCastFunctions(CastFunctionSet &casts);
 
 private:
 	// Scalar functions
-	static CreateScalarFunctionInfo GetExtractFunction();
-	static CreateScalarFunctionInfo GetExtractStringFunction();
+	static ScalarFunctionSet GetExtractFunction();
+	static ScalarFunctionSet GetExtractStringFunction();
 
-	static CreateScalarFunctionInfo GetArrayFunction();
-	static CreateScalarFunctionInfo GetObjectFunction();
-	static CreateScalarFunctionInfo GetToJSONFunction();
-	static CreateScalarFunctionInfo GetArrayToJSONFunction();
-	static CreateScalarFunctionInfo GetRowToJSONFunction();
-	static CreateScalarFunctionInfo GetMergePatchFunction();
+	static ScalarFunctionSet GetArrayFunction();
+	static ScalarFunctionSet GetObjectFunction();
+	static ScalarFunctionSet GetToJSONFunction();
+	static ScalarFunctionSet GetArrayToJSONFunction();
+	static ScalarFunctionSet GetRowToJSONFunction();
+	static ScalarFunctionSet GetMergePatchFunction();
 
-	static CreateScalarFunctionInfo GetStructureFunction();
-	static CreateScalarFunctionInfo GetTransformFunction();
-	static CreateScalarFunctionInfo GetTransformStrictFunction();
+	static ScalarFunctionSet GetStructureFunction();
+	static ScalarFunctionSet GetTransformFunction();
+	static ScalarFunctionSet GetTransformStrictFunction();
 
-	static CreateScalarFunctionInfo GetArrayLengthFunction();
-	static CreateScalarFunctionInfo GetContainsFunction();
-	static CreateScalarFunctionInfo GetKeysFunction();
-	static CreateScalarFunctionInfo GetTypeFunction();
-	static CreateScalarFunctionInfo GetValidFunction();
+	static ScalarFunctionSet GetArrayLengthFunction();
+	static ScalarFunctionSet GetContainsFunction();
+	static ScalarFunctionSet GetKeysFunction();
+	static ScalarFunctionSet GetTypeFunction();
+	static ScalarFunctionSet GetValidFunction();
+	static ScalarFunctionSet GetSerializeSqlFunction();
+	static ScalarFunctionSet GetDeserializeSqlFunction();
+
+	static PragmaFunctionSet GetExecuteJsonSerializedSqlPragmaFunction();
 
 	template <class FUNCTION_INFO>
-	static void AddAliases(vector<string> names, FUNCTION_INFO fun, vector<FUNCTION_INFO> &functions) {
+	static void AddAliases(const vector<string> &names, FUNCTION_INFO fun, vector<FUNCTION_INFO> &functions) {
 		for (auto &name : names) {
 			fun.name = name;
 			functions.push_back(fun);
@@ -100,12 +113,13 @@ private:
 
 private:
 	// Table functions
-	static CreateTableFunctionInfo GetReadJSONObjectsFunction();
-	static CreateTableFunctionInfo GetReadNDJSONObjectsFunction();
-	static CreateTableFunctionInfo GetReadJSONFunction();
-	static CreateTableFunctionInfo GetReadNDJSONFunction();
-	static CreateTableFunctionInfo GetReadJSONAutoFunction();
-	static CreateTableFunctionInfo GetReadNDJSONAutoFunction();
+	static TableFunctionSet GetReadJSONObjectsFunction();
+	static TableFunctionSet GetReadNDJSONObjectsFunction();
+	static TableFunctionSet GetReadJSONFunction();
+	static TableFunctionSet GetReadNDJSONFunction();
+	static TableFunctionSet GetReadJSONAutoFunction();
+	static TableFunctionSet GetReadNDJSONAutoFunction();
+	static TableFunctionSet GetExecuteJsonSerializedSqlFunction();
 };
 
 } // namespace duckdb

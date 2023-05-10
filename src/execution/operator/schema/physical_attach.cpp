@@ -1,9 +1,12 @@
 #include "duckdb/execution/operator/schema/physical_attach.hpp"
-#include "duckdb/parser/parsed_data/attach_info.hpp"
+
 #include "duckdb/catalog/catalog.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/database_path_and_type.hpp"
+#include "duckdb/main/extension_helper.hpp"
+#include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 
 namespace duckdb {
@@ -11,24 +14,9 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 // Source
 //===--------------------------------------------------------------------===//
-class AttachSourceState : public GlobalSourceState {
-public:
-	AttachSourceState() : finished(false) {
-	}
 
-	bool finished;
-};
-
-unique_ptr<GlobalSourceState> PhysicalAttach::GetGlobalSourceState(ClientContext &context) const {
-	return make_unique<AttachSourceState>();
-}
-
-void PhysicalAttach::GetData(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
-                             LocalSourceState &lstate) const {
-	auto &state = (AttachSourceState &)gstate;
-	if (state.finished) {
-		return;
-	}
+SourceResultType PhysicalAttach::GetData(ExecutionContext &context, DataChunk &chunk,
+                                         OperatorSourceInput &input) const {
 	// parse the options
 	auto &config = DBConfig::GetConfig(context.client);
 	AccessMode access_mode = config.options.access_mode;
@@ -55,11 +43,29 @@ void PhysicalAttach::GetData(ExecutionContext &context, DataChunk &chunk, Global
 			unrecognized_option = entry.first;
 		}
 	}
+	auto &db = DatabaseInstance::GetDatabase(context.client);
+	if (type.empty()) {
+		// try to extract type from path
+		auto path_and_type = DBPathAndType::Parse(info->path, config);
+		type = path_and_type.type;
+		info->path = path_and_type.path;
+	}
+
+	if (type.empty() && !unrecognized_option.empty()) {
+		throw BinderException("Unrecognized option for attach \"%s\"", unrecognized_option);
+	}
+
+	// if we are loading a database type from an extension - check if that extension is loaded
+	if (!type.empty()) {
+		if (!db.ExtensionIsLoaded(type)) {
+			ExtensionHelper::LoadExternalExtension(context.client, type);
+		}
+	}
 
 	// attach the database
-	auto name = info->name;
+	auto &name = info->name;
 	const auto &path = info->path;
-	auto &db = DatabaseInstance::GetDatabase(context.client);
+
 	if (name.empty()) {
 		name = AttachedDatabase::ExtractDatabaseName(path);
 	}
@@ -68,26 +74,12 @@ void PhysicalAttach::GetData(ExecutionContext &context, DataChunk &chunk, Global
 	if (existing_db) {
 		throw BinderException("Database \"%s\" is already attached with alias \"%s\"", path, existing_db->GetName());
 	}
-
-	unique_ptr<AttachedDatabase> new_db;
-	if (type.empty()) {
-		if (!unrecognized_option.empty()) {
-			throw BinderException("Unrecognized option for attach \"%s\"", unrecognized_option);
-		}
-		new_db = make_unique<AttachedDatabase>(db, Catalog::GetSystemCatalog(db), name, path, access_mode);
-	} else {
-		// attach an extension database
-		auto entry = config.storage_extensions.find(type);
-		if (entry == config.storage_extensions.end()) {
-			throw BinderException("Unrecognized storage type \"%s\"", type);
-		}
-		new_db =
-		    make_unique<AttachedDatabase>(db, Catalog::GetSystemCatalog(db), *entry->second, name, *info, access_mode);
-	}
+	auto new_db = db.CreateAttachedDatabase(*info, type, access_mode);
 	new_db->Initialize();
 
 	db_manager.AddDatabase(context.client, std::move(new_db));
-	state.finished = true;
+
+	return SourceResultType::FINISHED;
 }
 
 } // namespace duckdb

@@ -5,29 +5,60 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/storage/arena_allocator.hpp"
 #include "duckdb/execution/index/art/art_key.hpp"
+#include "duckdb/execution/index/art/prefix_segment.hpp"
+#include "duckdb/execution/index/art/leaf_segment.hpp"
+#include "duckdb/execution/index/art/prefix.hpp"
+#include "duckdb/execution/index/art/leaf.hpp"
+#include "duckdb/execution/index/art/node4.hpp"
+#include "duckdb/execution/index/art/node16.hpp"
+#include "duckdb/execution/index/art/node48.hpp"
+#include "duckdb/execution/index/art/node256.hpp"
+#include "duckdb/execution/index/art/iterator.hpp"
 #include "duckdb/common/types/conflict_manager.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
 
 #include <algorithm>
 #include <cstring>
-#include <ctgmath>
 
 namespace duckdb {
 
-ART::ART(const vector<column_t> &column_ids, TableIOManager &table_io_manager,
-         const vector<unique_ptr<Expression>> &unbound_expressions, IndexConstraintType constraint_type,
-         AttachedDatabase &db, bool track_memory, idx_t block_id, idx_t block_offset)
+struct ARTIndexScanState : public IndexScanState {
 
-    : Index(db, IndexType::ART, table_io_manager, column_ids, unbound_expressions, constraint_type, track_memory) {
+	//! Scan predicates (single predicate scan or range scan)
+	Value values[2];
+	//! Expressions of the scan predicates
+	ExpressionType expressions[2];
+	bool checked = false;
+	//! All scanned row IDs
+	vector<row_t> result_ids;
+	Iterator iterator;
+};
+
+ART::ART(const vector<column_t> &column_ids, TableIOManager &table_io_manager,
+         const vector<unique_ptr<Expression>> &unbound_expressions, const IndexConstraintType constraint_type,
+         AttachedDatabase &db, const idx_t block_id, const idx_t block_offset)
+
+    : Index(db, IndexType::ART, table_io_manager, column_ids, unbound_expressions, constraint_type) {
 
 	if (!Radix::IsLittleEndian()) {
 		throw NotImplementedException("ART indexes are not supported on big endian architectures");
 	}
 
+	// initialize all allocators
+	allocators.emplace_back(make_uniq<FixedSizeAllocator>(sizeof(PrefixSegment), buffer_manager.GetBufferAllocator()));
+	allocators.emplace_back(make_uniq<FixedSizeAllocator>(sizeof(LeafSegment), buffer_manager.GetBufferAllocator()));
+	allocators.emplace_back(make_uniq<FixedSizeAllocator>(sizeof(Leaf), buffer_manager.GetBufferAllocator()));
+	allocators.emplace_back(make_uniq<FixedSizeAllocator>(sizeof(Node4), buffer_manager.GetBufferAllocator()));
+	allocators.emplace_back(make_uniq<FixedSizeAllocator>(sizeof(Node16), buffer_manager.GetBufferAllocator()));
+	allocators.emplace_back(make_uniq<FixedSizeAllocator>(sizeof(Node48), buffer_manager.GetBufferAllocator()));
+	allocators.emplace_back(make_uniq<FixedSizeAllocator>(sizeof(Node256), buffer_manager.GetBufferAllocator()));
+
 	// set the root node of the tree
-	tree = nullptr;
+	tree = make_uniq<Node>();
 	if (block_id != DConstants::INVALID_INDEX) {
-		tree = Node::Deserialize(*this, block_id, block_offset);
-		Verify();
+		tree->buffer_id = block_id;
+		tree->offset = block_offset;
+		tree->Deserialize(*this);
 	}
 	serialized_data_pointer = BlockPointer(block_id, block_offset);
 
@@ -55,33 +86,28 @@ ART::ART(const vector<column_t> &column_ids, TableIOManager &table_io_manager,
 }
 
 ART::~ART() {
-	if (!tree) {
-		return;
-	}
-	Verify();
-	if (track_memory) {
-		buffer_manager.DecreaseUsedMemory(memory_size);
-	}
-	Node::Delete(tree);
-	tree = nullptr;
+	tree->Reset();
 }
 
 //===--------------------------------------------------------------------===//
 // Initialize Predicate Scans
 //===--------------------------------------------------------------------===//
 
-unique_ptr<IndexScanState> ART::InitializeScanSinglePredicate(Transaction &transaction, Value value,
-                                                              ExpressionType expression_type) {
-	auto result = make_unique<ARTIndexScanState>();
+unique_ptr<IndexScanState> ART::InitializeScanSinglePredicate(const Transaction &transaction, const Value &value,
+                                                              const ExpressionType expression_type) {
+	// initialize point lookup
+	auto result = make_uniq<ARTIndexScanState>();
 	result->values[0] = value;
 	result->expressions[0] = expression_type;
 	return std::move(result);
 }
 
-unique_ptr<IndexScanState> ART::InitializeScanTwoPredicates(Transaction &transaction, Value low_value,
-                                                            ExpressionType low_expression_type, Value high_value,
-                                                            ExpressionType high_expression_type) {
-	auto result = make_unique<ARTIndexScanState>();
+unique_ptr<IndexScanState> ART::InitializeScanTwoPredicates(const Transaction &transaction, const Value &low_value,
+                                                            const ExpressionType low_expression_type,
+                                                            const Value &high_value,
+                                                            const ExpressionType high_expression_type) {
+	// initialize range lookup
+	auto result = make_uniq<ARTIndexScanState>();
 	result->values[0] = low_value;
 	result->expressions[0] = low_expression_type;
 	result->values[1] = high_value;
@@ -94,7 +120,7 @@ unique_ptr<IndexScanState> ART::InitializeScanTwoPredicates(Transaction &transac
 //===--------------------------------------------------------------------===//
 
 template <class T>
-static void TemplatedGenerateKeys(ArenaAllocator &allocator, Vector &input, idx_t count, vector<Key> &keys) {
+static void TemplatedGenerateKeys(ArenaAllocator &allocator, Vector &input, idx_t count, vector<ARTKey> &keys) {
 	UnifiedVectorFormat idata;
 	input.ToUnifiedFormat(count, idata);
 
@@ -103,13 +129,16 @@ static void TemplatedGenerateKeys(ArenaAllocator &allocator, Vector &input, idx_
 	for (idx_t i = 0; i < count; i++) {
 		auto idx = idata.sel->get_index(i);
 		if (idata.validity.RowIsValid(idx)) {
-			Key::CreateKey<T>(allocator, keys[i], input_data[idx]);
+			ARTKey::CreateARTKey<T>(allocator, input.GetType(), keys[i], input_data[idx]);
+		} else {
+			// we need to possibly reset the former key value in the keys vector
+			keys[i] = ARTKey();
 		}
 	}
 }
 
 template <class T>
-static void ConcatenateKeys(ArenaAllocator &allocator, Vector &input, idx_t count, vector<Key> &keys) {
+static void ConcatenateKeys(ArenaAllocator &allocator, Vector &input, idx_t count, vector<ARTKey> &keys) {
 	UnifiedVectorFormat idata;
 	input.ToUnifiedFormat(count, idata);
 
@@ -121,16 +150,16 @@ static void ConcatenateKeys(ArenaAllocator &allocator, Vector &input, idx_t coun
 		if (!keys[i].Empty()) {
 			if (!idata.validity.RowIsValid(idx)) {
 				// this column entry is NULL, set whole key to NULL
-				keys[i] = Key();
+				keys[i] = ARTKey();
 			} else {
-				auto other_key = Key::CreateKey<T>(allocator, input_data[idx]);
-				keys[i].ConcatenateKey(allocator, other_key);
+				auto other_key = ARTKey::CreateARTKey<T>(allocator, input.GetType(), input_data[idx]);
+				keys[i].ConcatenateARTKey(allocator, other_key);
 			}
 		}
 	}
 }
 
-void ART::GenerateKeys(ArenaAllocator &allocator, DataChunk &input, vector<Key> &keys) {
+void ART::GenerateKeys(ArenaAllocator &allocator, DataChunk &input, vector<ARTKey> &keys) {
 	// generate keys for the first input column
 	switch (input.data[0].GetType().InternalType()) {
 	case PhysicalType::BOOL:
@@ -225,13 +254,13 @@ void ART::GenerateKeys(ArenaAllocator &allocator, DataChunk &input, vector<Key> 
 }
 
 //===--------------------------------------------------------------------===//
-// Construct from sorted data
+// Construct from sorted data (only during CREATE (UNIQUE) INDEX statements)
 //===--------------------------------------------------------------------===//
 
 struct KeySection {
 	KeySection(idx_t start_p, idx_t end_p, idx_t depth_p, data_t key_byte_p)
 	    : start(start_p), end(end_p), depth(depth_p), key_byte(key_byte_p) {};
-	KeySection(idx_t start_p, idx_t end_p, vector<Key> &keys, KeySection &key_section)
+	KeySection(idx_t start_p, idx_t end_p, vector<ARTKey> &keys, KeySection &key_section)
 	    : start(start_p), end(end_p), depth(key_section.depth + 1), key_byte(keys[end_p].data[key_section.depth]) {};
 	idx_t start;
 	idx_t end;
@@ -239,7 +268,7 @@ struct KeySection {
 	data_t key_byte;
 };
 
-void GetChildSections(vector<KeySection> &child_sections, vector<Key> &keys, KeySection &key_section) {
+void GetChildSections(vector<KeySection> &child_sections, vector<ARTKey> &keys, KeySection &key_section) {
 
 	idx_t child_start_idx = key_section.start;
 	for (idx_t i = key_section.start + 1; i <= key_section.end; i++) {
@@ -251,7 +280,7 @@ void GetChildSections(vector<KeySection> &child_sections, vector<Key> &keys, Key
 	child_sections.emplace_back(child_start_idx, key_section.end, keys, key_section);
 }
 
-void Construct(ART &art, vector<Key> &keys, row_t *row_ids, Node *&node, KeySection &key_section,
+bool Construct(ART &art, vector<ARTKey> &keys, row_t *row_ids, Node &node, KeySection &key_section,
                bool &has_constraint) {
 
 	D_ASSERT(key_section.start < keys.size());
@@ -275,40 +304,42 @@ void Construct(ART &art, vector<Key> &keys, row_t *row_ids, Node *&node, KeySect
 		// check for possible constraint violation
 		auto single_row_id = num_row_ids == 1;
 		if (has_constraint && !single_row_id) {
-			throw ConstraintException("New data contains duplicates on indexed column(s)");
+			return false;
 		}
 
 		if (single_row_id) {
-			node = Leaf::New(start_key, prefix_start, row_ids[key_section.start]);
-			art.memory_size += node->MemorySize(art, false);
-			return;
+			Leaf::New(art, node, start_key, prefix_start, row_ids[key_section.start]);
+		} else {
+			Leaf::New(art, node, start_key, prefix_start, row_ids + key_section.start, num_row_ids);
 		}
-		node = Leaf::New(start_key, prefix_start, row_ids + key_section.start, num_row_ids);
-		art.memory_size += node->MemorySize(art, false);
+		return true;
+	}
 
-	} else { // create a new node and recurse
+	// create a new node and recurse
 
-		// we will find at least two child entries of this node, otherwise we'd have reached a leaf
-		vector<KeySection> child_sections;
-		GetChildSections(child_sections, keys, key_section);
+	// we will find at least two child entries of this node, otherwise we'd have reached a leaf
+	vector<KeySection> child_sections;
+	GetChildSections(child_sections, keys, key_section);
 
-		auto node_type = Node::GetTypeBySize(child_sections.size());
-		Node::New(node_type, node);
+	auto node_type = Node::GetARTNodeTypeByCount(child_sections.size());
+	Node::New(art, node, node_type);
 
-		auto prefix_length = key_section.depth - prefix_start;
-		node->prefix = Prefix(start_key, prefix_start, prefix_length);
-		art.memory_size += node->MemorySize(art, false);
+	auto prefix_length = key_section.depth - prefix_start;
+	node.GetPrefix(art).Initialize(art, start_key, prefix_start, prefix_length);
 
-		// recurse on each child section
-		for (auto &child_section : child_sections) {
-			Node *new_child = nullptr;
-			Construct(art, keys, row_ids, new_child, child_section, has_constraint);
-			Node::InsertChild(art, node, child_section.key_byte, new_child);
+	// recurse on each child section
+	for (auto &child_section : child_sections) {
+		Node new_child;
+		auto no_violation = Construct(art, keys, row_ids, new_child, child_section, has_constraint);
+		Node::InsertChild(art, node, child_section.key_byte, new_child);
+		if (!no_violation) {
+			return false;
 		}
 	}
+	return true;
 }
 
-void ART::ConstructFromSorted(idx_t count, vector<Key> &keys, Vector &row_identifiers) {
+bool ART::ConstructFromSorted(idx_t count, vector<ARTKey> &keys, Vector &row_identifiers) {
 
 	// prepare the row_identifiers
 	row_identifiers.Flatten(count);
@@ -316,24 +347,21 @@ void ART::ConstructFromSorted(idx_t count, vector<Key> &keys, Vector &row_identi
 
 	auto key_section = KeySection(0, count - 1, 0, 0);
 	auto has_constraint = IsUnique();
-	Construct(*this, keys, row_ids, this->tree, key_section, has_constraint);
+	return Construct(*this, keys, row_ids, *this->tree, key_section, has_constraint);
 }
 
 //===--------------------------------------------------------------------===//
-// Insert
+// Insert / Verification / Constraint Checking
 //===--------------------------------------------------------------------===//
-
-bool ART::Insert(IndexLock &lock, DataChunk &input, Vector &row_ids) {
+PreservedError ART::Insert(IndexLock &lock, DataChunk &input, Vector &row_ids) {
 
 	D_ASSERT(row_ids.GetType().InternalType() == ROW_TYPE);
 	D_ASSERT(logical_types[0] == input.data[0].GetType());
 
 	// generate the keys for the given input
 	ArenaAllocator arena_allocator(BufferAllocator::Get(db));
-	vector<Key> keys(input.size());
+	vector<ARTKey> keys(input.size());
 	GenerateKeys(arena_allocator, input, keys);
-
-	auto old_memory_size = this->memory_size;
 
 	// get the corresponding row IDs
 	row_ids.Flatten(input.size());
@@ -347,35 +375,32 @@ bool ART::Insert(IndexLock &lock, DataChunk &input, Vector &row_ids) {
 		}
 
 		row_t row_id = row_identifiers[i];
-		if (!Insert(tree, keys[i], 0, row_id)) {
+		if (!Insert(*tree, keys[i], 0, row_id)) {
 			// failed to insert because of constraint violation
 			failed_index = i;
 			break;
 		}
 	}
-	if (failed_index != DConstants::INVALID_INDEX) {
 
-		// failed to insert because of constraint violation: remove previously inserted entries
+	// failed to insert because of constraint violation: remove previously inserted entries
+	if (failed_index != DConstants::INVALID_INDEX) {
 		for (idx_t i = 0; i < failed_index; i++) {
 			if (keys[i].Empty()) {
 				continue;
 			}
 			row_t row_id = row_identifiers[i];
-			Erase(tree, keys[i], 0, row_id);
+			Erase(*tree, keys[i], 0, row_id);
 		}
-		// nothing changed, no need to update the buffer memory size
-		return false;
 	}
 
-	D_ASSERT(old_memory_size <= memory_size);
-	Verify();
-	if (track_memory) {
-		buffer_manager.IncreaseUsedMemory(memory_size - old_memory_size);
+	if (failed_index != DConstants::INVALID_INDEX) {
+		return PreservedError(ConstraintException("PRIMARY KEY or UNIQUE constraint violated: duplicate key \"%s\"",
+		                                          AppendRowError(input, failed_index)));
 	}
-	return true;
+	return PreservedError();
 }
 
-bool ART::Append(IndexLock &lock, DataChunk &appended_data, Vector &row_identifiers) {
+PreservedError ART::Append(IndexLock &lock, DataChunk &appended_data, Vector &row_identifiers) {
 	DataChunk expression_result;
 	expression_result.Initialize(Allocator::DefaultAllocator(), logical_types);
 
@@ -388,31 +413,21 @@ bool ART::Append(IndexLock &lock, DataChunk &appended_data, Vector &row_identifi
 
 void ART::VerifyAppend(DataChunk &chunk) {
 	ConflictManager conflict_manager(VerifyExistenceType::APPEND, chunk.size());
-	LookupValues(chunk, conflict_manager);
+	CheckConstraintsForChunk(chunk, conflict_manager);
 }
 
 void ART::VerifyAppend(DataChunk &chunk, ConflictManager &conflict_manager) {
 	D_ASSERT(conflict_manager.LookupType() == VerifyExistenceType::APPEND);
-	LookupValues(chunk, conflict_manager);
+	CheckConstraintsForChunk(chunk, conflict_manager);
 }
 
-void ART::VerifyAppendForeignKey(DataChunk &chunk) {
-	ConflictManager conflict_manager(VerifyExistenceType::APPEND_FK, chunk.size());
-	LookupValues(chunk, conflict_manager);
-}
+bool ART::InsertToLeaf(Node &leaf_node, const row_t &row_id) {
 
-void ART::VerifyDeleteForeignKey(DataChunk &chunk) {
-	if (!IsUnique()) {
-		return;
-	}
-	ConflictManager conflict_manager(VerifyExistenceType::DELETE_FK, chunk.size());
-	LookupValues(chunk, conflict_manager);
-}
+	auto &leaf = Leaf::Get(*this, leaf_node);
 
-bool ART::InsertToLeaf(Leaf &leaf, row_t row_id) {
 #ifdef DEBUG
 	for (idx_t k = 0; k < leaf.count; k++) {
-		D_ASSERT(leaf.GetRowId(k) != row_id);
+		D_ASSERT(leaf.GetRowId(*this, k) != row_id);
 	}
 #endif
 	if (IsUnique() && leaf.count != 0) {
@@ -422,86 +437,75 @@ bool ART::InsertToLeaf(Leaf &leaf, row_t row_id) {
 	return true;
 }
 
-bool ART::Insert(Node *&node, Key &key, idx_t depth, row_t row_id) {
+bool ART::Insert(Node &node, const ARTKey &key, idx_t depth, const row_t &row_id) {
 
-	if (!node) {
+	if (!node.IsSet()) {
 		// node is currently empty, create a leaf here with the key
-		node = Leaf::New(key, depth, row_id);
-		this->memory_size += node->MemorySize(*this, false);
+		Leaf::New(*this, node, key, depth, row_id);
 		return true;
 	}
 
-	if (node->type == NodeType::NLeaf) {
+	if (node.DecodeARTNodeType() == NType::LEAF) {
+
+		// add a row ID to a leaf, if they have the same key
+		auto &leaf = Leaf::Get(*this, node);
+		auto mismatch_position = leaf.prefix.KeyMismatchPosition(*this, key, depth);
+		if (mismatch_position == leaf.prefix.count && depth + leaf.prefix.count == key.len) {
+			return InsertToLeaf(node, row_id);
+		}
+
 		// replace leaf with Node4 and store both leaves in it
-		// or add a row ID to a leaf, if they have the same key
-		auto leaf = (Leaf *)node;
-		uint32_t new_prefix_length = 0;
+		auto old_node = node;
+		auto &new_n4 = Node4::New(*this, node);
+		new_n4.prefix.Initialize(*this, key, depth, mismatch_position);
 
-		// FIXME: this code (if and while) can be optimized, less branching, see Construct
-		// leaf node is already there (its key matches the current key), update row_id vector
-		if (new_prefix_length == leaf->prefix.Size() && depth + leaf->prefix.Size() == key.len) {
-			return InsertToLeaf(*leaf, row_id);
-		}
-		while (leaf->prefix[new_prefix_length] == key[depth + new_prefix_length]) {
-			new_prefix_length++;
-			// leaf node is already there (its key matches the current key), update row_id vector
-			if (new_prefix_length == leaf->prefix.Size() && depth + leaf->prefix.Size() == key.len) {
-				return InsertToLeaf(*leaf, row_id);
-			}
-		}
+		auto key_byte = old_node.GetPrefix(*this).Reduce(*this, mismatch_position);
+		Node4::InsertChild(*this, node, key_byte, old_node);
 
-		Node *new_node = Node4::New();
-		new_node->prefix = Prefix(key, depth, new_prefix_length);
-		this->memory_size += new_node->MemorySize(*this, false);
+		Node leaf_node;
+		Leaf::New(*this, leaf_node, key, depth + mismatch_position + 1, row_id);
+		Node4::InsertChild(*this, node, key[depth + mismatch_position], leaf_node);
 
-		auto key_byte = node->prefix.Reduce(*this, new_prefix_length);
-		Node4::InsertChild(*this, new_node, key_byte, node);
-
-		Node *leaf_node = Leaf::New(key, depth + new_prefix_length + 1, row_id);
-		Node4::InsertChild(*this, new_node, key[depth + new_prefix_length], leaf_node);
-		this->memory_size += leaf_node->MemorySize(*this, false);
-
-		node = new_node;
 		return true;
 	}
 
 	// handle prefix of inner node
-	if (node->prefix.Size()) {
+	auto &old_node_prefix = node.GetPrefix(*this);
+	if (old_node_prefix.count) {
 
-		uint32_t mismatch_pos = node->prefix.KeyMismatchPosition(key, depth);
-		if (mismatch_pos != node->prefix.Size()) {
+		auto mismatch_position = old_node_prefix.KeyMismatchPosition(*this, key, depth);
+		if (mismatch_position != old_node_prefix.count) {
+
 			// prefix differs, create new node
-			Node *new_node = Node4::New();
-			new_node->prefix = Prefix(key, depth, mismatch_pos);
-			this->memory_size += new_node->MemorySize(*this, false);
+			auto old_node = node;
+			auto &new_n4 = Node4::New(*this, node);
+			new_n4.prefix.Initialize(*this, key, depth, mismatch_position);
 
-			// break up prefix
-			auto key_byte = node->prefix.Reduce(*this, mismatch_pos);
-			Node4::InsertChild(*this, new_node, key_byte, node);
+			auto key_byte = old_node_prefix.Reduce(*this, mismatch_position);
+			Node4::InsertChild(*this, node, key_byte, old_node);
 
-			Node *leaf_node = Leaf::New(key, depth + mismatch_pos + 1, row_id);
-			Node4::InsertChild(*this, new_node, key[depth + mismatch_pos], leaf_node);
-			this->memory_size += leaf_node->MemorySize(*this, false);
+			Node leaf_node;
+			Leaf::New(*this, leaf_node, key, depth + mismatch_position + 1, row_id);
+			Node4::InsertChild(*this, node, key[depth + mismatch_position], leaf_node);
 
-			node = new_node;
 			return true;
 		}
-		depth += node->prefix.Size();
+		depth += node.GetPrefix(*this).count;
 	}
 
 	// recurse
 	D_ASSERT(depth < key.len);
-	idx_t pos = node->GetChildPos(key[depth]);
-	if (pos != DConstants::INVALID_INDEX) {
-		auto child = node->GetChild(*this, pos);
-		bool insertion_result = Insert(child, key, depth + 1, row_id);
-		node->ReplaceChildPointer(pos, child);
-		return insertion_result;
+	auto child = node.GetChild(*this, key[depth]);
+	if (child) {
+		bool success = Insert(*child, key, depth + 1, row_id);
+		node.ReplaceChild(*this, key[depth], *child);
+		return success;
 	}
 
-	Node *leaf_node = Leaf::New(key, depth + 1, row_id);
+	// insert at position
+	Node leaf_node;
+	Leaf::New(*this, leaf_node, key, depth + 1, row_id);
 	Node::InsertChild(*this, node, key[depth], leaf_node);
-	this->memory_size += leaf_node->MemorySize(*this, false);
 	return true;
 }
 
@@ -519,10 +523,8 @@ void ART::Delete(IndexLock &state, DataChunk &input, Vector &row_ids) {
 
 	// then generate the keys for the given input
 	ArenaAllocator arena_allocator(BufferAllocator::Get(db));
-	vector<Key> keys(expression.size());
+	vector<ARTKey> keys(expression.size());
 	GenerateKeys(arena_allocator, expression, keys);
-
-	auto old_memory_size = this->memory_size;
 
 	// now erase the elements from the database
 	row_ids.Flatten(input.size());
@@ -532,170 +534,179 @@ void ART::Delete(IndexLock &state, DataChunk &input, Vector &row_ids) {
 		if (keys[i].Empty()) {
 			continue;
 		}
-		Erase(tree, keys[i], 0, row_identifiers[i]);
+		Erase(*tree, keys[i], 0, row_identifiers[i]);
 #ifdef DEBUG
-		auto node = Lookup(tree, keys[i], 0);
-		if (node) {
-			auto leaf = (Leaf *)node;
-			for (idx_t k = 0; k < leaf->count; k++) {
-				D_ASSERT(leaf->GetRowId(k) != row_identifiers[i]);
+		auto node = Lookup(*tree, keys[i], 0);
+		if (node.IsSet()) {
+			auto &leaf = Leaf::Get(*this, node);
+			for (idx_t k = 0; k < leaf.count; k++) {
+				D_ASSERT(leaf.GetRowId(*this, k) != row_identifiers[i]);
 			}
 		}
 #endif
 	}
-
-	D_ASSERT(old_memory_size >= memory_size);
-	Verify();
-	if (track_memory) {
-		buffer_manager.DecreaseUsedMemory(old_memory_size - memory_size);
-	}
 }
 
-void ART::Erase(Node *&node, Key &key, idx_t depth, row_t row_id) {
+void ART::Erase(Node &node, const ARTKey &key, idx_t depth, const row_t &row_id) {
 
-	if (!node) {
+	if (!node.IsSet()) {
 		return;
 	}
 
-	// delete a leaf from a tree
-	if (node->type == NodeType::NLeaf) {
-		auto leaf = (Leaf *)node;
-		leaf->Remove(*this, row_id);
+	// delete a row ID from a leaf
+	if (node.DecodeARTNodeType() == NType::LEAF) {
+		auto &leaf = Leaf::Get(*this, node);
+		leaf.Remove(*this, row_id);
 
-		if (leaf->count == 0) {
-			D_ASSERT(this->memory_size >= leaf->MemorySize(*this, false));
-			this->memory_size -= leaf->MemorySize(*this, false);
-			Node::Delete(node);
-			node = nullptr;
+		if (leaf.count == 0) {
+			Node::Free(*this, node);
+			node.Reset();
 		}
 		return;
 	}
 
 	// handle prefix
-	if (node->prefix.Size()) {
-		if (node->prefix.KeyMismatchPosition(key, depth) != node->prefix.Size()) {
+	auto &node_prefix = node.GetPrefix(*this);
+	if (node_prefix.count) {
+		if (node_prefix.KeyMismatchPosition(*this, key, depth) != node_prefix.count) {
 			return;
 		}
-		depth += node->prefix.Size();
+		depth += node_prefix.count;
 	}
 
-	idx_t pos = node->GetChildPos(key[depth]);
-	if (pos != DConstants::INVALID_INDEX) {
-		auto child = node->GetChild(*this, pos);
-		D_ASSERT(child);
+	auto child = node.GetChild(*this, key[depth]);
+	if (child) {
+		D_ASSERT(child->IsSet());
 
-		if (child->type == NodeType::NLeaf) {
+		if (child->DecodeARTNodeType() == NType::LEAF) {
 			// leaf found, remove entry
-			auto leaf = (Leaf *)child;
-			leaf->Remove(*this, row_id);
+			auto &leaf = Leaf::Get(*this, *child);
+			leaf.Remove(*this, row_id);
 
-			if (leaf->count == 0) {
+			if (leaf.count == 0) {
 				// leaf is empty, delete leaf, decrement node counter and maybe shrink node
-				Node::EraseChild(*this, node, pos);
+				Node::DeleteChild(*this, node, key[depth]);
 			}
-
-		} else {
-			// recurse
-			Erase(child, key, depth + 1, row_id);
-			node->ReplaceChildPointer(pos, child);
+			return;
 		}
+
+		// recurse
+		Erase(*child, key, depth + 1, row_id);
+		node.ReplaceChild(*this, key[depth], *child);
 	}
 }
 
 //===--------------------------------------------------------------------===//
-// Point Query
+// Point Query (Equal)
 //===--------------------------------------------------------------------===//
 
-static Key CreateKey(ArenaAllocator &allocator, PhysicalType type, Value &value) {
+static ARTKey CreateKey(ArenaAllocator &allocator, PhysicalType type, Value &value) {
 	D_ASSERT(type == value.type().InternalType());
 	switch (type) {
 	case PhysicalType::BOOL:
-		return Key::CreateKey<bool>(allocator, value);
+		return ARTKey::CreateARTKey<bool>(allocator, value.type(), value);
 	case PhysicalType::INT8:
-		return Key::CreateKey<int8_t>(allocator, value);
+		return ARTKey::CreateARTKey<int8_t>(allocator, value.type(), value);
 	case PhysicalType::INT16:
-		return Key::CreateKey<int16_t>(allocator, value);
+		return ARTKey::CreateARTKey<int16_t>(allocator, value.type(), value);
 	case PhysicalType::INT32:
-		return Key::CreateKey<int32_t>(allocator, value);
+		return ARTKey::CreateARTKey<int32_t>(allocator, value.type(), value);
 	case PhysicalType::INT64:
-		return Key::CreateKey<int64_t>(allocator, value);
+		return ARTKey::CreateARTKey<int64_t>(allocator, value.type(), value);
 	case PhysicalType::UINT8:
-		return Key::CreateKey<uint8_t>(allocator, value);
+		return ARTKey::CreateARTKey<uint8_t>(allocator, value.type(), value);
 	case PhysicalType::UINT16:
-		return Key::CreateKey<uint16_t>(allocator, value);
+		return ARTKey::CreateARTKey<uint16_t>(allocator, value.type(), value);
 	case PhysicalType::UINT32:
-		return Key::CreateKey<uint32_t>(allocator, value);
+		return ARTKey::CreateARTKey<uint32_t>(allocator, value.type(), value);
 	case PhysicalType::UINT64:
-		return Key::CreateKey<uint64_t>(allocator, value);
+		return ARTKey::CreateARTKey<uint64_t>(allocator, value.type(), value);
 	case PhysicalType::INT128:
-		return Key::CreateKey<hugeint_t>(allocator, value);
+		return ARTKey::CreateARTKey<hugeint_t>(allocator, value.type(), value);
 	case PhysicalType::FLOAT:
-		return Key::CreateKey<float>(allocator, value);
+		return ARTKey::CreateARTKey<float>(allocator, value.type(), value);
 	case PhysicalType::DOUBLE:
-		return Key::CreateKey<double>(allocator, value);
+		return ARTKey::CreateARTKey<double>(allocator, value.type(), value);
 	case PhysicalType::VARCHAR:
-		return Key::CreateKey<string_t>(allocator, value);
+		return ARTKey::CreateARTKey<string_t>(allocator, value.type(), value);
 	default:
-		throw InternalException("Invalid type for index");
+		throw InternalException("Invalid type for the ART key");
 	}
 }
 
-bool ART::SearchEqual(Key &key, idx_t max_count, vector<row_t> &result_ids) {
+bool ART::SearchEqual(ARTKey &key, idx_t max_count, vector<row_t> &result_ids) {
 
-	auto leaf = (Leaf *)(Lookup(tree, key, 0));
-	if (!leaf) {
+	auto leaf_node = Lookup(*tree, key, 0);
+	if (!leaf_node.IsSet()) {
 		return true;
 	}
-	if (leaf->count > max_count) {
+
+	auto &leaf = Leaf::Get(*this, leaf_node);
+	if (leaf.count > max_count) {
 		return false;
 	}
-	for (idx_t i = 0; i < leaf->count; i++) {
-		row_t row_id = leaf->GetRowId(i);
+	for (idx_t i = 0; i < leaf.count; i++) {
+		row_t row_id = leaf.GetRowId(*this, i);
 		result_ids.push_back(row_id);
 	}
 	return true;
 }
 
-void ART::SearchEqualJoinNoFetch(Key &key, idx_t &result_size) {
+void ART::SearchEqualJoinNoFetch(ARTKey &key, idx_t &result_size) {
 
 	// we need to look for a leaf
-	auto leaf = Lookup(tree, key, 0);
-	if (!leaf) {
+	auto leaf_node = Lookup(*tree, key, 0);
+	if (!leaf_node.IsSet()) {
+		result_size = 0;
 		return;
 	}
-	result_size = leaf->count;
+
+	auto &leaf = Leaf::Get(*this, leaf_node);
+	result_size = leaf.count;
 }
 
-Leaf *ART::Lookup(Node *node, Key &key, idx_t depth) {
-	while (node) {
-		if (node->type == NodeType::NLeaf) {
-			auto leaf = (Leaf *)node;
-			auto &leaf_prefix = leaf->prefix;
-			//! Check leaf
-			for (idx_t i = 0; i < leaf->prefix.Size(); i++) {
-				if (leaf_prefix[i] != key[i + depth]) {
-					return nullptr;
+//===--------------------------------------------------------------------===//
+// Lookup
+//===--------------------------------------------------------------------===//
+
+Node ART::Lookup(Node node, const ARTKey &key, idx_t depth) {
+
+	while (node.IsSet()) {
+		if (node.DecodeARTNodeType() == NType::LEAF) {
+			auto &leaf = Leaf::Get(*this, node);
+
+			// check if leaf contains key
+			for (idx_t i = 0; i < leaf.prefix.count; i++) {
+				if (leaf.prefix.GetByte(*this, i) != key[i + depth]) {
+					return Node();
 				}
 			}
-			return (Leaf *)node;
+			return node;
 		}
-		if (node->prefix.Size()) {
-			for (idx_t pos = 0; pos < node->prefix.Size(); pos++) {
-				if (key[depth + pos] != node->prefix[pos]) {
-					return nullptr;
+		auto &node_prefix = node.GetPrefix(*this);
+		if (node_prefix.count) {
+			for (idx_t pos = 0; pos < node_prefix.count; pos++) {
+				if (key[depth + pos] != node_prefix.GetByte(*this, pos)) {
+					// prefix mismatch, subtree of node does not contain key
+					return Node();
 				}
 			}
-			depth += node->prefix.Size();
+			depth += node_prefix.count;
 		}
-		idx_t pos = node->GetChildPos(key[depth]);
-		if (pos == DConstants::INVALID_INDEX) {
-			return nullptr;
+
+		// prefix matches key, but no child at byte, does not contain key
+		auto child = node.GetChild(*this, key[depth]);
+		if (!child) {
+			return Node();
 		}
-		node = node->GetChild(*this, pos);
-		D_ASSERT(node);
+
+		// recurse into child
+		node = *child;
+		D_ASSERT(node.IsSet());
 		depth++;
 	}
-	return nullptr;
+
+	return Node();
 }
 
 //===--------------------------------------------------------------------===//
@@ -704,7 +715,7 @@ Leaf *ART::Lookup(Node *node, Key &key, idx_t depth) {
 //          False (Otherwise)
 //===--------------------------------------------------------------------===//
 
-bool ART::SearchGreater(ARTIndexScanState *state, Key &key, bool inclusive, idx_t max_count,
+bool ART::SearchGreater(ARTIndexScanState *state, ARTKey &key, bool inclusive, idx_t max_count,
                         vector<row_t> &result_ids) {
 
 	Iterator *it = &state->iterator;
@@ -713,14 +724,14 @@ bool ART::SearchGreater(ARTIndexScanState *state, Key &key, bool inclusive, idx_
 	// that satisfies our requirement
 	if (!it->art) {
 		it->art = this;
-		bool found = it->LowerBound(tree, key, inclusive);
-		if (!found) {
+		if (!it->LowerBound(*tree, key, inclusive)) {
 			return true;
 		}
 	}
+
 	// after that we continue the scan; we don't need to check the bounds as any value following this value is
 	// automatically bigger and hence satisfies our predicate
-	Key empty_key = Key();
+	ARTKey empty_key = ARTKey();
 	return it->Scan(empty_key, max_count, result_ids, false);
 }
 
@@ -728,10 +739,10 @@ bool ART::SearchGreater(ARTIndexScanState *state, Key &key, bool inclusive, idx_
 // Less Than
 //===--------------------------------------------------------------------===//
 
-bool ART::SearchLess(ARTIndexScanState *state, Key &upper_bound, bool inclusive, idx_t max_count,
+bool ART::SearchLess(ARTIndexScanState *state, ARTKey &upper_bound, bool inclusive, idx_t max_count,
                      vector<row_t> &result_ids) {
 
-	if (!tree) {
+	if (!tree->IsSet()) {
 		return true;
 	}
 
@@ -746,6 +757,7 @@ bool ART::SearchLess(ARTIndexScanState *state, Key &upper_bound, bool inclusive,
 			return true;
 		}
 	}
+
 	// now continue the scan until we reach the upper bound
 	return it->Scan(upper_bound, max_count, result_ids, inclusive);
 }
@@ -754,7 +766,7 @@ bool ART::SearchLess(ARTIndexScanState *state, Key &upper_bound, bool inclusive,
 // Closed Range Query
 //===--------------------------------------------------------------------===//
 
-bool ART::SearchCloseRange(ARTIndexScanState *state, Key &lower_bound, Key &upper_bound, bool left_inclusive,
+bool ART::SearchCloseRange(ARTIndexScanState *state, ARTKey &lower_bound, ARTKey &upper_bound, bool left_inclusive,
                            bool right_inclusive, idx_t max_count, vector<row_t> &result_ids) {
 
 	Iterator *it = &state->iterator;
@@ -762,17 +774,17 @@ bool ART::SearchCloseRange(ARTIndexScanState *state, Key &lower_bound, Key &uppe
 	// first find the first node that satisfies the left predicate
 	if (!it->art) {
 		it->art = this;
-		bool found = it->LowerBound(tree, lower_bound, left_inclusive);
-		if (!found) {
+		if (!it->LowerBound(*tree, lower_bound, left_inclusive)) {
 			return true;
 		}
 	}
+
 	// now continue the scan until we reach the upper bound
 	return it->Scan(upper_bound, max_count, result_ids, right_inclusive);
 }
 
-bool ART::Scan(Transaction &transaction, DataTable &table, IndexScanState &table_state, idx_t max_count,
-               vector<row_t> &result_ids) {
+bool ART::Scan(const Transaction &transaction, const DataTable &table, IndexScanState &table_state,
+               const idx_t max_count, vector<row_t> &result_ids) {
 
 	auto state = (ARTIndexScanState *)&table_state;
 	vector<row_t> row_ids;
@@ -841,8 +853,15 @@ bool ART::Scan(Transaction &transaction, DataTable &table, IndexScanState &table
 	return true;
 }
 
+//===--------------------------------------------------------------------===//
+// More Verification / Constraint Checking
+//===--------------------------------------------------------------------===//
+
 string ART::GenerateErrorKeyName(DataChunk &input, idx_t row) {
-	// re-executing the expressions is not very fast, but we're going to throw anyways, so we don't care
+
+	// FIXME: why exactly can we not pass the expression_chunk as an argument to this
+	// FIXME: function instead of re-executing?
+	// re-executing the expressions is not very fast, but we're going to throw, so we don't care
 	DataChunk expression_chunk;
 	expression_chunk.Initialize(Allocator::DefaultAllocator(), logical_types);
 	ExecuteExpressions(input, expression_chunk);
@@ -862,7 +881,11 @@ string ART::GenerateConstraintErrorMessage(VerifyExistenceType verify_type, cons
 	case VerifyExistenceType::APPEND: {
 		// APPEND to PK/UNIQUE table, but node/key already exists in PK/UNIQUE table
 		string type = IsPrimary() ? "primary key" : "unique";
-		return StringUtil::Format("Duplicate key \"%s\" violates %s constraint", key_name, type);
+		return StringUtil::Format(
+		    "Duplicate key \"%s\" violates %s constraint. "
+		    "If this is an unexpected constraint violation please double "
+		    "check with the known index limitations section in our documentation (docs - sql - indexes).",
+		    key_name, type);
 	}
 	case VerifyExistenceType::APPEND_FK: {
 		// APPEND_FK to FK table, node/key does not exist in PK/UNIQUE table
@@ -880,7 +903,7 @@ string ART::GenerateConstraintErrorMessage(VerifyExistenceType verify_type, cons
 	}
 }
 
-void ART::LookupValues(DataChunk &input, ConflictManager &conflict_manager) {
+void ART::CheckConstraintsForChunk(DataChunk &input, ConflictManager &conflict_manager) {
 
 	// don't alter the index during constraint checking
 	lock_guard<mutex> l(lock);
@@ -892,37 +915,43 @@ void ART::LookupValues(DataChunk &input, ConflictManager &conflict_manager) {
 
 	// generate the keys for the given input
 	ArenaAllocator arena_allocator(BufferAllocator::Get(db));
-	vector<Key> keys(expression_chunk.size());
+	vector<ARTKey> keys(expression_chunk.size());
 	GenerateKeys(arena_allocator, expression_chunk, keys);
 
 	idx_t found_conflict = DConstants::INVALID_INDEX;
 	for (idx_t i = 0; found_conflict == DConstants::INVALID_INDEX && i < input.size(); i++) {
+
 		if (keys[i].Empty()) {
 			if (conflict_manager.AddNull(i)) {
 				found_conflict = i;
 			}
 			continue;
 		}
-		Leaf *leaf_ptr = Lookup(tree, keys[i], 0);
-		if (leaf_ptr == nullptr) {
+
+		auto leaf_node = Lookup(*tree, keys[i], 0);
+		if (!leaf_node.IsSet()) {
 			if (conflict_manager.AddMiss(i)) {
 				found_conflict = i;
 			}
 			continue;
 		}
+
 		// When we find a node, we need to update the 'matches' and 'row_ids'
 		// NOTE: Leafs can have more than one row_id, but for UNIQUE/PRIMARY KEY they will only have one
-		D_ASSERT(leaf_ptr->count == 1);
-		auto row_id = leaf_ptr->GetRowId(0);
+		Leaf &leaf = Leaf::Get(*this, leaf_node);
+		D_ASSERT(leaf.count == 1);
+		auto row_id = leaf.GetRowId(*this, 0);
 		if (conflict_manager.AddHit(i, row_id)) {
 			found_conflict = i;
 		}
 	}
+
 	conflict_manager.FinishLookup();
+
 	if (found_conflict == DConstants::INVALID_INDEX) {
-		// No conflicts detected
 		return;
 	}
+
 	auto key_name = GenerateErrorKeyName(input, found_conflict);
 	auto exception_msg = GenerateConstraintErrorMessage(conflict_manager.LookupType(), key_name);
 	throw ConstraintException(exception_msg);
@@ -932,32 +961,107 @@ void ART::LookupValues(DataChunk &input, ConflictManager &conflict_manager) {
 // Serialization
 //===--------------------------------------------------------------------===//
 
-BlockPointer ART::Serialize(duckdb::MetaBlockWriter &writer) {
+BlockPointer ART::Serialize(MetaBlockWriter &writer) {
+
 	lock_guard<mutex> l(lock);
-	if (tree) {
+	if (tree->IsSet()) {
 		serialized_data_pointer = tree->Serialize(*this, writer);
 	} else {
 		serialized_data_pointer = {(block_id_t)DConstants::INVALID_INDEX, (uint32_t)DConstants::INVALID_INDEX};
 	}
+
 	return serialized_data_pointer;
+}
+
+//===--------------------------------------------------------------------===//
+// Vacuum
+//===--------------------------------------------------------------------===//
+
+void ART::InitializeVacuum(ARTFlags &flags) {
+
+	flags.vacuum_flags.reserve(allocators.size());
+	for (auto &allocator : allocators) {
+		flags.vacuum_flags.push_back(allocator->InitializeVacuum());
+	}
+}
+
+void ART::FinalizeVacuum(const ARTFlags &flags) {
+
+	for (idx_t i = 0; i < allocators.size(); i++) {
+		if (flags.vacuum_flags[i]) {
+			allocators[i]->FinalizeVacuum();
+		}
+	}
+}
+
+void ART::Vacuum(IndexLock &state) {
+
+	if (!tree->IsSet()) {
+		for (auto &allocator : allocators) {
+			allocator->Reset();
+		}
+		return;
+	}
+
+	// holds true, if an allocator needs a vacuum, and false otherwise
+	ARTFlags flags;
+	InitializeVacuum(flags);
+
+	// skip vacuum if no allocators require it
+	auto perform_vacuum = false;
+	for (const auto &vacuum_flag : flags.vacuum_flags) {
+		if (vacuum_flag) {
+			perform_vacuum = true;
+			break;
+		}
+	}
+	if (!perform_vacuum) {
+		return;
+	}
+
+	// traverse the allocated memory of the tree to perform a vacuum
+	Node::Vacuum(*this, *tree, flags);
+
+	// finalize the vacuum operation
+	FinalizeVacuum(flags);
 }
 
 //===--------------------------------------------------------------------===//
 // Merging
 //===--------------------------------------------------------------------===//
 
-bool ART::MergeIndexes(IndexLock &state, Index *other_index) {
+void ART::InitializeMerge(ARTFlags &flags) {
 
-	auto other_art = (ART *)other_index;
+	flags.merge_buffer_counts.reserve(allocators.size());
+	for (auto &allocator : allocators) {
+		flags.merge_buffer_counts.emplace_back(allocator->buffers.size());
+	}
+}
 
-	if (!this->tree) {
-		this->memory_size += other_art->memory_size;
-		this->tree = other_art->tree;
-		other_art->tree = nullptr;
+bool ART::MergeIndexes(IndexLock &state, Index &other_index) {
+
+	auto &other_art = other_index.Cast<ART>();
+	if (!other_art.tree->IsSet()) {
 		return true;
 	}
 
-	return Node::MergeARTs(this, other_art);
+	if (tree->IsSet()) {
+		//  fully deserialize other_index, and traverse it to increment its buffer IDs
+		ARTFlags flags;
+		InitializeMerge(flags);
+		other_art.tree->InitializeMerge(other_art, flags);
+	}
+
+	// merge the node storage
+	for (idx_t i = 0; i < allocators.size(); i++) {
+		allocators[i]->Merge(*other_art.allocators[i]);
+	}
+
+	// merge the ARTs
+	if (!tree->Merge(*this, *other_art.tree)) {
+		return false;
+	}
+	return true;
 }
 
 //===--------------------------------------------------------------------===//
@@ -965,23 +1069,10 @@ bool ART::MergeIndexes(IndexLock &state, Index *other_index) {
 //===--------------------------------------------------------------------===//
 
 string ART::ToString() {
-	if (tree) {
+	if (tree->IsSet()) {
 		return tree->ToString(*this);
 	}
 	return "[empty]";
-}
-
-void ART::Verify() {
-#ifdef DEBUG
-	idx_t current_mem_size = 0;
-	if (tree) {
-		current_mem_size = tree->MemorySize(*this, true);
-	}
-	if (memory_size != current_mem_size) {
-		throw InternalException("Memory_size value (%d) does not match actual memory size (%d).", memory_size,
-		                        current_mem_size);
-	}
-#endif
 }
 
 } // namespace duckdb

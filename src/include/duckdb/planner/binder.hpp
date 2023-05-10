@@ -8,19 +8,20 @@
 
 #pragma once
 
+#include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/common/enums/join_type.hpp"
+#include "duckdb/common/enums/statement_type.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/parser/column_definition.hpp"
+#include "duckdb/parser/query_node.hpp"
+#include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/tokens.hpp"
 #include "duckdb/planner/bind_context.hpp"
+#include "duckdb/planner/bound_statement.hpp"
 #include "duckdb/planner/bound_tokens.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
-#include "duckdb/planner/bound_statement.hpp"
-#include "duckdb/common/case_insensitive_map.hpp"
-#include "duckdb/parser/query_node.hpp"
-#include "duckdb/parser/result_modifier.hpp"
-#include "duckdb/common/enums/statement_type.hpp"
-#include "duckdb/common/enums/join_type.hpp"
+#include "duckdb/common/reference_map.hpp"
 
 namespace duckdb {
 class BoundResultModifier;
@@ -73,43 +74,46 @@ struct CorrelatedColumnInfo {
 */
 class Binder : public std::enable_shared_from_this<Binder> {
 	friend class ExpressionBinder;
-	friend class SelectBinder;
 	friend class RecursiveSubqueryPlanner;
 
 public:
-	static shared_ptr<Binder> CreateBinder(ClientContext &context, Binder *parent = nullptr, bool inherit_ctes = true);
+	DUCKDB_API static shared_ptr<Binder> CreateBinder(ClientContext &context, optional_ptr<Binder> parent = nullptr,
+	                                                  bool inherit_ctes = true);
 
 	//! The client context
 	ClientContext &context;
 	//! A mapping of names to common table expressions
-	case_insensitive_map_t<CommonTableExpressionInfo *> CTE_bindings; // NOLINT
+	case_insensitive_map_t<reference<CommonTableExpressionInfo>> CTE_bindings; // NOLINT
 	//! The CTEs that have already been bound
-	unordered_set<CommonTableExpressionInfo *> bound_ctes;
+	reference_set_t<CommonTableExpressionInfo> bound_ctes;
 	//! The bind context
 	BindContext bind_context;
 	//! The set of correlated columns bound by this binder (FIXME: this should probably be an unordered_set and not a
 	//! vector)
 	vector<CorrelatedColumnInfo> correlated_columns;
 	//! The set of parameter expressions bound by this binder
-	BoundParameterMap *parameters;
+	optional_ptr<BoundParameterMap> parameters;
 	//! Statement properties
 	StatementProperties properties;
 	//! The alias for the currently processing subquery, if it exists
 	string alias;
 	//! Macro parameter bindings (if any)
-	DummyBinding *macro_binding = nullptr;
+	optional_ptr<DummyBinding> macro_binding;
 	//! The intermediate lambda bindings to bind nested lambdas (if any)
-	vector<DummyBinding> *lambda_bindings = nullptr;
+	optional_ptr<vector<DummyBinding>> lambda_bindings;
 
 public:
-	BoundStatement Bind(SQLStatement &statement);
-	BoundStatement Bind(QueryNode &node);
+	DUCKDB_API BoundStatement Bind(SQLStatement &statement);
+	DUCKDB_API BoundStatement Bind(QueryNode &node);
 
 	unique_ptr<BoundCreateTableInfo> BindCreateTableInfo(unique_ptr<CreateInfo> info);
-	unique_ptr<BoundCreateTableInfo> BindCreateTableInfo(unique_ptr<CreateInfo> info, SchemaCatalogEntry *schema);
+	unique_ptr<BoundCreateTableInfo> BindCreateTableInfo(unique_ptr<CreateInfo> info, SchemaCatalogEntry &schema);
+
+	vector<unique_ptr<Expression>> BindCreateIndexExpressions(TableCatalogEntry &table, CreateIndexInfo &info);
+
 	void BindCreateViewInfo(CreateViewInfo &base);
-	SchemaCatalogEntry *BindSchema(CreateInfo &info);
-	SchemaCatalogEntry *BindCreateFunctionInfo(CreateInfo &info);
+	SchemaCatalogEntry &BindSchema(CreateInfo &info);
+	SchemaCatalogEntry &BindCreateFunctionInfo(CreateInfo &info);
 
 	//! Check usage, and cast named parameters to their types
 	static void BindNamedParameters(named_parameter_type_map_t &types, named_parameter_map_t &values,
@@ -122,22 +126,22 @@ public:
 	idx_t GenerateTableIndex();
 
 	//! Add a common table expression to the binder
-	void AddCTE(const string &name, CommonTableExpressionInfo *cte);
+	void AddCTE(const string &name, CommonTableExpressionInfo &cte);
 	//! Find a common table expression by name; returns nullptr if none exists
-	CommonTableExpressionInfo *FindCTE(const string &name, bool skip = false);
+	optional_ptr<CommonTableExpressionInfo> FindCTE(const string &name, bool skip = false);
 
-	bool CTEIsAlreadyBound(CommonTableExpressionInfo *cte);
+	bool CTEIsAlreadyBound(CommonTableExpressionInfo &cte);
 
 	//! Add the view to the set of currently bound views - used for detecting recursive view definitions
-	void AddBoundView(ViewCatalogEntry *view);
+	void AddBoundView(ViewCatalogEntry &view);
 
-	void PushExpressionBinder(ExpressionBinder *binder);
+	void PushExpressionBinder(ExpressionBinder &binder);
 	void PopExpressionBinder();
-	void SetActiveBinder(ExpressionBinder *binder);
-	ExpressionBinder *GetActiveBinder();
+	void SetActiveBinder(ExpressionBinder &binder);
+	ExpressionBinder &GetActiveBinder();
 	bool HasActiveBinder();
 
-	vector<ExpressionBinder *> &GetActiveBinders();
+	vector<reference<ExpressionBinder>> &GetActiveBinders();
 
 	void MergeCorrelatedColumns(vector<CorrelatedColumnInfo> &other);
 	//! Add a correlated column to this binder (if it does not exist)
@@ -160,15 +164,15 @@ public:
 		return FormatErrorRecursive(query_location, msg, values, params...);
 	}
 
-	unique_ptr<LogicalOperator> BindUpdateSet(LogicalOperator *op, unique_ptr<LogicalOperator> root,
-	                                          UpdateSetInfo &set_info, TableCatalogEntry *table,
+	unique_ptr<LogicalOperator> BindUpdateSet(LogicalOperator &op, unique_ptr<LogicalOperator> root,
+	                                          UpdateSetInfo &set_info, TableCatalogEntry &table,
 	                                          vector<PhysicalIndex> &columns);
 	void BindDoUpdateSetExpressions(const string &table_alias, LogicalInsert *insert, UpdateSetInfo &set_info,
 	                                TableCatalogEntry &table);
 	void BindOnConflictClause(LogicalInsert &insert, TableCatalogEntry &table, InsertStatement &stmt);
 
 	static void BindSchemaOrCatalog(ClientContext &context, string &catalog, string &schema);
-	static void BindLogicalType(ClientContext &context, LogicalType &type, const string &catalog = INVALID_CATALOG,
+	static void BindLogicalType(ClientContext &context, LogicalType &type, optional_ptr<Catalog> catalog = nullptr,
 	                            const string &schema = INVALID_SCHEMA);
 
 	bool HasMatchingBinding(const string &table_name, const string &column_name, string &error_message);
@@ -181,6 +185,9 @@ public:
 	BindingMode GetBindingMode();
 	void AddTableName(string table_name);
 	const unordered_set<string> &GetTableNames();
+	optional_ptr<SQLStatement> GetRootStatement() {
+		return root_statement;
+	}
 
 	void SetCanContainNulls(bool can_contain_nulls);
 
@@ -188,7 +195,7 @@ private:
 	//! The parent binder (if any)
 	shared_ptr<Binder> parent;
 	//! The vector of active binders
-	vector<ExpressionBinder *> active_binders;
+	vector<reference<ExpressionBinder>> active_binders;
 	//! The count of bound_tables
 	idx_t bound_tables;
 	//! Whether or not the binder has any unplanned subqueries that still need to be planned
@@ -200,13 +207,13 @@ private:
 	//! Whether or not the binder can contain NULLs as the root of expressions
 	bool can_contain_nulls = false;
 	//! The root statement of the query that is currently being parsed
-	SQLStatement *root_statement = nullptr;
+	optional_ptr<SQLStatement> root_statement;
 	//! Binding mode
 	BindingMode mode = BindingMode::STANDARD_BINDING;
 	//! Table names extracted for BindingMode::EXTRACT_NAMES
 	unordered_set<string> table_names;
 	//! The set of bound views
-	unordered_set<ViewCatalogEntry *> bound_views;
+	reference_set_t<ViewCatalogEntry> bound_views;
 
 private:
 	//! Bind the expressions of generated columns to check for errors
@@ -246,12 +253,13 @@ private:
 	BoundStatement Bind(LoadStatement &stmt);
 	BoundStatement Bind(LogicalPlanStatement &stmt);
 	BoundStatement Bind(AttachStatement &stmt);
+	BoundStatement Bind(DetachStatement &stmt);
 
-	BoundStatement BindReturning(vector<unique_ptr<ParsedExpression>> returning_list, TableCatalogEntry *table,
-	                             idx_t update_table_index, unique_ptr<LogicalOperator> child_operator,
-	                             BoundStatement result);
+	BoundStatement BindReturning(vector<unique_ptr<ParsedExpression>> returning_list, TableCatalogEntry &table,
+	                             const string &alias, idx_t update_table_index,
+	                             unique_ptr<LogicalOperator> child_operator, BoundStatement result);
 
-	unique_ptr<QueryNode> BindTableMacro(FunctionExpression &function, TableMacroCatalogEntry *macro_func, idx_t depth);
+	unique_ptr<QueryNode> BindTableMacro(FunctionExpression &function, TableMacroCatalogEntry &macro_func, idx_t depth);
 
 	unique_ptr<BoundQueryNode> BindNode(SelectNode &node);
 	unique_ptr<BoundQueryNode> BindNode(SetOperationNode &node);
@@ -266,10 +274,17 @@ private:
 
 	unique_ptr<BoundTableRef> Bind(BaseTableRef &ref);
 	unique_ptr<BoundTableRef> Bind(JoinRef &ref);
-	unique_ptr<BoundTableRef> Bind(SubqueryRef &ref, CommonTableExpressionInfo *cte = nullptr);
+	unique_ptr<BoundTableRef> Bind(SubqueryRef &ref, optional_ptr<CommonTableExpressionInfo> cte = nullptr);
 	unique_ptr<BoundTableRef> Bind(TableFunctionRef &ref);
 	unique_ptr<BoundTableRef> Bind(EmptyTableRef &ref);
 	unique_ptr<BoundTableRef> Bind(ExpressionListRef &ref);
+	unique_ptr<BoundTableRef> Bind(PivotRef &expr);
+
+	unique_ptr<SelectNode> BindPivot(PivotRef &expr, vector<unique_ptr<ParsedExpression>> all_columns);
+	unique_ptr<SelectNode> BindUnpivot(Binder &child_binder, PivotRef &expr,
+	                                   vector<unique_ptr<ParsedExpression>> all_columns,
+	                                   unique_ptr<ParsedExpression> &where_clause);
+	unique_ptr<BoundTableRef> BindBoundPivot(PivotRef &expr);
 
 	bool BindTableFunctionParameters(TableFunctionCatalogEntry &table_function,
 	                                 vector<unique_ptr<ParsedExpression>> &expressions, vector<LogicalType> &arguments,
@@ -291,6 +306,7 @@ private:
 	unique_ptr<LogicalOperator> CreatePlan(BoundEmptyTableRef &ref);
 	unique_ptr<LogicalOperator> CreatePlan(BoundExpressionListRef &ref);
 	unique_ptr<LogicalOperator> CreatePlan(BoundCTERef &ref);
+	unique_ptr<LogicalOperator> CreatePlan(BoundPivotRef &ref);
 
 	BoundStatement BindCopyTo(CopyStatement &stmt);
 	BoundStatement BindCopyFrom(CopyStatement &stmt);
@@ -305,7 +321,7 @@ private:
 
 	unique_ptr<LogicalOperator> PlanFilter(unique_ptr<Expression> condition, unique_ptr<LogicalOperator> root);
 
-	void PlanSubqueries(unique_ptr<Expression> *expr, unique_ptr<LogicalOperator> *root);
+	void PlanSubqueries(unique_ptr<Expression> &expr, unique_ptr<LogicalOperator> &root);
 	unique_ptr<Expression> PlanSubquery(BoundSubqueryExpression &expr, unique_ptr<LogicalOperator> &root);
 	unique_ptr<LogicalOperator> PlanLateralJoin(unique_ptr<LogicalOperator> left, unique_ptr<LogicalOperator> right,
 	                                            vector<CorrelatedColumnInfo> &correlated_columns,
@@ -320,20 +336,23 @@ private:
 	bool TryFindBinding(const string &using_column, const string &join_side, string &result);
 
 	void AddUsingBindingSet(unique_ptr<UsingColumnSet> set);
-	string RetrieveUsingBinding(Binder &current_binder, UsingColumnSet *current_set, const string &column_name,
-	                            const string &join_side, UsingColumnSet *new_set);
+	string RetrieveUsingBinding(Binder &current_binder, optional_ptr<UsingColumnSet> current_set,
+	                            const string &column_name, const string &join_side);
 
 	void AddCTEMap(CommonTableExpressionMap &cte_map);
 
 	void ExpandStarExpressions(vector<unique_ptr<ParsedExpression>> &select_list,
 	                           vector<unique_ptr<ParsedExpression>> &new_select_list);
 	void ExpandStarExpression(unique_ptr<ParsedExpression> expr, vector<unique_ptr<ParsedExpression>> &new_select_list);
-	bool FindStarExpression(ParsedExpression &expr, StarExpression **star);
+	bool FindStarExpression(unique_ptr<ParsedExpression> &expr, StarExpression **star, bool is_root, bool in_columns);
 	void ReplaceStarExpression(unique_ptr<ParsedExpression> &expr, unique_ptr<ParsedExpression> &replacement);
+	void BindWhereStarExpression(unique_ptr<ParsedExpression> &expr);
 
 	//! If only a schema name is provided (e.g. "a.b") then figure out if "a" is a schema or a catalog name
 	void BindSchemaOrCatalog(string &catalog_name, string &schema_name);
-	SchemaCatalogEntry *BindCreateSchema(CreateInfo &info);
+	SchemaCatalogEntry &BindCreateSchema(CreateInfo &info);
+
+	unique_ptr<BoundQueryNode> BindSelectNode(SelectNode &statement, unique_ptr<BoundTableRef> from_table);
 
 public:
 	// This should really be a private constructor, but make_shared does not allow it...

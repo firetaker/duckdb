@@ -55,11 +55,10 @@ class BufferedCSVReader : public BaseCSVReader {
 public:
 	BufferedCSVReader(ClientContext &context, BufferedCSVReaderOptions options,
 	                  const vector<LogicalType> &requested_types = vector<LogicalType>());
-	BufferedCSVReader(FileSystem &fs, Allocator &allocator, FileOpener *opener, BufferedCSVReaderOptions options,
-	                  const vector<LogicalType> &requested_types = vector<LogicalType>());
 	BufferedCSVReader(ClientContext &context, string filename, BufferedCSVReaderOptions options,
 	                  const vector<LogicalType> &requested_types = vector<LogicalType>());
-	~BufferedCSVReader();
+	virtual ~BufferedCSVReader() {
+	}
 
 	unique_ptr<char[]> buffer;
 	idx_t buffer_size;
@@ -89,7 +88,7 @@ private:
 	//! Resets the steam
 	void ResetStream();
 	//! Reads a new buffer from the CSV file if the current one has been exhausted
-	bool ReadBuffer(idx_t &start);
+	bool ReadBuffer(idx_t &start, idx_t &line_start);
 	//! Jumps back to the beginning of input stream and resets necessary internal states
 	bool JumpToNextSample();
 	//! Initializes the TextSearchShiftArrays for complex parser
@@ -126,6 +125,9 @@ private:
 	                                        const vector<LogicalType> &requested_types,
 	                                        vector<vector<LogicalType>> &best_sql_types_candidates,
 	                                        map<LogicalTypeId, vector<string>> &best_format_candidates);
+
+	//! Skip Empty lines for tables with over one column
+	void SkipEmptyLines();
 };
 
 } // namespace duckdb

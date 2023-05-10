@@ -1,6 +1,7 @@
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/bit.hpp"
 #include "duckdb/function/table/system_functions.hpp"
 
 #include <cmath>
@@ -57,11 +58,12 @@ vector<TestType> TestAllTypesFun::GetTestTypes() {
 	max_interval.micros = 999999999;
 	result.emplace_back(LogicalType::INTERVAL, "interval", Value::INTERVAL(min_interval),
 	                    Value::INTERVAL(max_interval));
-	// strings/blobs
+	// strings/blobs/bitstrings
 	result.emplace_back(LogicalType::VARCHAR, "varchar", Value("🦆🦆🦆🦆🦆🦆"),
 	                    Value(string("goo\x00se", 6)));
 	result.emplace_back(LogicalType::BLOB, "blob", Value::BLOB("thisisalongblob\\x00withnullbytes"),
 	                    Value::BLOB("\\x00\\x00\\x00a"));
+	result.emplace_back(LogicalType::BIT, "bit", Value::BIT("0010001001011100010101011010111"), Value::BIT("10101"));
 
 	// enums
 	Vector small_enum(LogicalType::VARCHAR, 2);
@@ -136,7 +138,7 @@ vector<TestType> TestAllTypesFun::GetTestTypes() {
 	child_list_t<LogicalType> struct_type_list;
 	struct_type_list.push_back(make_pair("a", LogicalType::INTEGER));
 	struct_type_list.push_back(make_pair("b", LogicalType::VARCHAR));
-	auto struct_type = LogicalType::STRUCT(std::move(struct_type_list));
+	auto struct_type = LogicalType::STRUCT(struct_type_list);
 
 	child_list_t<Value> min_struct_list;
 	min_struct_list.push_back(make_pair("a", Value(LogicalType::INTEGER)));
@@ -154,7 +156,7 @@ vector<TestType> TestAllTypesFun::GetTestTypes() {
 	child_list_t<LogicalType> struct_list_type_list;
 	struct_list_type_list.push_back(make_pair("a", int_list_type));
 	struct_list_type_list.push_back(make_pair("b", varchar_list_type));
-	auto struct_list_type = LogicalType::STRUCT(std::move(struct_list_type_list));
+	auto struct_list_type = LogicalType::STRUCT(struct_list_type_list);
 
 	child_list_t<Value> min_struct_vl_list;
 	min_struct_vl_list.push_back(make_pair("a", Value(int_list_type)));
@@ -178,7 +180,7 @@ vector<TestType> TestAllTypesFun::GetTestTypes() {
 
 	// map
 	auto map_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
-	auto min_map_value = Value::MAP(ListType::GetChildType(map_type), std::vector<Value>());
+	auto min_map_value = Value::MAP(ListType::GetChildType(map_type), vector<Value>());
 
 	child_list_t<Value> map_struct1;
 	map_struct1.push_back(make_pair("key", Value("key1")));
@@ -187,7 +189,7 @@ vector<TestType> TestAllTypesFun::GetTestTypes() {
 	map_struct2.push_back(make_pair("key", Value("key2")));
 	map_struct2.push_back(make_pair("key", Value("goose")));
 
-	std::vector<Value> map_values;
+	vector<Value> map_values;
 	map_values.push_back(Value::STRUCT(map_struct1));
 	map_values.push_back(Value::STRUCT(map_struct2));
 
@@ -208,7 +210,7 @@ static unique_ptr<FunctionData> TestAllTypesBind(ClientContext &context, TableFu
 }
 
 unique_ptr<GlobalTableFunctionState> TestAllTypesInit(ClientContext &context, TableFunctionInitInput &input) {
-	auto result = make_unique<TestAllTypesData>();
+	auto result = make_uniq<TestAllTypesData>();
 	auto test_types = TestAllTypesFun::GetTestTypes();
 	// 3 rows: min, max and NULL
 	result->entries.resize(3);
@@ -222,7 +224,7 @@ unique_ptr<GlobalTableFunctionState> TestAllTypesInit(ClientContext &context, Ta
 }
 
 void TestAllTypesFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &data = (TestAllTypesData &)*data_p.global_state;
+	auto &data = data_p.global_state->Cast<TestAllTypesData>();
 	if (data.offset >= data.entries.size()) {
 		// finished returning values
 		return;

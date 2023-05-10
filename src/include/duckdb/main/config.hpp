@@ -24,14 +24,13 @@
 #include "duckdb/common/winapi.hpp"
 #include "duckdb/storage/compression/bitpacking.hpp"
 #include "duckdb/function/cast/default_casts.hpp"
-#include "duckdb/function/replacement_open.hpp"
 #include "duckdb/function/replacement_scan.hpp"
-#include "duckdb/function/create_database_extension.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/planner/operator_extension.hpp"
 
 namespace duckdb {
+class BufferPool;
 class CastFunctionSet;
 class ClientContext;
 class ErrorManager;
@@ -85,6 +84,8 @@ struct ExtensionOption {
 struct DBConfigOptions {
 	//! Database file path. May be empty for in-memory mode
 	string database_path;
+	//! Database type. If empty, automatically extracted from `database_path`, where a `type:path` syntax is expected
+	string database_type;
 	//! Access mode of the database (AUTOMATIC, READ_ONLY or READ_WRITE)
 	AccessMode access_mode = AccessMode::AUTOMATIC;
 	//! Checkpoint when WAL reaches this size (default: 16MB)
@@ -107,8 +108,8 @@ struct DBConfigOptions {
 	string collation = string();
 	//! The order type used when none is specified (default: ASC)
 	OrderType default_order_type = OrderType::ASCENDING;
-	//! Null ordering used when none is specified (default: NULLS FIRST)
-	OrderByNullType default_null_order = OrderByNullType::NULLS_FIRST;
+	//! Null ordering used when none is specified (default: NULLS LAST)
+	DefaultOrderByNullType default_null_order = DefaultOrderByNullType::NULLS_LAST;
 	//! enable COPY and related commands
 	bool enable_external_access = true;
 	//! Whether or not object cache is used
@@ -138,14 +139,20 @@ struct DBConfigOptions {
 	case_insensitive_map_t<Value> set_variables;
 	//! Database configuration variable default values;
 	case_insensitive_map_t<Value> set_variable_defaults;
+	//! Directory to store extension binaries in
+	string extension_directory;
 	//! Whether unsigned extensions should be loaded
 	bool allow_unsigned_extensions = false;
 	//! Enable emitting FSST Vectors
 	bool enable_fsst_vectors = false;
-	//! Experimental parallel CSV reader
-	bool experimental_parallel_csv_reader = false;
 	//! Start transactions immediately in all attached databases - instead of lazily when a database is referenced
 	bool immediate_transaction_mode = false;
+	//! Debug setting - how to initialize  blocks in the storage layer when allocating
+	DebugInitialize debug_initialize = DebugInitialize::NO_INITIALIZE;
+	//! The set of unrecognized (other) options
+	unordered_map<string, Value> unrecognized_options;
+	//! Whether to print bindings when printing the plan (debug mode only)
+	static bool debug_print_bindings;
 
 	bool operator==(const DBConfigOptions &other) const;
 };
@@ -162,9 +169,6 @@ public:
 	mutex config_lock;
 	//! Replacement table scans are automatically attempted when a table name cannot be found in the schema
 	vector<ReplacementScan> replacement_scans;
-
-	//! Replacement open handlers are callbacks that run pre and post database initialization
-	vector<ReplacementOpen> replacement_opens;
 
 	//! Extra parameters that can be SET for loaded extensions
 	case_insensitive_map_t<ExtensionOption> extension_parameters;
@@ -184,11 +188,11 @@ public:
 	//! A reference to the (shared) default allocator (Allocator::DefaultAllocator)
 	shared_ptr<Allocator> default_allocator;
 	//! Extensions made to binder
-	vector<std::unique_ptr<OperatorExtension>> operator_extensions;
+	vector<unique_ptr<OperatorExtension>> operator_extensions;
 	//! Extensions made to storage
-	case_insensitive_map_t<std::unique_ptr<StorageExtension>> storage_extensions;
-	//! Extensions made to binder to implement the create_database functionality
-	vector<CreateDatabaseExtension> create_database_extensions;
+	case_insensitive_map_t<duckdb::unique_ptr<StorageExtension>> storage_extensions;
+	//! A buffer pool can be shared across multiple databases (if desired).
+	shared_ptr<BufferPool> buffer_pool;
 
 public:
 	DUCKDB_API static DBConfig &GetConfig(ClientContext &context);
@@ -209,6 +213,7 @@ public:
 
 	DUCKDB_API void SetOption(const ConfigurationOption &option, const Value &value);
 	DUCKDB_API void SetOption(DatabaseInstance *db, const ConfigurationOption &option, const Value &value);
+	DUCKDB_API void SetOptionByName(const string &name, const Value &value);
 	DUCKDB_API void ResetOption(DatabaseInstance *db, const ConfigurationOption &option);
 	DUCKDB_API void SetOption(const string &name, Value value);
 	DUCKDB_API void ResetOption(const string &name);
@@ -216,9 +221,9 @@ public:
 	DUCKDB_API static idx_t ParseMemoryLimit(const string &arg);
 
 	//! Return the list of possible compression functions for the specific physical type
-	DUCKDB_API vector<CompressionFunction *> GetCompressionFunctions(PhysicalType data_type);
+	DUCKDB_API vector<reference<CompressionFunction>> GetCompressionFunctions(PhysicalType data_type);
 	//! Return the compression function for the specified compression type/physical type combo
-	DUCKDB_API CompressionFunction *GetCompressionFunction(CompressionType type, PhysicalType data_type);
+	DUCKDB_API optional_ptr<CompressionFunction> GetCompressionFunction(CompressionType type, PhysicalType data_type);
 
 	bool operator==(const DBConfig &other);
 	bool operator!=(const DBConfig &other);
@@ -226,6 +231,9 @@ public:
 	DUCKDB_API CastFunctionSet &GetCastFunctions();
 	void SetDefaultMaxThreads();
 	void SetDefaultMaxMemory();
+
+	OrderType ResolveOrder(OrderType order_type) const;
+	OrderByNullType ResolveNullOrder(OrderType order_type, OrderByNullType null_type) const;
 
 private:
 	unique_ptr<CompressionFunctionSet> compression_functions;

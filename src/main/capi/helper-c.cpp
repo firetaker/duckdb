@@ -98,6 +98,8 @@ duckdb_type ConvertCPPTypeToC(const LogicalType &sql_type) {
 		return DUCKDB_TYPE_VARCHAR;
 	case LogicalTypeId::BLOB:
 		return DUCKDB_TYPE_BLOB;
+	case LogicalTypeId::BIT:
+		return DUCKDB_TYPE_BIT;
 	case LogicalTypeId::INTERVAL:
 		return DUCKDB_TYPE_INTERVAL;
 	case LogicalTypeId::DECIMAL:
@@ -183,4 +185,11 @@ void duckdb_free(void *ptr) {
 
 idx_t duckdb_vector_size() {
 	return STANDARD_VECTOR_SIZE;
+}
+
+bool duckdb_string_is_inlined(duckdb_string_t string_p) {
+	static_assert(sizeof(duckdb_string_t) == sizeof(duckdb::string_t),
+	              "duckdb_string_t should have the same memory layout as duckdb::string_t");
+	auto &string = *(duckdb::string_t *)(&string_p);
+	return string.IsInlined();
 }

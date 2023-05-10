@@ -149,7 +149,7 @@ public:
 	DUCKDB_API double GetProgress();
 
 	//! Register function in the temporary schema
-	DUCKDB_API void RegisterFunction(CreateFunctionInfo *info);
+	DUCKDB_API void RegisterFunction(CreateFunctionInfo &info);
 
 	//! Parse statements from a query
 	DUCKDB_API vector<unique_ptr<SQLStatement>> ParseStatements(const string &query);
@@ -187,6 +187,9 @@ public:
 	DUCKDB_API unordered_set<string> GetTableNames(const string &query);
 
 	DUCKDB_API ClientProperties GetClientProperties() const;
+
+	//! Returns true if execution of the current query is finished
+	DUCKDB_API bool ExecutionIsFinished();
 
 private:
 	//! Parse statements and resolve pragmas from a query

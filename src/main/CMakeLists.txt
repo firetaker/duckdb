@@ -21,6 +21,7 @@ add_library_unity(
   config.cpp
   connection.cpp
   database.cpp
+  database_path_and_type.cpp
   database_manager.cpp
   db_instance_cache.cpp
   error_manager.cpp
@@ -30,7 +31,6 @@ add_library_unity(
   prepared_statement.cpp
   prepared_statement_data.cpp
   relation.cpp
-  extension_prefix_opener.cpp
   query_profiler.cpp
   query_result.cpp
   stream_query_result.cpp

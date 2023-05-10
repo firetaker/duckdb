@@ -26,7 +26,6 @@ const DUCKDB_PENDING_RESULT_READY = 0;
 const DUCKDB_PENDING_RESULT_NOT_READY = 1;
 const DUCKDB_PENDING_ERROR = 2;
 
-
 @enum DUCKDB_TYPE_::UInt32 begin
     DUCKDB_TYPE_INVALID = 0
     DUCKDB_TYPE_BOOLEAN
@@ -57,6 +56,7 @@ const DUCKDB_PENDING_ERROR = 2;
     DUCKDB_TYPE_MAP
     DUCKDB_TYPE_UUID
     DUCKDB_TYPE_UNION
+    DUCKDB_TYPE_BIT
 end
 
 const DUCKDB_TYPE = DUCKDB_TYPE_
@@ -175,6 +175,7 @@ INTERNAL_TYPE_MAP = Dict(
     DUCKDB_TYPE_UUID => duckdb_hugeint,
     DUCKDB_TYPE_VARCHAR => duckdb_string_t,
     DUCKDB_TYPE_BLOB => duckdb_string_t,
+    DUCKDB_TYPE_BIT => duckdb_string_t,
     DUCKDB_TYPE_UUID => duckdb_hugeint,
     DUCKDB_TYPE_LIST => duckdb_list_entry_t,
     DUCKDB_TYPE_STRUCT => Cvoid,
@@ -207,6 +208,7 @@ JULIA_TYPE_MAP = Dict(
     DUCKDB_TYPE_VARCHAR => String,
     DUCKDB_TYPE_ENUM => String,
     DUCKDB_TYPE_BLOB => Base.CodeUnits{UInt8, String},
+    DUCKDB_TYPE_BIT => Base.CodeUnits{UInt8, String},
     DUCKDB_TYPE_MAP => Dict
 )
 

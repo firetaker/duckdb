@@ -341,6 +341,11 @@ outstr = open(outfile,'rb').read()
 if b'42' not in outstr:
      raise Exception('.output test failed')
 
+# issue 6204
+test('''
+.output foo.txt
+select * from range(2049);
+''')
 
 outfile = tf()
 test('''
@@ -425,7 +430,7 @@ SELECT * FROM t1;
 duckdb_nonsense_db = 'duckdbtest_nonsensedb.db'
 with open(duckdb_nonsense_db, 'w+') as f:
      f.write('blablabla')
-test('', err='The file is not a valid DuckDB database file', extra_commands=[duckdb_nonsense_db])
+test('', err='not a valid DuckDB database file', extra_commands=[duckdb_nonsense_db])
 os.remove(duckdb_nonsense_db)
 
 # enable_profiling doesn't result in any output
@@ -874,11 +879,75 @@ outstr = open(outfile,'rb').read().decode('utf8')
 if '50' not in outstr:
      raise Exception('.output test failed')
 
+# we always display all columns when outputting to a file
+columns = ', '.join([str(x) for x in range(100)])
+outfile = tf()
+test('''
+.output %s
+SELECT %s
+''' % (outfile, columns))
+outstr = open(outfile,'rb').read().decode('utf8')
+if '99' not in outstr:
+     raise Exception('.output test failed')
+
+# columnar mode
+test('''
+.col
+select * from range(4);
+''', out='Row 1')
+
+columns = ','.join(["'MyValue" + str(x) + "'" for x in range(100)])
+test(f'''
+.col
+select {columns};
+''', out='MyValue50')
+
+test(f'''
+.col
+select {columns}
+from range(1000)
+''', out='100 columns')
+
 # test null-byte rendering
 test('select varchar from test_all_types();', out='goo\\0se')
 
 # null byte in error message
 test('select chr(0)::int', err='INT32')
+
+# test temp directory behavior (issue #5878)
+# use an existing temp directory
+temp_dir = tf()
+temp_file = os.path.join(temp_dir, 'myfile')
+os.mkdir(temp_dir)
+with open(temp_file, 'w+') as f:
+     f.write('hello world')
+
+test(f'''
+SET temp_directory='{temp_dir}';
+PRAGMA memory_limit='2MB';
+CREATE TABLE t1 AS SELECT * FROM range(1000000);
+''')
+
+# make sure the temp directory or existing files are not deleted
+assert os.path.isdir(temp_dir)
+with open(temp_file, 'r') as f:
+     assert f.read() == "hello world"
+
+# all other files are gone
+assert os.listdir(temp_dir) == ['myfile']
+
+os.remove(temp_file)
+os.rmdir(temp_dir)
+
+# now use a new temp directory
+test(f'''
+SET temp_directory='{temp_dir}';
+PRAGMA memory_limit='2MB';
+CREATE TABLE t1 AS SELECT * FROM range(1000000);
+''')
+
+# make sure the temp directory is deleted
+assert not os.path.isdir(temp_dir)
 
 if os.name != 'nt':
      shell_test_dir = 'shell_test_dir'

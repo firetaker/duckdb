@@ -1,6 +1,5 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 
-#include "duckdb/common/field_writer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/config.hpp"
 
@@ -41,66 +40,27 @@ vector<ColumnBinding> LogicalAggregate::GetColumnBindings() {
 	return result;
 }
 
-string LogicalAggregate::ParamsToString() const {
-	string result;
+InsertionOrderPreservingMap<string> LogicalAggregate::ParamsToString() const {
+	InsertionOrderPreservingMap<string> result;
+	string groups_info;
 	for (idx_t i = 0; i < groups.size(); i++) {
 		if (i > 0) {
-			result += "\n";
+			groups_info += "\n";
 		}
-		result += groups[i]->GetName();
+		groups_info += groups[i]->GetName();
 	}
+	result["Groups"] = groups_info;
+
+	string expressions_info;
 	for (idx_t i = 0; i < expressions.size(); i++) {
-		if (i > 0 || !groups.empty()) {
-			result += "\n";
+		if (i > 0) {
+			expressions_info += "\n";
 		}
-		result += expressions[i]->GetName();
+		expressions_info += expressions[i]->GetName();
 	}
+	result["Expressions"] = expressions_info;
+	SetParamsEstimatedCardinality(result);
 	return result;
-}
-
-void LogicalAggregate::Serialize(FieldWriter &writer) const {
-	writer.WriteSerializableList(expressions);
-
-	writer.WriteField(group_index);
-	writer.WriteField(aggregate_index);
-	writer.WriteField(groupings_index);
-	writer.WriteSerializableList(groups);
-	writer.WriteField<idx_t>(grouping_sets.size());
-	for (auto &entry : grouping_sets) {
-		writer.WriteList<idx_t>(entry);
-	}
-	writer.WriteField<idx_t>(grouping_functions.size());
-	for (auto &entry : grouping_functions) {
-		writer.WriteList<idx_t>(entry);
-	}
-
-	// TODO statistics
-}
-
-unique_ptr<LogicalOperator> LogicalAggregate::Deserialize(LogicalDeserializationState &state, FieldReader &reader) {
-	auto expressions = reader.ReadRequiredSerializableList<Expression>(state.gstate);
-
-	auto group_index = reader.ReadRequired<idx_t>();
-	auto aggregate_index = reader.ReadRequired<idx_t>();
-	auto groupings_index = reader.ReadRequired<idx_t>();
-	auto groups = reader.ReadRequiredSerializableList<Expression>(state.gstate);
-	auto grouping_sets_size = reader.ReadRequired<idx_t>();
-	vector<GroupingSet> grouping_sets;
-	for (idx_t i = 0; i < grouping_sets_size; i++) {
-		grouping_sets.push_back(reader.ReadRequiredSet<idx_t>());
-	}
-	vector<unsafe_vector<idx_t>> grouping_functions;
-	auto grouping_functions_size = reader.ReadRequired<idx_t>();
-	for (idx_t i = 0; i < grouping_functions_size; i++) {
-		grouping_functions.push_back(reader.ReadRequiredList<idx_t>());
-	}
-	auto result = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(expressions));
-	result->groupings_index = groupings_index;
-	result->groups = std::move(groups);
-	result->grouping_functions = std::move(grouping_functions);
-	result->grouping_sets = std::move(grouping_sets);
-
-	return std::move(result);
 }
 
 idx_t LogicalAggregate::EstimateCardinality(ClientContext &context) {

@@ -16,6 +16,9 @@ namespace duckdb {
 
 class Command;
 class LoopCommand;
+class SQLLogicParser;
+
+enum class RequireResult { PRESENT, MISSING };
 
 class SQLLogicTestRunner {
 public:
@@ -41,6 +44,7 @@ public:
 	bool enable_verification = false;
 	bool skip_reload = false;
 	unordered_map<string, string> environment_variables;
+	string local_extension_repo;
 
 	// If these error msgs occur in a test, the test will abort but still count as passed
 	unordered_set<string> ignore_error_messages = {"HTTP", "Unable to connect"};
@@ -54,7 +58,7 @@ public:
 
 public:
 	void ExecuteFile(string script);
-	virtual void LoadDatabase(string dbpath);
+	virtual void LoadDatabase(string dbpath, bool load_extensions);
 
 	string ReplaceKeywords(string input);
 
@@ -65,9 +69,12 @@ public:
 	void Reconnect();
 	void StartLoop(LoopDefinition loop);
 	void EndLoop();
-	static string ReplaceLoopIterator(string text, string loop_iterator_name, string replacement);
-	static string LoopReplacement(string text, const vector<LoopDefinition> &loops);
-	static bool ForEachTokenReplace(const string &parameter, vector<string> &result);
+	string ReplaceLoopIterator(string text, string loop_iterator_name, string replacement);
+	string LoopReplacement(string text, const vector<LoopDefinition> &loops);
+	bool ForEachTokenReplace(const string &parameter, vector<string> &result);
+
+private:
+	RequireResult CheckRequire(SQLLogicParser &parser, const vector<string> &params);
 };
 
 } // namespace duckdb

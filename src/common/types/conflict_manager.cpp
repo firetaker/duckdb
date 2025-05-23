@@ -1,7 +1,7 @@
 #include "duckdb/common/types/conflict_manager.hpp"
-#include "duckdb/storage/index.hpp"
-#include "duckdb/execution/index/art/art.hpp"
+
 #include "duckdb/common/types/constraint_conflict_info.hpp"
+#include "duckdb/execution/index/art/art.hpp"
 
 namespace duckdb {
 
@@ -57,10 +57,10 @@ void ConflictManager::FinishLookup() {
 	}
 }
 
-void ConflictManager::SetMode(ConflictManagerMode mode) {
-	// Only allow SCAN when we have conflict info
-	D_ASSERT(mode != ConflictManagerMode::SCAN || conflict_info != nullptr);
-	this->mode = mode;
+void ConflictManager::SetMode(const ConflictManagerMode mode_p) {
+	// Scanning requires conflict_info.
+	D_ASSERT(mode_p != ConflictManagerMode::SCAN || conflict_info != nullptr);
+	mode = mode_p;
 }
 
 void ConflictManager::AddToConflictSet(idx_t chunk_index) {
@@ -86,20 +86,22 @@ void ConflictManager::AddConflictInternal(idx_t chunk_index, row_t row_id) {
 
 		// We can be more efficient because we don't need to merge conflicts of multiple indexes
 		auto &selection = InternalSelection();
-		auto &row_ids = InternalRowIds();
-		auto data = FlatVector::GetData<row_t>(row_ids);
+		auto &internal_row_ids = InternalRowIds();
+		auto data = FlatVector::GetData<row_t>(internal_row_ids);
 		data[selection.Count()] = row_id;
 		selection.Append(chunk_index);
-	} else {
-		auto &intermediate = InternalIntermediate();
-		auto data = FlatVector::GetData<bool>(intermediate);
-		// Mark this index in the chunk as producing a conflict
-		data[chunk_index] = true;
-		if (row_id_map.empty()) {
-			row_id_map.resize(input_size);
-		}
-		row_id_map[chunk_index] = row_id;
+		return;
 	}
+
+	auto &intermediate = InternalIntermediate();
+	auto data = FlatVector::GetData<bool>(intermediate);
+	// Mark this index in the chunk as producing a conflict
+	data[chunk_index] = true;
+	if (row_id_map.empty()) {
+		row_id_map.resize(input_size);
+	}
+	// FIXME: do we need to limit calls to AddConflictInternal to one per chunk?
+	row_id_map[chunk_index] = row_id;
 }
 
 bool ConflictManager::IsConflict(LookupResultType type) {
@@ -128,11 +130,6 @@ bool ConflictManager::IsConflict(LookupResultType type) {
 
 bool ConflictManager::AddHit(idx_t chunk_index, row_t row_id) {
 	D_ASSERT(chunk_index < input_size);
-	// First check if this causes a conflict
-	if (!IsConflict(LookupResultType::LOOKUP_HIT)) {
-		return false;
-	}
-
 	// Then check if we should throw on a conflict
 	if (ShouldThrow(chunk_index)) {
 		return true;
@@ -149,17 +146,12 @@ bool ConflictManager::AddHit(idx_t chunk_index, row_t row_id) {
 	return false;
 }
 
-bool ConflictManager::AddMiss(idx_t chunk_index) {
-	D_ASSERT(chunk_index < input_size);
-	return IsConflict(LookupResultType::LOOKUP_MISS);
-}
-
 bool ConflictManager::AddNull(idx_t chunk_index) {
 	D_ASSERT(chunk_index < input_size);
 	if (!IsConflict(LookupResultType::LOOKUP_NULL)) {
 		return false;
 	}
-	return AddHit(chunk_index, DConstants::INVALID_INDEX);
+	return AddHit(chunk_index, static_cast<row_t>(DConstants::INVALID_INDEX));
 }
 
 bool ConflictManager::SingleIndexTarget() const {
@@ -212,6 +204,24 @@ idx_t ConflictManager::ConflictCount() const {
 	return conflicts.Count();
 }
 
+void ConflictManager::AddIndex(BoundIndex &index, optional_ptr<BoundIndex> delete_index) {
+	matched_indexes.push_back(index);
+	matched_delete_indexes.push_back(delete_index);
+	matched_index_names.insert(index.name);
+}
+
+bool ConflictManager::MatchedIndex(BoundIndex &index) {
+	return matched_index_names.find(index.name) != matched_index_names.end();
+}
+
+const vector<reference<BoundIndex>> &ConflictManager::MatchedIndexes() const {
+	return matched_indexes;
+}
+
+const vector<optional_ptr<BoundIndex>> &ConflictManager::MatchedDeleteIndexes() const {
+	return matched_delete_indexes;
+}
+
 void ConflictManager::Finalize() {
 	D_ASSERT(!finalized);
 	if (SingleIndexTarget()) {
@@ -234,8 +244,8 @@ void ConflictManager::Finalize() {
 		}
 	}
 	// Now create the row_ids Vector, aligned with the selection vector
-	auto &row_ids = InternalRowIds();
-	auto row_id_data = FlatVector::GetData<row_t>(row_ids);
+	auto &internal_row_ids = InternalRowIds();
+	auto row_id_data = FlatVector::GetData<row_t>(internal_row_ids);
 
 	for (idx_t i = 0; i < selection.Count(); i++) {
 		D_ASSERT(!row_id_map.empty());
@@ -248,11 +258,7 @@ void ConflictManager::Finalize() {
 }
 
 VerifyExistenceType ConflictManager::LookupType() const {
-	return this->lookup_type;
-}
-
-void ConflictManager::SetIndexCount(idx_t count) {
-	index_count = count;
+	return lookup_type;
 }
 
 } // namespace duckdb

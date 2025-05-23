@@ -57,29 +57,50 @@ void BenchmarkRunner::InitializeBenchmarkDirectory() {
 
 atomic<bool> is_active;
 atomic<bool> timeout;
+atomic<bool> summarize;
+std::vector<std::string> summary;
 
-void sleep_thread(Benchmark *benchmark, BenchmarkState *state, int timeout_duration) {
+void sleep_thread(Benchmark *benchmark, BenchmarkRunner *runner, BenchmarkState *state, bool hotrun,
+                  const optional_idx &optional_timeout) {
+	if (!optional_timeout.IsValid()) {
+		return;
+	}
+	auto timeout_duration = optional_timeout.GetIndex();
+
 	// timeout is given in seconds
 	// we wait 10ms per iteration, so timeout * 100 gives us the amount of
 	// iterations
-	if (timeout_duration < 0) {
-		return;
-	}
 	for (size_t i = 0; i < (size_t)(timeout_duration * 100) && is_active; i++) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
 	if (is_active) {
 		timeout = true;
 		benchmark->Interrupt(state);
+
+		// wait again after interrupting
+		for (size_t i = 0; i < (size_t)(timeout_duration * 100) && is_active; i++) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		if (is_active) {
+			// still active - we might be stuck in an infinite loop
+			// our interrupt is not working
+			if (!hotrun) {
+				runner->Log(StringUtil::Format("%s\t%d\t", benchmark->name, 0));
+			}
+			runner->LogResult("KILLED");
+			exit(1);
+		}
 	}
 }
 
 void BenchmarkRunner::Log(string message) {
 	fprintf(stderr, "%s", message.c_str());
+	fflush(stderr);
 }
 
 void BenchmarkRunner::LogLine(string message) {
 	fprintf(stderr, "%s\n", message.c_str());
+	fflush(stderr);
 }
 
 void BenchmarkRunner::LogResult(string message) {
@@ -97,11 +118,27 @@ void BenchmarkRunner::LogOutput(string message) {
 	}
 }
 
+void BenchmarkRunner::LogSummary(string benchmark, string message, size_t i) {
+	string log_result_line = StringUtil::Format("%s\t%d\t", benchmark, i) + "\tINCORRECT\n";
+	string failure_message = benchmark + "\nname\trun\ttiming\n" + log_result_line + message;
+	summary.push_back(failure_message);
+}
+
 void BenchmarkRunner::RunBenchmark(Benchmark *benchmark) {
 	Profiler profiler;
 	auto display_name = benchmark->DisplayName();
 
-	auto state = benchmark->Initialize(configuration);
+	duckdb::unique_ptr<BenchmarkState> state;
+	try {
+		state = benchmark->Initialize(configuration);
+		benchmark->Assert(state.get());
+	} catch (std::exception &ex) {
+		Log(StringUtil::Format("%s\t1\t", benchmark->name));
+		LogResult("ERROR");
+		duckdb::ErrorData error_data(ex);
+		LogLine(error_data.Message());
+		return;
+	}
 	auto nruns = benchmark->NRuns();
 	for (size_t i = 0; i < nruns + 1; i++) {
 		bool hotrun = i > 0;
@@ -113,18 +150,28 @@ void BenchmarkRunner::RunBenchmark(Benchmark *benchmark) {
 		}
 		is_active = true;
 		timeout = false;
-		std::thread interrupt_thread(sleep_thread, benchmark, state.get(), benchmark->Timeout());
+		std::thread interrupt_thread(sleep_thread, benchmark, this, state.get(), hotrun,
+		                             benchmark->Timeout(configuration));
 
-		profiler.Start();
-		benchmark->Run(state.get());
-		profiler.End();
+		string error;
+		try {
+			profiler.Start();
+			benchmark->Run(state.get());
+			profiler.End();
+		} catch (std::exception &ex) {
+			duckdb::ErrorData error_data(ex);
+			error = error_data.Message();
+		}
 
 		is_active = false;
 		interrupt_thread.join();
 		if (hotrun) {
 			LogOutput(benchmark->GetLogOutput(state.get()));
-			if (timeout) {
-				// write timeout
+			if (!error.empty()) {
+				LogResult("ERROR");
+				LogLine(error);
+				break;
+			} else if (timeout) {
 				LogResult("TIMEOUT");
 				break;
 			} else {
@@ -134,6 +181,7 @@ void BenchmarkRunner::RunBenchmark(Benchmark *benchmark) {
 					LogResult("INCORRECT");
 					LogLine("INCORRECT RESULT: " + verify);
 					LogOutput("INCORRECT RESULT: " + verify);
+					LogSummary(benchmark->name, "INCORRECT RESULT: " + verify, i);
 					break;
 				} else {
 					LogResult(std::to_string(profiler.Elapsed()));
@@ -166,6 +214,8 @@ void print_help() {
 	fprintf(stderr, "              --query                Prints query of the benchmark\n");
 	fprintf(stderr, "              --root-dir             Sets the root directory for where to store temp data and "
 	                "look for the 'benchmarks' directory\n");
+	fprintf(stderr, "              --disable-timeout      Disables killing the run after a certain amount of time has "
+	                "passed (30 seconds by default)\n");
 	fprintf(stderr,
 	        "              [name_pattern]         Run only the benchmark which names match the specified name pattern, "
 	        "e.g., DS.* for TPC-DS benchmarks\n");
@@ -173,17 +223,16 @@ void print_help() {
 
 enum ConfigurationError { None, BenchmarkNotFound, InfoWithoutBenchmarkName };
 
-void LoadInterpretedBenchmarks() {
+void LoadInterpretedBenchmarks(FileSystem &fs) {
 	// load interpreted benchmarks
-	duckdb::unique_ptr<FileSystem> fs = FileSystem::CreateLocal();
-	listFiles(*fs, "benchmark", [](const string &path) {
+	listFiles(fs, "benchmark", [](const string &path) {
 		if (endsWith(path, ".benchmark")) {
 			new InterpretedBenchmark(path);
 		}
 	});
 }
 
-string parse_root_dir_or_default(const int arg_counter, char const *const *arg_values) {
+string parse_root_dir_or_default(const int arg_counter, char const *const *arg_values, FileSystem &fs) {
 	// check if the user specified a different root directory
 	for (int arg_index = 1; arg_index < arg_counter; ++arg_index) {
 		string arg = arg_values[arg_index];
@@ -194,10 +243,10 @@ string parse_root_dir_or_default(const int arg_counter, char const *const *arg_v
 				exit(1);
 			}
 			auto path = arg_values[arg_index + 1];
-			if (FileSystem::IsPathAbsolute(path)) {
+			if (fs.IsPathAbsolute(path)) {
 				return path;
 			} else {
-				return FileSystem::JoinPath(FileSystem::GetWorkingDirectory(), path);
+				return fs.JoinPath(FileSystem::GetWorkingDirectory(), path);
 			}
 		}
 	}
@@ -211,6 +260,8 @@ void parse_arguments(const int arg_counter, char const *const *arg_values) {
 	auto &instance = BenchmarkRunner::GetInstance();
 	auto &benchmarks = instance.benchmarks;
 	for (int arg_index = 1; arg_index < arg_counter; ++arg_index) {
+		// make it summarize failures by default
+		summarize = true;
 		string arg = arg_values[arg_index];
 		if (arg == "--list") {
 			// list names of all benchmarks
@@ -237,6 +288,8 @@ void parse_arguments(const int arg_counter, char const *const *arg_values) {
 		} else if (arg == "--query") {
 			// write group of benchmark
 			instance.configuration.meta = BenchmarkMetaType::QUERY;
+		} else if (arg == "--disable-timeout") {
+			instance.configuration.timeout_duration = optional_idx();
 		} else if (StringUtil::StartsWith(arg, "--out=") || StringUtil::StartsWith(arg, "--log=")) {
 			auto splits = StringUtil::Split(arg, '=');
 			if (splits.size() != 2) {
@@ -249,6 +302,19 @@ void parse_arguments(const int arg_counter, char const *const *arg_values) {
 				fprintf(stderr, "Could not open file %s for writing\n", splits[1].c_str());
 				exit(1);
 			}
+		} else if (arg == "--no-summary") {
+			summarize = false;
+		} else if (StringUtil::StartsWith(arg, "--")) {
+			// custom argument
+			auto arg_name = arg.substr(2);
+			if (arg_index + 1 >= arg_counter) {
+				fprintf(stderr, "Benchmark argument %s requires an argument\n", arg_name.c_str());
+				print_help();
+				exit(1);
+			}
+			arg_index++;
+			auto arg_value = arg_values[arg_index];
+			instance.custom_arguments.emplace(std::move(arg_name), std::move(arg_value));
 		} else {
 			if (!instance.configuration.name_pattern.empty()) {
 				fprintf(stderr, "Only one benchmark can be specified.\n");
@@ -335,13 +401,25 @@ void print_error_message(const ConfigurationError &error) {
 }
 
 int main(int argc, char **argv) {
+	duckdb::unique_ptr<FileSystem> fs = FileSystem::CreateLocal();
 	// Set the working directory. We need to scan this before loading the benchmarks or parsing the other arguments
-	string root_dir = parse_root_dir_or_default(argc, argv);
+	string root_dir = parse_root_dir_or_default(argc, argv, *fs);
 	FileSystem::SetWorkingDirectory(root_dir);
 	// load interpreted benchmarks before doing anything else
-	LoadInterpretedBenchmarks();
+	LoadInterpretedBenchmarks(*fs);
 	parse_arguments(argc, argv);
 	const auto configuration_error = run_benchmarks();
+
+	if (!summary.empty() && summarize) {
+		std::cout << "\n====================================================" << std::endl;
+		std::cout << "================  FAILURES SUMMARY  ================" << std::endl;
+		std::cout << "====================================================\n" << std::endl;
+		for (size_t i = 0; i < summary.size(); i++) {
+			std::cout << i + 1 << ": " << summary[i] << std::endl;
+			std::cout << "----------------------------------------------------" << std::endl;
+		}
+	}
+
 	if (configuration_error != ConfigurationError::None) {
 		print_error_message(configuration_error);
 		exit(1);

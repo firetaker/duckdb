@@ -12,6 +12,7 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 
 namespace duckdb {
 //! Represents a built-in operator expression
@@ -29,28 +30,26 @@ public:
 public:
 	string ToString() const override;
 
-	static bool Equal(const OperatorExpression *a, const OperatorExpression *b);
+	static bool Equal(const OperatorExpression &a, const OperatorExpression &b);
 
 	unique_ptr<ParsedExpression> Copy() const override;
 
-	void Serialize(FieldWriter &writer) const override;
-	static unique_ptr<ParsedExpression> Deserialize(ExpressionType type, FieldReader &source);
-	void FormatSerialize(FormatSerializer &serializer) const override;
-	static unique_ptr<ParsedExpression> FormatDeserialize(ExpressionType type, FormatDeserializer &deserializer);
+	void Serialize(Serializer &serializer) const override;
+	static unique_ptr<ParsedExpression> Deserialize(Deserializer &deserializer);
 
 public:
 	template <class T, class BASE>
 	static string ToString(const T &entry) {
-		auto op = ExpressionTypeToOperator(entry.type);
+		auto op = ExpressionTypeToOperator(entry.GetExpressionType());
 		if (!op.empty()) {
 			// use the operator string to represent the operator
 			D_ASSERT(entry.children.size() == 2);
 			return entry.children[0]->ToString() + " " + op + " " + entry.children[1]->ToString();
 		}
-		switch (entry.type) {
+		switch (entry.GetExpressionType()) {
 		case ExpressionType::COMPARE_IN:
 		case ExpressionType::COMPARE_NOT_IN: {
-			string op_type = entry.type == ExpressionType::COMPARE_IN ? " IN " : " NOT IN ";
+			string op_type = entry.GetExpressionType() == ExpressionType::COMPARE_IN ? " IN " : " NOT IN ";
 			string in_child = entry.children[0]->ToString();
 			string child_list = "(";
 			for (idx_t i = 1; i < entry.children.size(); i++) {
@@ -62,9 +61,15 @@ public:
 			child_list += ")";
 			return "(" + in_child + op_type + child_list + ")";
 		}
+		case ExpressionType::OPERATOR_UNPACK: {
+			return StringUtil::Format("UNPACK(%s)", entry.children[0]->ToString());
+		}
+		case ExpressionType::OPERATOR_TRY: {
+			return StringUtil::Format("TRY(%s)", entry.children[0]->ToString());
+		}
 		case ExpressionType::OPERATOR_NOT: {
 			string result = "(";
-			result += ExpressionTypeToString(entry.type);
+			result += ExpressionTypeToString(entry.GetExpressionType());
 			result += " ";
 			result += StringUtil::Join(entry.children, entry.children.size(), ", ",
 			                           [](const unique_ptr<BASE> &child) { return child->ToString(); });
@@ -73,7 +78,7 @@ public:
 		}
 		case ExpressionType::GROUPING_FUNCTION:
 		case ExpressionType::OPERATOR_COALESCE: {
-			string result = ExpressionTypeToString(entry.type);
+			string result = ExpressionTypeToString(entry.GetExpressionType());
 			result += "(";
 			result += StringUtil::Join(entry.children, entry.children.size(), ", ",
 			                           [](const unique_ptr<BASE> &child) { return child->ToString(); });
@@ -86,18 +91,34 @@ public:
 			return "(" + entry.children[0]->ToString() + " IS NOT NULL)";
 		case ExpressionType::ARRAY_EXTRACT:
 			return entry.children[0]->ToString() + "[" + entry.children[1]->ToString() + "]";
-		case ExpressionType::ARRAY_SLICE:
-			return entry.children[0]->ToString() + "[" + entry.children[1]->ToString() + ":" +
-			       entry.children[2]->ToString() + "]";
+		case ExpressionType::ARRAY_SLICE: {
+			string begin = entry.children[1]->ToString();
+			if (begin == "[]") {
+				begin = "";
+			}
+			string end = entry.children[2]->ToString();
+			if (end == "[]") {
+				if (entry.children.size() == 4) {
+					end = "-";
+				} else {
+					end = "";
+				}
+			}
+			if (entry.children.size() == 4) {
+				return entry.children[0]->ToString() + "[" + begin + ":" + end + ":" + entry.children[3]->ToString() +
+				       "]";
+			}
+			return entry.children[0]->ToString() + "[" + begin + ":" + end + "]";
+		}
 		case ExpressionType::STRUCT_EXTRACT: {
-			if (entry.children[1]->type != ExpressionType::VALUE_CONSTANT) {
+			if (entry.children[1]->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 				return string();
 			}
 			auto child_string = entry.children[1]->ToString();
 			D_ASSERT(child_string.size() >= 3);
 			D_ASSERT(child_string[0] == '\'' && child_string[child_string.size() - 1] == '\'');
-			return "(" + entry.children[0]->ToString() + ")." +
-			       KeywordHelper::WriteOptionallyQuoted(child_string.substr(1, child_string.size() - 2));
+			return StringUtil::Format("(%s).%s", entry.children[0]->ToString(),
+			                          SQLIdentifier(child_string.substr(1, child_string.size() - 2)));
 		}
 		case ExpressionType::ARRAY_CONSTRUCTOR: {
 			string result = "(ARRAY[";

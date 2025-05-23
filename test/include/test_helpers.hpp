@@ -35,8 +35,13 @@ void RegisterSqllogictests();
 void DeleteDatabase(string path);
 void TestDeleteDirectory(string path);
 void TestCreateDirectory(string path);
+string TestJoinPath(string path1, string path2);
 void TestDeleteFile(string path);
 void TestChangeDirectory(string path);
+void SetDeleteTestPath(bool delete_path);
+bool DeleteTestPath();
+void ClearTestDirectory();
+string TestGetCurrentDirectory();
 string TestDirectoryPath();
 string TestCreatePath(string suffix);
 unique_ptr<DBConfig> GetTestConfig();
@@ -44,7 +49,8 @@ bool TestIsInternalError(unordered_set<string> &internal_error_messages, const s
 void SetTestDirectory(string path);
 void SetDebugInitialize(int value);
 void SetSingleThreaded();
-string GetTestDirectory();
+void AddRequire(string require);
+bool IsRequired(string require);
 string GetCSVPath();
 void WriteCSV(string path, const char *csv);
 void WriteBinary(string path, const uint8_t *data, uint64_t length);
@@ -58,6 +64,13 @@ bool NO_FAIL(duckdb::unique_ptr<QueryResult> result);
 #define COMPARE_CSV(result, csv, header)                                                                               \
 	{                                                                                                                  \
 		auto res = compare_csv(*result, csv, header);                                                                  \
+		if (!res.empty())                                                                                              \
+			FAIL(res);                                                                                                 \
+	}
+
+#define COMPARE_CSV_COLLECTION(collection, csv, header)                                                                \
+	{                                                                                                                  \
+		auto res = compare_csv_collection(collection, csv, header);                                                    \
 		if (!res.empty())                                                                                              \
 			FAIL(res);                                                                                                 \
 	}

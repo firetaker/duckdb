@@ -8,8 +8,9 @@
 
 #pragma once
 
-#include "duckdb_python/numpy/array_wrapper.hpp"
+#include "duckdb_python/numpy/numpy_result_conversion.hpp"
 #include "duckdb.hpp"
+#include "duckdb/main/chunk_scan_state.hpp"
 #include "duckdb_python/pybind11/pybind_wrapper.hpp"
 #include "duckdb_python/python_objects.hpp"
 #include "duckdb_python/pybind11/dataframe.hpp"
@@ -19,6 +20,7 @@ namespace duckdb {
 struct DuckDBPyResult {
 public:
 	explicit DuckDBPyResult(unique_ptr<QueryResult> result);
+	~DuckDBPyResult();
 
 public:
 	Optional<py::tuple> Fetchone();
@@ -29,19 +31,22 @@ public:
 
 	py::dict FetchNumpy();
 
-	py::dict FetchNumpyInternal(bool stream = false, idx_t vectors_per_chunk = 1);
+	py::dict FetchNumpyInternal(bool stream = false, idx_t vectors_per_chunk = 1,
+	                            unique_ptr<NumpyResultConversion> conversion = nullptr);
 
 	PandasDataFrame FetchDF(bool date_as_object);
 
-	duckdb::pyarrow::Table FetchArrowTable(idx_t rows_per_batch);
+	duckdb::pyarrow::Table FetchArrowTable(idx_t rows_per_batch, bool to_polars);
 
-	PandasDataFrame FetchDFChunk(idx_t vectors_per_chunk, bool date_as_object);
+	PandasDataFrame FetchDFChunk(const idx_t vectors_per_chunk = 1, bool date_as_object = false);
 
 	py::dict FetchPyTorch();
 
 	py::dict FetchTF();
 
-	duckdb::pyarrow::RecordBatchReader FetchRecordBatchReader(idx_t rows_per_batch);
+	ArrowArrayStream FetchArrowArrayStream(idx_t rows_per_batch = 1000000);
+	duckdb::pyarrow::RecordBatchReader FetchRecordBatchReader(idx_t rows_per_batch = 1000000);
+	py::object FetchArrowCapsule(idx_t rows_per_batch = 1000000);
 
 	static py::list GetDescription(const vector<string> &names, const vector<LogicalType> &types);
 
@@ -55,18 +60,14 @@ public:
 	const vector<LogicalType> &GetTypes();
 
 private:
-	py::list FetchAllArrowChunks(idx_t rows_per_batch);
-
 	void FillNumpy(py::dict &res, idx_t col_idx, NumpyResultConversion &conversion, const char *name);
-
-	bool FetchArrowChunk(QueryResult *result, py::list &batches, idx_t rows_per_batch);
 
 	PandasDataFrame FrameFromNumpy(bool date_as_object, const py::handle &o);
 
 	void ChangeToTZType(PandasDataFrame &df);
-	void ChangeDateToDatetime(PandasDataFrame &df);
 	unique_ptr<DataChunk> FetchNext(QueryResult &result);
 	unique_ptr<DataChunk> FetchNextRaw(QueryResult &result);
+	unique_ptr<NumpyResultConversion> InitializeNumpyConversion(bool pandas = false);
 
 private:
 	idx_t chunk_offset = 0;
@@ -77,9 +78,6 @@ private:
 	unordered_map<idx_t, py::list> categories;
 	// Holds the categorical type of Categorical/ENUM types
 	unordered_map<idx_t, py::object> categories_type;
-
-	string timezone_config;
-
 	bool result_closed = false;
 };
 

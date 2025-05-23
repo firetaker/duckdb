@@ -7,78 +7,103 @@
 //===----------------------------------------------------------------------===//
 #pragma once
 
+#include "duckdb/execution/index/fixed_size_allocator.hpp"
+#include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/execution/index/art/node.hpp"
 
 namespace duckdb {
 
-// classes
 class ARTKey;
-class PrefixSegment;
 
+//! Prefix is a wrapper class to access a prefix.
+//! The prefix contains up to the ART's prefix size bytes and an additional byte for the count.
+//! It also contains a Node pointer to a child node.
 class Prefix {
 public:
-	//! Number of bytes in this prefix
-	uint32_t count;
-	union {
-		//! Pointer to the head of the list of prefix segments
-		Node ptr;
-		//! Inlined prefix bytes
-		uint8_t inlined[Node::PREFIX_INLINE_BYTES];
-	} data;
+	static constexpr NType PREFIX = NType::PREFIX;
+
+	static constexpr uint8_t ROW_ID_SIZE = sizeof(row_t);
+	static constexpr uint8_t ROW_ID_COUNT = ROW_ID_SIZE - 1;
+	static constexpr uint8_t DEPRECATED_COUNT = 15;
+	static constexpr uint8_t METADATA_SIZE = sizeof(Node) + 1;
 
 public:
-	//! Delete all prefix segments (if not inlined) and reset all fields
-	void Free(ART &art);
-	//! Initializes all the fields of an empty prefix
-	inline void Initialize() {
-		count = 0;
+	Prefix() = delete;
+	Prefix(const ART &art, const Node ptr_p, const bool is_mutable = false, const bool set_in_memory = false);
+	Prefix(unsafe_unique_ptr<FixedSizeAllocator> &allocator, const Node ptr_p, const idx_t count);
+
+	data_ptr_t data;
+	Node *ptr;
+	bool in_memory;
+
+public:
+	static inline uint8_t Count(const ART &art) {
+		return art.prefix_count;
 	}
-	//! Initialize a prefix from an ART key
-	void Initialize(ART &art, const ARTKey &key, const uint32_t depth, const uint32_t count_p);
-	//! Initialize a prefix from another prefix up to count
-	void Initialize(ART &art, const Prefix &other, const uint32_t count_p);
+	static optional_idx GetMismatchWithKey(ART &art, const Node &node, const ARTKey &key, idx_t &depth);
+	static uint8_t GetByte(const ART &art, const Node &node, const uint8_t pos);
 
-	//! Initializes a merge by incrementing the buffer IDs of the prefix segments
-	void InitializeMerge(ART &art, const idx_t buffer_count);
+public:
+	//! Get a new list of prefix nodes. The node reference holds the child of the last prefix node.
+	static void New(ART &art, reference<Node> &ref, const ARTKey &key, const idx_t depth, idx_t count);
 
-	//! Move a prefix into this prefix
-	inline void Move(Prefix &other) {
-		count = other.count;
-		data = other.data;
-		other.Initialize();
-	}
-	//! Append a prefix to this prefix
-	void Append(ART &art, const Prefix &other);
-	//! Concatenate prefix with a partial key byte and another prefix: other.prefix + byte + this->prefix
-	void Concatenate(ART &art, const uint8_t byte, const Prefix &other);
-	//! Removes the first n bytes, and returns the new first byte
-	uint8_t Reduce(ART &art, const idx_t reduce_count);
+	//! Free the prefix and its child.
+	static void Free(ART &art, Node &node);
 
-	//! Get the byte at position
-	uint8_t GetByte(const ART &art, const idx_t position) const;
-	//! Compare the key with the prefix of the node, return the position where they mismatch
-	uint32_t KeyMismatchPosition(const ART &art, const ARTKey &key, const uint32_t depth) const;
-	//! Compare this prefix to another prefix, return the position where they mismatch, or count otherwise
-	uint32_t MismatchPosition(const ART &art, const Prefix &other) const;
+	//! Concatenates parent -> byte -> child. Special-handling, if
+	//! 1. the byte was in a gate node.
+	//! 2. the byte was in PREFIX_INLINED.
+	static void Concat(ART &art, Node &parent, uint8_t byte, const GateStatus old_status, const Node &child,
+	                   const GateStatus status);
 
-	//! Serialize this prefix
-	void Serialize(const ART &art, MetaBlockWriter &writer) const;
-	//! Deserialize this prefix
-	void Deserialize(ART &art, MetaBlockReader &reader);
+	//! Traverse a prefix and a key until
+	//! 1. a non-prefix node.
+	//! 2. a mismatching byte.
+	//! Early-out, if the next prefix is a gate node.
+	static optional_idx Traverse(ART &art, reference<const Node> &node, const ARTKey &key, idx_t &depth);
+	static optional_idx TraverseMutable(ART &art, reference<Node> &node, const ARTKey &key, idx_t &depth);
 
-	//! Vacuum the prefix segments of a prefix, if not inlined
-	void Vacuum(ART &art);
+	//! Removes up to pos bytes from the prefix.
+	//! Shifts all subsequent bytes by pos. Frees empty nodes.
+	static void Reduce(ART &art, Node &node, const idx_t pos);
+	//! Splits the prefix at pos.
+	//! node references the node that replaces the split byte.
+	//! child references the remaining node after the split.
+	//! Returns GATE_SET, if a gate node was freed, else GATE_NOT_SET.
+	//! If it returns GATE_SET, then the caller must set the gate for the node replacing the split byte,
+	//! after its creation.
+	static GateStatus Split(ART &art, reference<Node> &node, Node &child, const uint8_t pos);
+
+	//! Returns the string representation of the node, or only traverses and verifies the node and its subtree
+	static string VerifyAndToString(ART &art, const Node &node, const bool only_verify);
+	//! Transform the child of the node.
+	static void TransformToDeprecated(ART &art, Node &node, unsafe_unique_ptr<FixedSizeAllocator> &allocator);
 
 private:
-	//! Returns whether this prefix is inlined
-	inline bool IsInlined() const {
-		return count <= Node::PREFIX_INLINE_BYTES;
-	}
-	//! Moves all inlined bytes onto a prefix segment, does not change the size
-	//! so this will be an (temporarily) invalid prefix
-	PrefixSegment &MoveInlinedToSegment(ART &art);
-	//! Inlines up to eight bytes on the first prefix segment
-	void MoveSegmentToInlined(ART &art);
-};
+	static Prefix NewInternal(ART &art, Node &node, const data_ptr_t data, const uint8_t count, const idx_t offset,
+	                          const NType type);
 
+	static Prefix GetTail(ART &art, const Node &node);
+
+	static void ConcatGate(ART &art, Node &parent, uint8_t byte, const Node &child);
+	static void ConcatChildIsGate(ART &art, Node &parent, uint8_t byte, const Node &child);
+
+	Prefix Append(ART &art, const uint8_t byte);
+	void Append(ART &art, Node other);
+	Prefix TransformToDeprecatedAppend(ART &art, unsafe_unique_ptr<FixedSizeAllocator> &allocator, uint8_t byte);
+
+private:
+	template <class F, class NODE>
+	static void Iterator(ART &art, reference<NODE> &ref, const bool exit_gate, const bool is_mutable, F &&lambda) {
+		while (ref.get().HasMetadata() && ref.get().GetType() == PREFIX) {
+			Prefix prefix(art, ref, is_mutable);
+			lambda(prefix);
+
+			ref = *prefix.ptr;
+			if (exit_gate && ref.get().GetGateStatus() == GateStatus::GATE_SET) {
+				break;
+			}
+		}
+	}
+};
 } // namespace duckdb

@@ -17,15 +17,19 @@ namespace duckdb {
 
 class ZStdFileSystem : public CompressedFileSystem {
 public:
-	duckdb::unique_ptr<FileHandle> OpenCompressedFile(duckdb::unique_ptr<FileHandle> handle, bool write) override;
+	unique_ptr<FileHandle> OpenCompressedFile(unique_ptr<FileHandle> handle, bool write) override;
 
 	std::string GetName() const override {
 		return "ZStdFileSystem";
 	}
 
-	duckdb::unique_ptr<StreamWrapper> CreateStream() override;
+	unique_ptr<StreamWrapper> CreateStream() override;
 	idx_t InBufferSize() override;
 	idx_t OutBufferSize() override;
+
+	static int64_t DefaultCompressionLevel();
+	static int64_t MinimumCompressionLevel();
+	static int64_t MaximumCompressionLevel();
 };
 
 } // namespace duckdb

@@ -45,13 +45,16 @@ public:
 
 	static unique_ptr<NodeStatistics> PandasScanCardinality(ClientContext &context, const FunctionData *bind_data);
 
-	static idx_t PandasScanGetBatchIndex(ClientContext &context, const FunctionData *bind_data_p,
-	                                     LocalTableFunctionState *local_state, GlobalTableFunctionState *global_state);
+	static OperatorPartitionData PandasScanGetPartitionData(ClientContext &context,
+	                                                        TableFunctionGetPartitionInput &input);
 
 	// Helper function that transform pandas df names to make them work with our binder
 	static py::object PandasReplaceCopiedNames(const py::object &original_df);
 
 	static void PandasBackendScanSwitch(PandasColumnBindData &bind_data, idx_t count, idx_t offset, Vector &out);
+
+	static void PandasSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+	                            const TableFunction &function);
 };
 
 } // namespace duckdb

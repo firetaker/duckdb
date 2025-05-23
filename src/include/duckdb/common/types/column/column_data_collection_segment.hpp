@@ -94,7 +94,7 @@ public:
 	//! The set of child indices
 	vector<VectorDataIndex> child_indices;
 	//! The string heap for the column data collection (only used for IN_MEMORY_ALLOCATOR)
-	StringHeap heap;
+	shared_ptr<StringHeap> heap;
 
 public:
 	void AllocateNewChunk();
@@ -126,13 +126,19 @@ public:
 	}
 
 	idx_t ChunkCount() const;
+	//! Get the total *used* size (not cached)
+	idx_t SizeInBytes() const;
+	//! Get the currently allocated size in bytes (cached)
+	idx_t AllocationSize() const;
+
 	void FetchChunk(idx_t chunk_idx, DataChunk &result);
 	void FetchChunk(idx_t chunk_idx, DataChunk &result, const vector<column_t> &column_ids);
 
 	void Verify();
 
 	static idx_t GetDataSize(idx_t type_size);
-	static validity_t *GetValidityPointer(data_ptr_t base_ptr, idx_t type_size);
+	static validity_t *GetValidityPointerForWriting(data_ptr_t base_ptr, idx_t type_size);
+	static validity_t *GetValidityPointer(data_ptr_t base_ptr, idx_t type_size, idx_t count);
 
 private:
 	idx_t ReadVectorInternal(ChunkManagementState &state, VectorDataIndex vector_index, Vector &result);

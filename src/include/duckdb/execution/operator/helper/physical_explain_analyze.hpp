@@ -10,6 +10,7 @@
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/expression.hpp"
+#include "duckdb/common/enums/explain_format.hpp"
 
 namespace duckdb {
 
@@ -18,9 +19,12 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXPLAIN_ANALYZE;
 
 public:
-	PhysicalExplainAnalyze(vector<LogicalType> types)
-	    : PhysicalOperator(PhysicalOperatorType::EXPLAIN_ANALYZE, std::move(types), 1) {
+	explicit PhysicalExplainAnalyze(vector<LogicalType> types, ExplainFormat format)
+	    : PhysicalOperator(PhysicalOperatorType::EXPLAIN_ANALYZE, std::move(types), 1), format(format) {
 	}
+
+public:
+	ExplainFormat format;
 
 public:
 	// Source interface
@@ -34,7 +38,7 @@ public:
 	// Sink Interface
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	                          GlobalSinkState &gstate) const override;
+	                          OperatorSinkFinalizeInput &input) const override;
 
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 

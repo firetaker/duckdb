@@ -11,6 +11,7 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/optional_idx.hpp"
 
 namespace duckdb {
 
@@ -25,21 +26,71 @@ public:
 	virtual ~BaseExpression() {
 	}
 
-	//! Returns the type of the expression
-	ExpressionType GetExpressionType() const {
-		return type;
-	}
 	//! Returns the class of the expression
 	ExpressionClass GetExpressionClass() const {
 		return expression_class;
 	}
 
+	//! Returns the type of the expression
+	ExpressionType GetExpressionType() const {
+		return type;
+	}
+
+	//! Sets the type of the expression unsafely. In general expressions are immutable and should not be changed after
+	//! creation. Only use this if you know what you are doing.
+	void SetExpressionTypeUnsafe(ExpressionType new_type) {
+		type = new_type;
+	}
+
+	//! Returns the location in the query (if any)
+	optional_idx GetQueryLocation() const {
+		return query_location;
+	}
+
+	//! Sets the location in the query
+	void SetQueryLocation(optional_idx location) {
+		query_location = location;
+	}
+
+	//! Returns true if the expression has a non-empty alias
+	bool HasAlias() const {
+		return !alias.empty();
+	}
+
+	//! Returns the alias of the expression
+	const string &GetAlias() const {
+		return alias;
+	}
+
+	//! Sets the alias of the expression
+	void SetAlias(const string &alias_p) {
+		alias = alias_p;
+	}
+
+	//! Sets the alias of the expression
+	void SetAlias(string &&alias_p) {
+		alias = std::move(alias_p);
+	}
+
+	//! Clears the alias of the expression
+	void ClearAlias() {
+		alias.clear();
+	}
+
+	// TODO: Make the following protected
+	// protected:
+
 	//! Type of the expression
 	ExpressionType type;
+
 	//! The expression class of the node
 	ExpressionClass expression_class;
+
 	//! The alias of the expression,
 	string alias;
+
+	//! The location in the query (if any)
+	optional_idx query_location;
 
 public:
 	//! Returns true if this expression is an aggregate or not.
@@ -71,19 +122,13 @@ public:
 	//! Expression::Equals() returns true), that their hash value is identical as well.
 	virtual hash_t Hash() const = 0;
 	//! Returns true if this expression is equal to another expression
-	virtual bool Equals(const BaseExpression *other) const;
+	virtual bool Equals(const BaseExpression &other) const;
 
-	static bool Equals(const BaseExpression *left, const BaseExpression *right) {
-		if (left == right) {
-			return true;
-		}
-		if (!left || !right) {
-			return false;
-		}
-		return left->Equals(right);
+	static bool Equals(const BaseExpression &left, const BaseExpression &right) {
+		return left.Equals(right);
 	}
-	bool operator==(const BaseExpression &rhs) {
-		return this->Equals(&rhs);
+	bool operator==(const BaseExpression &rhs) const {
+		return Equals(rhs);
 	}
 
 	virtual void Verify() const;
@@ -94,7 +139,7 @@ public:
 		if (expression_class != TARGET::TYPE) {
 			throw InternalException("Failed to cast expression to type - expression type mismatch");
 		}
-		return (TARGET &)*this;
+		return reinterpret_cast<TARGET &>(*this);
 	}
 
 	template <class TARGET>
@@ -102,7 +147,7 @@ public:
 		if (expression_class != TARGET::TYPE) {
 			throw InternalException("Failed to cast expression to type - expression type mismatch");
 		}
-		return (const TARGET &)*this;
+		return reinterpret_cast<const TARGET &>(*this);
 	}
 };
 

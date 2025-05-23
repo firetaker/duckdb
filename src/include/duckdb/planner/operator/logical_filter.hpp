@@ -25,8 +25,13 @@ public:
 
 public:
 	vector<ColumnBinding> GetColumnBindings() override;
-	void Serialize(FieldWriter &writer) const override;
-	static unique_ptr<LogicalOperator> Deserialize(LogicalDeserializationState &state, FieldReader &reader);
+
+	bool HasProjectionMap() const override {
+		return !projection_map.empty();
+	}
+
+	void Serialize(Serializer &serializer) const override;
+	static unique_ptr<LogicalOperator> Deserialize(Deserializer &deserializer);
 
 	bool SplitPredicates() {
 		return SplitPredicates(expressions);

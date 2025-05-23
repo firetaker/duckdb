@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/storage/checkpoint/row_group_writer.hpp"
 
 namespace duckdb {
@@ -23,40 +24,44 @@ class TableStatistics;
 //! Abstraction will support, for example: tiering, versioning, or splitting into multiple block managers.
 class TableDataWriter {
 public:
-	explicit TableDataWriter(TableCatalogEntry &table);
+	explicit TableDataWriter(TableCatalogEntry &table, optional_ptr<ClientContext> client_context);
 	virtual ~TableDataWriter();
 
 public:
-	void WriteTableData();
+	void WriteTableData(Serializer &metadata_serializer);
 
 	CompressionType GetColumnCompressionType(idx_t i);
 
-	virtual void FinalizeTable(TableStatistics &&global_stats, DataTableInfo *info) = 0;
+	virtual void FinalizeTable(const TableStatistics &global_stats, DataTableInfo *info, Serializer &serializer) = 0;
 	virtual unique_ptr<RowGroupWriter> GetRowGroupWriter(RowGroup &row_group) = 0;
 
-	virtual void AddRowGroup(RowGroupPointer &&row_group_pointer, unique_ptr<RowGroupWriter> &&writer);
+	virtual void AddRowGroup(RowGroupPointer &&row_group_pointer, unique_ptr<RowGroupWriter> writer);
+	virtual CheckpointType GetCheckpointType() const = 0;
+
+	DatabaseInstance &GetDatabase();
+	unique_ptr<TaskExecutor> CreateTaskExecutor();
 
 protected:
 	DuckTableEntry &table;
-	// Pointers to the start of each row group.
+	optional_ptr<ClientContext> client_context;
+	//! Pointers to the start of each row group.
 	vector<RowGroupPointer> row_group_pointers;
 };
 
 class SingleFileTableDataWriter : public TableDataWriter {
 public:
 	SingleFileTableDataWriter(SingleFileCheckpointWriter &checkpoint_manager, TableCatalogEntry &table,
-	                          MetaBlockWriter &table_data_writer, MetaBlockWriter &meta_data_writer);
+	                          MetadataWriter &table_data_writer);
 
 public:
-	virtual void FinalizeTable(TableStatistics &&global_stats, DataTableInfo *info) override;
-	virtual unique_ptr<RowGroupWriter> GetRowGroupWriter(RowGroup &row_group) override;
+	void FinalizeTable(const TableStatistics &global_stats, DataTableInfo *info, Serializer &serializer) override;
+	unique_ptr<RowGroupWriter> GetRowGroupWriter(RowGroup &row_group) override;
+	CheckpointType GetCheckpointType() const override;
 
 private:
 	SingleFileCheckpointWriter &checkpoint_manager;
-	// Writes the actual table data
-	MetaBlockWriter &table_data_writer;
-	// Writes the metadata of the table
-	MetaBlockWriter &meta_data_writer;
+	//! Writes the actual table data
+	MetadataWriter &table_data_writer;
 };
 
 } // namespace duckdb

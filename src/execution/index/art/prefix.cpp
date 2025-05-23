@@ -1,469 +1,412 @@
 #include "duckdb/execution/index/art/prefix.hpp"
 
+#include "duckdb/common/swap.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/execution/index/art/art_key.hpp"
+#include "duckdb/execution/index/art/base_leaf.hpp"
+#include "duckdb/execution/index/art/base_node.hpp"
+#include "duckdb/execution/index/art/leaf.hpp"
 #include "duckdb/execution/index/art/node.hpp"
-#include "duckdb/execution/index/art/prefix_segment.hpp"
-#include "duckdb/storage/meta_block_reader.hpp"
-#include "duckdb/storage/meta_block_writer.hpp"
 
 namespace duckdb {
 
-void Prefix::Free(ART &art) {
-
-	if (IsInlined()) {
-		return Initialize();
-	}
-
-	// delete all prefix segments
-	auto ptr = data.ptr;
-	while (ptr.IsSet()) {
-		auto next_ptr = PrefixSegment::Get(art, ptr).next;
-		Node::Free(art, ptr);
-		ptr = next_ptr;
-	}
-
-	Initialize();
-}
-
-void Prefix::Initialize(ART &art, const ARTKey &key, const uint32_t depth, const uint32_t count_p) {
-
-	// prefix can be inlined
-	if (count_p <= Node::PREFIX_INLINE_BYTES) {
-		memcpy(data.inlined, key.data + depth, count_p);
-		count = count_p;
-		return;
-	}
-
-	// prefix cannot be inlined, copy to segment(s)
-	count = 0;
-	reference<PrefixSegment> segment(PrefixSegment::New(art, data.ptr));
-	for (idx_t i = 0; i < count_p; i++) {
-		segment = segment.get().Append(art, count, key.data[depth + i]);
-	}
-	D_ASSERT(count == count_p);
-}
-
-void Prefix::Initialize(ART &art, const Prefix &other, const uint32_t count_p) {
-
-	D_ASSERT(count_p <= other.count);
-
-	// copy inlined data
-	if (other.IsInlined()) {
-		memcpy(data.inlined, other.data.inlined, count_p);
-		count = count_p;
-		return;
-	}
-
-	// initialize the count and get the first segment
-	count = 0;
-	reference<PrefixSegment> segment(PrefixSegment::New(art, data.ptr));
-
-	// iterate the segments of the other prefix and copy their data
-	auto other_ptr = other.data.ptr;
-	auto remaining = count_p;
-
-	while (remaining != 0) {
-		D_ASSERT(other_ptr.IsSet());
-		auto &other_segment = PrefixSegment::Get(art, other_ptr);
-		auto copy_count = MinValue(Node::PREFIX_SEGMENT_SIZE, remaining);
-
-		// copy the data
-		for (idx_t i = 0; i < copy_count; i++) {
-			segment = segment.get().Append(art, count, other_segment.bytes[i]);
+Prefix::Prefix(const ART &art, const Node ptr_p, const bool is_mutable, const bool set_in_memory) {
+	if (!set_in_memory) {
+		data = Node::GetAllocator(art, PREFIX).Get(ptr_p, is_mutable);
+	} else {
+		data = Node::GetAllocator(art, PREFIX).GetIfLoaded(ptr_p);
+		if (!data) {
+			ptr = nullptr;
+			in_memory = false;
+			return;
 		}
-
-		// adjust the loop variables
-		other_ptr = other_segment.next;
-		remaining -= copy_count;
 	}
-	D_ASSERT(count == count_p);
+	ptr = reinterpret_cast<Node *>(data + Count(art) + 1);
+	in_memory = true;
 }
 
-void Prefix::InitializeMerge(ART &art, const idx_t buffer_count) {
-
-	if (IsInlined()) {
-		return;
-	}
-
-	reference<PrefixSegment> segment(PrefixSegment::Get(art, data.ptr));
-	data.ptr.buffer_id += buffer_count;
-
-	auto ptr = segment.get().next;
-	while (ptr.IsSet()) {
-		segment.get().next.buffer_id += buffer_count;
-		segment = PrefixSegment::Get(art, ptr);
-		ptr = segment.get().next;
-	}
+Prefix::Prefix(unsafe_unique_ptr<FixedSizeAllocator> &allocator, const Node ptr_p, const idx_t count) {
+	data = allocator->Get(ptr_p, true);
+	ptr = reinterpret_cast<Node *>(data + count + 1);
+	in_memory = true;
 }
 
-void Prefix::Append(ART &art, const Prefix &other) {
-
-	// result fits into inlined data, i.e., both prefixes are also inlined
-	if (count + other.count <= Node::PREFIX_INLINE_BYTES) {
-		memcpy(data.inlined + count, other.data.inlined, other.count);
-		count += other.count;
-		return;
-	}
-
-	// this prefix is inlined, but will no longer be after appending the other prefix,
-	// move the inlined bytes to the first prefix segment
-	if (IsInlined()) {
-		MoveInlinedToSegment(art);
-	}
-
-	// get the tail of the segments of this prefix
-	reference<PrefixSegment> segment(PrefixSegment::Get(art, data.ptr).GetTail(art));
-
-	// the other prefix is inlined
-	if (other.IsInlined()) {
-		for (idx_t i = 0; i < other.count; i++) {
-			segment = segment.get().Append(art, count, other.data.inlined[i]);
+optional_idx Prefix::GetMismatchWithKey(ART &art, const Node &node, const ARTKey &key, idx_t &depth) {
+	Prefix prefix(art, node);
+	for (idx_t i = 0; i < prefix.data[Prefix::Count(art)]; i++) {
+		if (prefix.data[i] != key[depth]) {
+			return i;
 		}
-		return;
+		depth++;
 	}
-
-	// iterate all segments of the other prefix and copy their data
-	auto other_ptr = other.data.ptr;
-	auto remaining = other.count;
-
-	while (other_ptr.IsSet()) {
-		auto &other_segment = PrefixSegment::Get(art, other_ptr);
-		auto copy_count = MinValue(Node::PREFIX_SEGMENT_SIZE, remaining);
-
-		// copy the data
-		for (idx_t i = 0; i < copy_count; i++) {
-			segment = segment.get().Append(art, count, other_segment.bytes[i]);
-		}
-
-		// adjust the loop variables
-		other_ptr = other_segment.next;
-		remaining -= copy_count;
-	}
-	D_ASSERT(remaining == 0);
+	return optional_idx::Invalid();
 }
 
-void Prefix::Concatenate(ART &art, const uint8_t byte, const Prefix &other) {
+uint8_t Prefix::GetByte(const ART &art, const Node &node, const uint8_t pos) {
+	D_ASSERT(node.GetType() == PREFIX);
+	Prefix prefix(art, node);
+	return prefix.data[pos];
+}
 
-	auto new_size = count + 1 + other.count;
+Prefix Prefix::NewInternal(ART &art, Node &node, const data_ptr_t data, const uint8_t count, const idx_t offset,
+                           const NType type) {
+	node = Node::GetAllocator(art, type).New();
+	node.SetMetadata(static_cast<uint8_t>(type));
 
-	// overwrite into this prefix (both are inlined)
-	if (new_size <= Node::PREFIX_INLINE_BYTES) {
-		// move this prefix backwards
-		memmove(data.inlined + other.count + 1, data.inlined, count);
-		// copy byte
-		data.inlined[other.count] = byte;
-		// copy the other prefix into this prefix
-		memcpy(data.inlined, other.data.inlined, other.count);
-		count = new_size;
+	Prefix prefix(art, node, true);
+	prefix.data[Count(art)] = count;
+	if (data) {
+		D_ASSERT(count);
+		memcpy(prefix.data, data + offset, count);
+	}
+	return prefix;
+}
+
+void Prefix::New(ART &art, reference<Node> &ref, const ARTKey &key, const idx_t depth, idx_t count) {
+	idx_t offset = 0;
+
+	while (count) {
+		auto min = MinValue(UnsafeNumericCast<idx_t>(Count(art)), count);
+		auto this_count = UnsafeNumericCast<uint8_t>(min);
+		auto prefix = NewInternal(art, ref, key.data, this_count, offset + depth, PREFIX);
+
+		ref = *prefix.ptr;
+		offset += this_count;
+		count -= this_count;
+	}
+}
+
+void Prefix::Free(ART &art, Node &node) {
+	Node next;
+
+	while (node.HasMetadata() && node.GetType() == PREFIX) {
+		Prefix prefix(art, node, true);
+		next = *prefix.ptr;
+		Node::GetAllocator(art, PREFIX).Free(node);
+		node = next;
+	}
+
+	Node::Free(art, node);
+	node.Clear();
+}
+
+void Prefix::Concat(ART &art, Node &parent, uint8_t byte, const GateStatus old_status, const Node &child,
+                    const GateStatus status) {
+	D_ASSERT(!parent.IsAnyLeaf());
+	D_ASSERT(child.HasMetadata());
+
+	if (old_status == GateStatus::GATE_SET) {
+		// Concat Node4.
+		D_ASSERT(status == GateStatus::GATE_SET);
+		return ConcatGate(art, parent, byte, child);
+	}
+	if (child.GetGateStatus() == GateStatus::GATE_SET) {
+		// Concat Node4.
+		D_ASSERT(status == GateStatus::GATE_NOT_SET);
+		return ConcatChildIsGate(art, parent, byte, child);
+	}
+
+	if (status == GateStatus::GATE_SET && child.GetType() == NType::LEAF_INLINED) {
+		auto row_id = child.GetRowId();
+		Free(art, parent);
+		Leaf::New(parent, row_id);
 		return;
 	}
 
-	auto this_inlined = IsInlined();
-	auto this_count = count;
-	auto this_data = data;
-	Initialize();
-
-	// append the other prefix and possibly move the data to a segment
-	Append(art, other);
-	if (IsInlined()) {
-		MoveInlinedToSegment(art);
-	}
-
-	// get the tail
-	reference<PrefixSegment> segment(PrefixSegment::Get(art, data.ptr).GetTail(art));
-	// append the byte
-	segment = segment.get().Append(art, count, byte);
-
-	if (this_inlined) {
-		// append this prefix
-		for (idx_t i = 0; i < this_count; i++) {
-			segment = segment.get().Append(art, count, this_data.inlined[i]);
+	if (parent.GetType() != PREFIX) {
+		auto prefix = NewInternal(art, parent, &byte, 1, 0, PREFIX);
+		if (child.GetType() == PREFIX) {
+			prefix.Append(art, child);
+		} else {
+			*prefix.ptr = child;
 		}
 		return;
 	}
 
-	// iterate all segments of this prefix, copy their data, and free them
-	auto this_ptr = this_data.ptr;
-	auto remaining = this_count;
+	auto tail = GetTail(art, parent);
+	tail = tail.Append(art, byte);
 
-	while (this_ptr.IsSet()) {
-		auto &this_segment = PrefixSegment::Get(art, this_ptr);
-		auto copy_count = MinValue(Node::PREFIX_SEGMENT_SIZE, remaining);
-
-		// copy the data
-		for (idx_t i = 0; i < copy_count; i++) {
-			segment = segment.get().Append(art, count, this_segment.bytes[i]);
-		}
-
-		// adjust the loop variables
-		Node::Free(art, this_ptr);
-		this_ptr = this_segment.next;
-		remaining -= copy_count;
+	if (child.GetType() == PREFIX) {
+		tail.Append(art, child);
+	} else {
+		*tail.ptr = child;
 	}
-	D_ASSERT(remaining == 0);
 }
 
-uint8_t Prefix::Reduce(ART &art, const idx_t reduce_count) {
+template <class NODE>
+optional_idx TraverseInternal(ART &art, reference<NODE> &node, const ARTKey &key, idx_t &depth,
+                              const bool is_mutable = false) {
+	D_ASSERT(node.get().HasMetadata());
+	D_ASSERT(node.get().GetType() == NType::PREFIX);
 
-	auto new_count = count - reduce_count - 1;
-	auto new_first_byte = GetByte(art, reduce_count);
-
-	// prefix is now empty
-	if (new_count == 0) {
-		Free(art);
-		return new_first_byte;
-	}
-
-	// was inlined, just move bytes
-	if (IsInlined()) {
-		memmove(data.inlined, data.inlined + reduce_count + 1, new_count);
-		count = new_count;
-		return new_first_byte;
-	}
-
-	count = 0;
-	auto start = reduce_count + 1;
-	auto offset = start % Node::PREFIX_SEGMENT_SIZE;
-	auto remaining = new_count;
-
-	// get the source segment, i.e., the segment that contains the byte at start
-	reference<PrefixSegment> src_segment(PrefixSegment::Get(art, data.ptr));
-	for (idx_t i = 0; i < start / Node::PREFIX_SEGMENT_SIZE; i++) {
-		D_ASSERT(src_segment.get().next.IsSet());
-		src_segment = PrefixSegment::Get(art, src_segment.get().next);
-	}
-
-	// iterate all segments starting at the source segment and shift their data
-	reference<PrefixSegment> dst_segment(PrefixSegment::Get(art, data.ptr));
-	while (true) {
-		auto copy_count = MinValue(Node::PREFIX_SEGMENT_SIZE - offset, remaining);
-
-		// copy the data
-		for (idx_t i = offset; i < offset + copy_count; i++) {
-			dst_segment = dst_segment.get().Append(art, count, src_segment.get().bytes[i]);
+	while (node.get().GetType() == NType::PREFIX) {
+		auto pos = Prefix::GetMismatchWithKey(art, node, key, depth);
+		if (pos.IsValid()) {
+			return pos;
 		}
 
-		// adjust the loop variables
-		offset = 0;
-		remaining -= copy_count;
-		if (remaining == 0) {
+		Prefix prefix(art, node, is_mutable);
+		node = *prefix.ptr;
+		if (node.get().GetGateStatus() == GateStatus::GATE_SET) {
 			break;
 		}
-		D_ASSERT(src_segment.get().next.IsSet());
-		src_segment = PrefixSegment::Get(art, src_segment.get().next);
 	}
 
-	// possibly inline the data
-	if (IsInlined()) {
-		MoveSegmentToInlined(art);
-	}
-
-	return new_first_byte;
+	// We return an invalid index, if (and only if) the next node is:
+	// 1. not a prefix, or
+	// 2. a gate.
+	return optional_idx::Invalid();
 }
 
-uint8_t Prefix::GetByte(const ART &art, const idx_t position) const {
-
-	D_ASSERT(position < count);
-	if (IsInlined()) {
-		return data.inlined[position];
-	}
-
-	// get the correct segment
-	reference<PrefixSegment> segment(PrefixSegment::Get(art, data.ptr));
-	for (idx_t i = 0; i < position / Node::PREFIX_SEGMENT_SIZE; i++) {
-		D_ASSERT(segment.get().next.IsSet());
-		segment = PrefixSegment::Get(art, segment.get().next);
-	}
-
-	return segment.get().bytes[position % Node::PREFIX_SEGMENT_SIZE];
+optional_idx Prefix::Traverse(ART &art, reference<const Node> &node, const ARTKey &key, idx_t &depth) {
+	return TraverseInternal<const Node>(art, node, key, depth);
 }
 
-uint32_t Prefix::KeyMismatchPosition(const ART &art, const ARTKey &key, const uint32_t depth) const {
-
-	if (IsInlined()) {
-		for (idx_t mismatch_position = 0; mismatch_position < count; mismatch_position++) {
-			D_ASSERT(depth + mismatch_position < key.len);
-			if (key[depth + mismatch_position] != data.inlined[mismatch_position]) {
-				return mismatch_position;
-			}
-		}
-		return count;
-	}
-
-	uint32_t mismatch_position = 0;
-	auto ptr = data.ptr;
-
-	while (mismatch_position != count) {
-		D_ASSERT(depth + mismatch_position < key.len);
-		D_ASSERT(ptr.IsSet());
-
-		auto &segment = PrefixSegment::Get(art, ptr);
-		auto compare_count = MinValue(Node::PREFIX_SEGMENT_SIZE, count - mismatch_position);
-
-		// compare bytes
-		for (uint32_t i = 0; i < compare_count; i++) {
-			if (key[depth + mismatch_position] != segment.bytes[i]) {
-				return mismatch_position;
-			}
-			mismatch_position++;
-		}
-
-		// adjust loop variables
-		ptr = segment.next;
-	}
-	return count;
+optional_idx Prefix::TraverseMutable(ART &art, reference<Node> &node, const ARTKey &key, idx_t &depth) {
+	return TraverseInternal<Node>(art, node, key, depth, true);
 }
 
-uint32_t Prefix::MismatchPosition(const ART &art, const Prefix &other) const {
+void Prefix::Reduce(ART &art, Node &node, const idx_t pos) {
+	D_ASSERT(node.HasMetadata());
+	D_ASSERT(pos < Count(art));
 
-	D_ASSERT(count <= other.count);
-
-	// case 1: both prefixes are inlined
-	if (IsInlined() && other.IsInlined()) {
-		for (uint32_t i = 0; i < count; i++) {
-			if (data.inlined[i] != other.data.inlined[i]) {
-				return i;
-			}
-		}
-		return count;
-	}
-
-	// case 2: only this prefix is inlined
-	if (IsInlined()) {
-		// we only need the first segment of the other prefix
-		auto &segment = PrefixSegment::Get(art, other.data.ptr);
-		for (uint32_t i = 0; i < count; i++) {
-			if (data.inlined[i] != segment.bytes[i]) {
-				return i;
-			}
-		}
-		return count;
-	}
-
-	// case 3: both prefixes are not inlined
-	auto ptr = data.ptr;
-	auto other_ptr = other.data.ptr;
-
-	// iterate segments and compare bytes
-	uint32_t mismatch_position = 0;
-	while (ptr.IsSet()) {
-		D_ASSERT(other_ptr.IsSet());
-		auto &segment = PrefixSegment::Get(art, ptr);
-		auto &other_segment = PrefixSegment::Get(art, other_ptr);
-
-		// compare bytes
-		auto compare_count = MinValue(Node::PREFIX_SEGMENT_SIZE, count - mismatch_position);
-		for (uint32_t i = 0; i < compare_count; i++) {
-			if (segment.bytes[i] != other_segment.bytes[i]) {
-				return mismatch_position;
-			}
-			mismatch_position++;
-		}
-
-		// adjust loop variables
-		ptr = segment.next;
-		other_ptr = other_segment.next;
-	}
-	return count;
-}
-
-void Prefix::Serialize(const ART &art, MetaBlockWriter &writer) const {
-
-	writer.Write(count);
-
-	// write inlined data
-	if (IsInlined()) {
-		writer.WriteData(data.inlined, count);
+	Prefix prefix(art, node);
+	if (pos == idx_t(prefix.data[Count(art)] - 1)) {
+		auto next = *prefix.ptr;
+		prefix.ptr->Clear();
+		Node::Free(art, node);
+		node = next;
 		return;
 	}
 
-	D_ASSERT(data.ptr.IsSet());
-	auto ptr = data.ptr;
-	auto remaining = count;
-
-	// iterate all prefix segments and write their bytes
-	while (ptr.IsSet()) {
-		auto &segment = PrefixSegment::Get(art, ptr);
-		auto copy_count = MinValue(Node::PREFIX_SEGMENT_SIZE, remaining);
-
-		// write the bytes
-		writer.WriteData(segment.bytes, copy_count);
-
-		// adjust loop variables
-		remaining -= copy_count;
-		ptr = segment.next;
+	// FIXME: Copy into new prefix (chain) instead of shifting.
+	for (idx_t i = 0; i < Count(art) - pos - 1; i++) {
+		prefix.data[i] = prefix.data[pos + i + 1];
 	}
-	D_ASSERT(remaining == 0);
+
+	prefix.data[Count(art)] -= pos + 1;
+	prefix.Append(art, *prefix.ptr);
 }
 
-void Prefix::Deserialize(ART &art, MetaBlockReader &reader) {
+GateStatus Prefix::Split(ART &art, reference<Node> &node, Node &child, const uint8_t pos) {
+	D_ASSERT(node.get().HasMetadata());
 
-	auto count_p = reader.Read<uint32_t>();
+	Prefix prefix(art, node, true);
 
-	// copy into inlined data
-	if (count_p <= Node::PREFIX_INLINE_BYTES) {
-		reader.ReadData(data.inlined, count_p);
-		count = count_p;
-		return;
+	// The split is at the last prefix byte, and the prefix is full.
+	// We decrease the count and return.
+	// We get:
+	// [this prefix minus its last byte] ->
+	// [new node at split byte] ->
+	// [child at split byte: prefix.ptr].
+	if (pos + 1 == Count(art)) {
+		prefix.data[Count(art)]--;
+		node = *prefix.ptr;
+		child = *prefix.ptr;
+		return GateStatus::GATE_NOT_SET;
 	}
 
-	// copy into segments
-	count = 0;
-	reference<PrefixSegment> segment(PrefixSegment::New(art, data.ptr));
-	for (idx_t i = 0; i < count_p; i++) {
-		segment = segment.get().Append(art, count, reader.Read<uint8_t>());
-	}
-	D_ASSERT(count_p == count);
-}
+	if (pos + 1 < prefix.data[Count(art)]) {
+		// The split is not at the last prefix byte.
+		// We get:
+		// [this prefix minus split byte, minus remaining bytes] ->
+		// [new node at split byte] ->
+		// [child with remaining bytes, and possibly remaining prefix nodes].
 
-void Prefix::Vacuum(ART &art) {
+		// Create a new prefix and
+		// 1. copy the remaining bytes of this prefix.
+		// 2. append remaining prefix nodes.
+		auto new_prefix = NewInternal(art, child, nullptr, 0, 0, PREFIX);
+		new_prefix.data[Count(art)] = prefix.data[Count(art)] - pos - 1;
+		memcpy(new_prefix.data, prefix.data + pos + 1, new_prefix.data[Count(art)]);
 
-	if (IsInlined()) {
-		return;
-	}
-
-	// first pointer has special treatment because we don't obtain it from a prefix segment
-	auto &allocator = Node::GetAllocator(art, NType::PREFIX_SEGMENT);
-	if (allocator.NeedsVacuum(data.ptr)) {
-		data.ptr.SetPtr(allocator.VacuumPointer(data.ptr));
-	}
-
-	auto ptr = data.ptr;
-	while (ptr.IsSet()) {
-		auto &segment = PrefixSegment::Get(art, ptr);
-		ptr = segment.next;
-		if (ptr.IsSet() && allocator.NeedsVacuum(ptr)) {
-			segment.next.SetPtr(allocator.VacuumPointer(ptr));
-			ptr = segment.next;
+		if (prefix.ptr->GetType() == PREFIX && prefix.ptr->GetGateStatus() == GateStatus::GATE_NOT_SET) {
+			new_prefix.Append(art, *prefix.ptr);
+		} else {
+			*new_prefix.ptr = *prefix.ptr;
 		}
+
+	} else {
+		D_ASSERT(pos + 1 == prefix.data[Count(art)]);
+		// The split is at the last prefix byte, but the prefix is not full.
+		// There are no other bytes or prefixes after the split.
+		// We get:
+		// [this prefix minus split byte (can be its only byte, then we free it)] ->
+		// [new node at split byte] ->
+		// [child at split byte: prefix.ptr].
+		child = *prefix.ptr;
+	}
+
+	// Set the new count of this node (can be empty).
+	prefix.data[Count(art)] = pos;
+
+	// No bytes left before the split, free this node.
+	if (pos == 0) {
+		auto old_status = node.get().GetGateStatus();
+		prefix.ptr->Clear();
+		Node::Free(art, node);
+		return old_status;
+	}
+
+	// There are bytes left before the split.
+	// The subsequent node replaces the split byte.
+	node = *prefix.ptr;
+	return GateStatus::GATE_NOT_SET;
+}
+
+string Prefix::VerifyAndToString(ART &art, const Node &node, const bool only_verify) {
+	string str = "";
+	reference<const Node> ref(node);
+
+	Iterator(art, ref, true, false, [&](Prefix &prefix) {
+		D_ASSERT(prefix.data[Count(art)] != 0);
+		D_ASSERT(prefix.data[Count(art)] <= Count(art));
+
+		str += " Prefix :[ ";
+		for (idx_t i = 0; i < prefix.data[Count(art)]; i++) {
+			str += to_string(prefix.data[i]) + "-";
+		}
+		str += " ] ";
+	});
+
+	auto child = ref.get().VerifyAndToString(art, only_verify);
+	return only_verify ? "" : str + child;
+}
+
+void Prefix::TransformToDeprecated(ART &art, Node &node, unsafe_unique_ptr<FixedSizeAllocator> &allocator) {
+	// Early-out, if we do not need any transformations.
+	if (!allocator) {
+		reference<Node> ref(node);
+		while (ref.get().GetType() == PREFIX && ref.get().GetGateStatus() == GateStatus::GATE_NOT_SET) {
+			Prefix prefix(art, ref, true, true);
+			if (!prefix.in_memory) {
+				return;
+			}
+			ref = *prefix.ptr;
+		}
+		return Node::TransformToDeprecated(art, ref, allocator);
+	}
+
+	// We need to create a new prefix (chain).
+	Node new_node;
+	new_node = allocator->New();
+	new_node.SetMetadata(static_cast<uint8_t>(PREFIX));
+	Prefix new_prefix(allocator, new_node, DEPRECATED_COUNT);
+
+	Node current_node = node;
+	while (current_node.GetType() == PREFIX && current_node.GetGateStatus() == GateStatus::GATE_NOT_SET) {
+		Prefix prefix(art, current_node, true, true);
+		if (!prefix.in_memory) {
+			return;
+		}
+
+		for (idx_t i = 0; i < prefix.data[Count(art)]; i++) {
+			new_prefix = new_prefix.TransformToDeprecatedAppend(art, allocator, prefix.data[i]);
+		}
+
+		*new_prefix.ptr = *prefix.ptr;
+		prefix.ptr->Clear();
+		Node::Free(art, current_node);
+		current_node = *new_prefix.ptr;
+	}
+
+	node = new_node;
+	return Node::TransformToDeprecated(art, *new_prefix.ptr, allocator);
+}
+
+Prefix Prefix::Append(ART &art, const uint8_t byte) {
+	if (data[Count(art)] != Count(art)) {
+		data[data[Count(art)]] = byte;
+		data[Count(art)]++;
+		return *this;
+	}
+
+	auto prefix = NewInternal(art, *ptr, nullptr, 0, 0, PREFIX);
+	return prefix.Append(art, byte);
+}
+
+void Prefix::Append(ART &art, Node other) {
+	D_ASSERT(other.HasMetadata());
+
+	Prefix prefix = *this;
+	while (other.GetType() == PREFIX) {
+		if (other.GetGateStatus() == GateStatus::GATE_SET) {
+			*prefix.ptr = other;
+			return;
+		}
+
+		Prefix other_prefix(art, other, true);
+		for (idx_t i = 0; i < other_prefix.data[Count(art)]; i++) {
+			prefix = prefix.Append(art, other_prefix.data[i]);
+		}
+
+		*prefix.ptr = *other_prefix.ptr;
+		Node::GetAllocator(art, PREFIX).Free(other);
+		other = *prefix.ptr;
 	}
 }
 
-PrefixSegment &Prefix::MoveInlinedToSegment(ART &art) {
-
-	D_ASSERT(IsInlined());
-
-	Node ptr;
-	auto &segment = PrefixSegment::New(art, ptr);
-
-	// move data
-	D_ASSERT(Node::PREFIX_SEGMENT_SIZE >= Node::PREFIX_INLINE_BYTES);
-	memcpy(segment.bytes, data.inlined, count);
-	data.ptr = ptr;
-	return segment;
+Prefix Prefix::GetTail(ART &art, const Node &node) {
+	Prefix prefix(art, node, true);
+	while (prefix.ptr->GetType() == PREFIX) {
+		prefix = Prefix(art, *prefix.ptr, true);
+	}
+	return prefix;
 }
 
-void Prefix::MoveSegmentToInlined(ART &art) {
+void Prefix::ConcatGate(ART &art, Node &parent, uint8_t byte, const Node &child) {
+	D_ASSERT(child.HasMetadata());
+	Node new_prefix = Node();
 
-	D_ASSERT(IsInlined());
-	D_ASSERT(data.ptr.IsSet());
+	// Inside gates, inlined row IDs are not prefixed.
+	if (child.GetType() == NType::LEAF_INLINED) {
+		Leaf::New(new_prefix, child.GetRowId());
 
-	auto ptr = data.ptr;
-	auto &segment = PrefixSegment::Get(art, data.ptr);
+	} else if (child.GetType() == PREFIX) {
+		// At least one more row ID in this gate.
+		auto prefix = NewInternal(art, new_prefix, &byte, 1, 0, PREFIX);
+		prefix.ptr->Clear();
+		prefix.Append(art, child);
+		new_prefix.SetGateStatus(GateStatus::GATE_SET);
 
-	memcpy(data.inlined, segment.bytes, count);
-	Node::Free(art, ptr);
+	} else {
+		// At least one more row ID in this gate.
+		auto prefix = NewInternal(art, new_prefix, &byte, 1, 0, PREFIX);
+		*prefix.ptr = child;
+		new_prefix.SetGateStatus(GateStatus::GATE_SET);
+	}
+
+	if (parent.GetType() != PREFIX) {
+		parent = new_prefix;
+		return;
+	}
+	*GetTail(art, parent).ptr = new_prefix;
+}
+
+void Prefix::ConcatChildIsGate(ART &art, Node &parent, uint8_t byte, const Node &child) {
+	// Create a new prefix and point it to the gate.
+	if (parent.GetType() != PREFIX) {
+		auto prefix = NewInternal(art, parent, &byte, 1, 0, PREFIX);
+		*prefix.ptr = child;
+		return;
+	}
+
+	auto tail = GetTail(art, parent);
+	tail = tail.Append(art, byte);
+	*tail.ptr = child;
+}
+
+Prefix Prefix::TransformToDeprecatedAppend(ART &art, unsafe_unique_ptr<FixedSizeAllocator> &allocator, uint8_t byte) {
+	if (data[DEPRECATED_COUNT] != DEPRECATED_COUNT) {
+		data[data[DEPRECATED_COUNT]] = byte;
+		data[DEPRECATED_COUNT]++;
+		return *this;
+	}
+
+	*ptr = allocator->New();
+	ptr->SetMetadata(static_cast<uint8_t>(PREFIX));
+	Prefix prefix(allocator, *ptr, DEPRECATED_COUNT);
+	return prefix.TransformToDeprecatedAppend(art, allocator, byte);
 }
 
 } // namespace duckdb

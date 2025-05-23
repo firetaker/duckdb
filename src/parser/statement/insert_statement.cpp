@@ -30,7 +30,7 @@ InsertStatement::InsertStatement(const InsertStatement &other)
     : SQLStatement(other), select_statement(unique_ptr_cast<SQLStatement, SelectStatement>(
                                other.select_statement ? other.select_statement->Copy() : nullptr)),
       columns(other.columns), table(other.table), schema(other.schema), catalog(other.catalog),
-      default_values(other.default_values) {
+      default_values(other.default_values), column_order(other.column_order) {
 	cte_map = other.cte_map.Copy();
 	for (auto &expr : other.returning_list) {
 		returning_list.emplace_back(expr->Copy());
@@ -81,6 +81,9 @@ string InsertStatement::ToString() const {
 	if (table_ref && !table_ref->alias.empty()) {
 		result += StringUtil::Format(" AS %s", KeywordHelper::WriteOptionallyQuoted(table_ref->alias));
 	}
+	if (column_order == InsertColumnOrder::INSERT_BY_NAME) {
+		result += " BY NAME";
+	}
 	if (!columns.empty()) {
 		result += " (";
 		for (idx_t i = 0; i < columns.size(); i++) {
@@ -95,8 +98,10 @@ string InsertStatement::ToString() const {
 	auto values_list = GetValuesList();
 	if (values_list) {
 		D_ASSERT(!default_values);
+		auto saved_alias = values_list->alias;
 		values_list->alias = string();
 		result += values_list->ToString();
+		values_list->alias = saved_alias;
 	} else if (select_statement) {
 		D_ASSERT(!default_values);
 		result += select_statement->ToString();
@@ -151,7 +156,12 @@ string InsertStatement::ToString() const {
 			if (i > 0) {
 				result += ", ";
 			}
-			result += returning_list[i]->ToString();
+			auto column = returning_list[i]->ToString();
+			if (!returning_list[i]->GetAlias().empty()) {
+				column +=
+				    StringUtil::Format(" AS %s", KeywordHelper::WriteOptionallyQuoted(returning_list[i]->GetAlias()));
+			}
+			result += column;
 		}
 	}
 	return result;
@@ -181,7 +191,7 @@ optional_ptr<ExpressionListRef> InsertStatement::GetValuesList() const {
 	if (node.aggregate_handling != AggregateHandling::STANDARD_HANDLING) {
 		return nullptr;
 	}
-	if (node.select_list.size() != 1 || node.select_list[0]->type != ExpressionType::STAR) {
+	if (node.select_list.size() != 1 || node.select_list[0]->GetExpressionType() != ExpressionType::STAR) {
 		return nullptr;
 	}
 	if (!node.from_table || node.from_table->type != TableReferenceType::EXPRESSION_LIST) {

@@ -10,7 +10,7 @@
 
 #include "duckdb/catalog/catalog_entry.hpp"
 #include "duckdb/catalog/catalog_set.hpp"
-#include "duckdb/parser/query_error_context.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 
 namespace duckdb {
 class ClientContext;
@@ -19,8 +19,6 @@ class StandardEntry;
 class TableCatalogEntry;
 class TableFunctionCatalogEntry;
 class SequenceCatalogEntry;
-class Serializer;
-class Deserializer;
 
 enum class OnCreateConflict : uint8_t;
 
@@ -46,25 +44,23 @@ public:
 	static constexpr const char *Name = "schema";
 
 public:
-	SchemaCatalogEntry(Catalog &catalog, string name, bool is_internal);
+	SchemaCatalogEntry(Catalog &catalog, CreateSchemaInfo &info);
 
 public:
+	unique_ptr<CreateInfo> GetInfo() const override;
+
 	//! Scan the specified catalog set, invoking the callback method for every entry
 	virtual void Scan(ClientContext &context, CatalogType type,
 	                  const std::function<void(CatalogEntry &)> &callback) = 0;
 	//! Scan the specified catalog set, invoking the callback method for every committed entry
 	virtual void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) = 0;
 
-	//! Serialize the meta information of the SchemaCatalogEntry a serializer
-	virtual void Serialize(Serializer &serializer) const;
-	//! Deserializes to a CreateSchemaInfo
-	static unique_ptr<CreateSchemaInfo> Deserialize(Deserializer &source);
-
 	string ToSQL() const override;
 
 	//! Creates an index with the given name in the schema
-	virtual optional_ptr<CatalogEntry> CreateIndex(ClientContext &context, CreateIndexInfo &info,
+	virtual optional_ptr<CatalogEntry> CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
 	                                               TableCatalogEntry &table) = 0;
+	optional_ptr<CatalogEntry> CreateIndex(ClientContext &context, CreateIndexInfo &info, TableCatalogEntry &table);
 	//! Create a scalar or aggregate function within the given schema
 	virtual optional_ptr<CatalogEntry> CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) = 0;
 	//! Creates a table with the given name in the schema
@@ -87,16 +83,22 @@ public:
 	//! Create a enum within the given schema
 	virtual optional_ptr<CatalogEntry> CreateType(CatalogTransaction transaction, CreateTypeInfo &info) = 0;
 
-	DUCKDB_API virtual optional_ptr<CatalogEntry> GetEntry(CatalogTransaction transaction, CatalogType type,
-	                                                       const string &name) = 0;
-	DUCKDB_API virtual SimilarCatalogEntry GetSimilarEntry(CatalogTransaction transaction, CatalogType type,
-	                                                       const string &name);
+	//! Lookup an entry in the schema
+	DUCKDB_API virtual optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction,
+	                                                          const EntryLookupInfo &lookup_info) = 0;
+	DUCKDB_API virtual CatalogSet::EntryLookup LookupEntryDetailed(CatalogTransaction transaction,
+	                                                               const EntryLookupInfo &lookup_info);
+	DUCKDB_API virtual SimilarCatalogEntry GetSimilarEntry(CatalogTransaction transaction,
+	                                                       const EntryLookupInfo &lookup_info);
+
+	DUCKDB_API optional_ptr<CatalogEntry> GetEntry(CatalogTransaction transaction, CatalogType type,
+	                                               const string &name);
 
 	//! Drops an entry from the schema
 	virtual void DropEntry(ClientContext &context, DropInfo &info) = 0;
 
 	//! Alters a catalog entry
-	virtual void Alter(ClientContext &context, AlterInfo &info) = 0;
+	virtual void Alter(CatalogTransaction transaction, AlterInfo &info) = 0;
 
 	CatalogTransaction GetCatalogTransaction(ClientContext &context);
 };

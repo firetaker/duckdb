@@ -1,12 +1,13 @@
 #include "result_helper.hpp"
-#include "re2/re2.h"
+
 #include "catch.hpp"
-#include "termcolor.hpp"
-#include "sqllogic_test_runner.hpp"
 #include "duckdb/common/crypto/md5.hpp"
 #include "duckdb/parser/qualified_name.hpp"
-#include "test_helpers.hpp"
+#include "re2/re2.h"
 #include "sqllogic_test_logger.hpp"
+#include "sqllogic_test_runner.hpp"
+#include "termcolor.hpp"
+#include "test_helpers.hpp"
 
 #include <thread>
 
@@ -87,7 +88,7 @@ bool TestResultHelper::CheckQueryResult(const Query &query, ExecuteContext &cont
 
 	vector<string> comparison_values;
 	if (values.size() == 1 && ResultIsFile(values[0])) {
-		auto fname = SQLLogicTestRunner::LoopReplacement(values[0], context.running_loops);
+		auto fname = runner.LoopReplacement(values[0], context.running_loops);
 		string csv_error;
 		comparison_values = LoadResultFromFile(fname, result.names, expected_column_count, csv_error);
 		if (!csv_error.empty()) {
@@ -123,6 +124,9 @@ bool TestResultHelper::CheckQueryResult(const Query &query, ExecuteContext &cont
 			// we try to keep going with the number of columns in the result
 			expected_column_count = result.ColumnCount();
 			column_count_mismatch = true;
+		}
+		if (expected_column_count == 0) {
+			return false;
 		}
 		idx_t expected_rows = comparison_values.size() / expected_column_count;
 		// we first check the counts: if the values are equal to the amount of rows we expect the results to be row-wise
@@ -181,7 +185,9 @@ bool TestResultHelper::CheckQueryResult(const Query &query, ExecuteContext &cont
 						return false;
 					}
 					// we do this just to increment the assertion counter
-					REQUIRE(success);
+					string success_log =
+					    StringUtil::Format("CheckQueryResult: %s:%d", query.file_name, query.query_line);
+					REQUIRE(success_log.c_str());
 				}
 				current_row++;
 			}
@@ -196,7 +202,8 @@ bool TestResultHelper::CheckQueryResult(const Query &query, ExecuteContext &cont
 					return false;
 				}
 				// we do this just to increment the assertion counter
-				REQUIRE(success);
+				string success_log = StringUtil::Format("CheckQueryResult: %s:%d", query.file_name, query.query_line);
+				REQUIRE(success_log.c_str());
 
 				current_column++;
 				if (current_column == expected_column_count) {
@@ -256,21 +263,30 @@ bool TestResultHelper::CheckStatementResult(const Statement &statement, ExecuteC
 		// internal errors are never expected
 		// neither are "unoptimized result differs from original result" errors
 
-		bool internal_error =
-		    result.HasError() ? TestIsInternalError(runner.always_fail_error_messages, result.GetError()) : false;
-		if (!internal_error) {
-			if (expected_result == ExpectedResult::RESULT_UNKNOWN) {
-				error = false;
-			} else {
-				error = !error;
-			}
+		if (result.HasError() && TestIsInternalError(runner.always_fail_error_messages, result.GetError())) {
+			logger.InternalException(result);
+			return false;
+		}
+		if (expected_result == ExpectedResult::RESULT_UNKNOWN) {
+			error = false;
 		} else {
-			expected_result = ExpectedResult::RESULT_SUCCESS;
+			error = !error;
 		}
 		if (result.HasError() && !statement.expected_error.empty()) {
 			if (!StringUtil::Contains(result.GetError(), statement.expected_error)) {
-				logger.ExpectedErrorMismatch(statement.expected_error, result);
-				return false;
+				bool success = false;
+				if (StringUtil::StartsWith(statement.expected_error, "<REGEX>:") ||
+				    StringUtil::StartsWith(statement.expected_error, "<!REGEX>:")) {
+					success = MatchesRegex(logger, result.ToString(), statement.expected_error);
+				}
+				if (!success) {
+					logger.ExpectedErrorMismatch(statement.expected_error, result);
+					return false;
+				}
+				string success_log =
+				    StringUtil::Format("CheckStatementResult: %s:%d", statement.file_name, statement.query_line);
+				REQUIRE(success_log.c_str());
+				return true;
 			}
 		}
 	}
@@ -284,7 +300,13 @@ bool TestResultHelper::CheckStatementResult(const Statement &statement, ExecuteC
 		}
 		return false;
 	}
-	REQUIRE(!error);
+	if (error) {
+		REQUIRE(false);
+	} else {
+		string success_log =
+		    StringUtil::Format("CheckStatementResult: %s:%d", statement.file_name, statement.query_line);
+		REQUIRE(success_log.c_str());
+	}
 	return true;
 }
 
@@ -292,7 +314,8 @@ vector<string> TestResultHelper::LoadResultFromFile(string fname, vector<string>
                                                     string &error) {
 	DuckDB db(nullptr);
 	Connection con(db);
-	con.Query("PRAGMA threads=" + to_string(std::thread::hardware_concurrency()));
+	auto threads = MaxValue<idx_t>(std::thread::hardware_concurrency(), 1);
+	con.Query("PRAGMA threads=" + to_string(threads));
 	fname = StringUtil::Replace(fname, "<FILE>:", "");
 
 	string struct_definition = "STRUCT_PACK(";
@@ -300,12 +323,12 @@ vector<string> TestResultHelper::LoadResultFromFile(string fname, vector<string>
 		if (i > 0) {
 			struct_definition += ", ";
 		}
-		struct_definition += KeywordHelper::WriteOptionallyQuoted(names[i]) + " := 'VARCHAR'";
+		struct_definition += StringUtil::Format("%s := VARCHAR", SQLIdentifier(names[i]));
 	}
 	struct_definition += ")";
 
-	auto csv_result =
-	    con.Query("SELECT * FROM read_csv('" + fname + "', header=1, sep='|', columns=" + struct_definition + ")");
+	auto csv_result = con.Query("SELECT * FROM read_csv('" + fname +
+	                            "', header=1, sep='|', columns=" + struct_definition + ", auto_detect=false)");
 	if (csv_result->HasError()) {
 		error = StringUtil::Format("Could not read CSV File \"%s\": %s", fname, csv_result->GetError());
 		return vector<string>();
@@ -422,21 +445,7 @@ bool TestResultHelper::CompareValues(SQLLogicTestLogger &logger, MaterializedQue
 		return true;
 	}
 	if (StringUtil::StartsWith(rvalue_str, "<REGEX>:") || StringUtil::StartsWith(rvalue_str, "<!REGEX>:")) {
-		bool want_match = StringUtil::StartsWith(rvalue_str, "<REGEX>:");
-		string regex_str = StringUtil::Replace(StringUtil::Replace(rvalue_str, "<REGEX>:", ""), "<!REGEX>:", "");
-		RE2::Options options;
-		options.set_dot_nl(true);
-		RE2 re(regex_str, options);
-		if (!re.ok()) {
-			logger.PrintErrorHeader("Test error!");
-			logger.PrintLineSep();
-			std::cerr << termcolor::red << termcolor::bold << "Failed to parse regex: " << re.error()
-			          << termcolor::reset << std::endl;
-			logger.PrintLineSep();
-			return false;
-		}
-		bool regex_matches = RE2::FullMatch(lvalue_str, re);
-		if (regex_matches == want_match) {
+		if (MatchesRegex(logger, lvalue_str, rvalue_str)) {
 			return true;
 		}
 	}
@@ -496,8 +505,9 @@ bool TestResultHelper::CompareValues(SQLLogicTestLogger &logger, MaterializedQue
 		logger.PrintLineSep();
 		logger.PrintSQL();
 		logger.PrintLineSep();
+
 		std::cerr << termcolor::red << termcolor::bold << "Mismatch on row " << current_row + 1 << ", column "
-		          << current_column + 1 << std::endl
+		          << result.ColumnName(current_column) << "(index " << current_column + 1 << ")" << std::endl
 		          << termcolor::reset;
 		std::cerr << lvalue_str << " <> " << rvalue_str << std::endl;
 		logger.PrintLineSep();
@@ -505,6 +515,28 @@ bool TestResultHelper::CompareValues(SQLLogicTestLogger &logger, MaterializedQue
 		return false;
 	}
 	return true;
+}
+
+bool TestResultHelper::MatchesRegex(SQLLogicTestLogger &logger, string lvalue_str, string rvalue_str) {
+	bool want_match = StringUtil::StartsWith(rvalue_str, "<REGEX>:");
+	string regex_str = StringUtil::Replace(StringUtil::Replace(rvalue_str, "<REGEX>:", ""), "<!REGEX>:", "");
+
+	RE2::Options options;
+	options.set_dot_nl(true);
+	RE2 re(regex_str, options);
+	if (!re.ok()) {
+		logger.PrintErrorHeader("Test error!");
+		logger.PrintLineSep();
+		std::cerr << termcolor::red << termcolor::bold << "Failed to parse regex: " << re.error() << termcolor::reset
+		          << std::endl;
+		logger.PrintLineSep();
+		return false;
+	}
+	bool regex_matches = RE2::FullMatch(lvalue_str, re);
+	if ((want_match && regex_matches) || (!want_match && !regex_matches)) {
+		return true;
+	}
+	return false;
 }
 
 } // namespace duckdb

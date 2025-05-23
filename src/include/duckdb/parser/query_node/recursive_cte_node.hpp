@@ -30,6 +30,8 @@ public:
 	unique_ptr<QueryNode> right;
 	//! Aliases of the recursive CTE node
 	vector<string> aliases;
+	//! targets for key variants
+	vector<unique_ptr<ParsedExpression>> key_targets;
 
 	const vector<unique_ptr<ParsedExpression>> &GetSelectList() const override {
 		return left->GetSelectList();
@@ -44,12 +46,10 @@ public:
 	unique_ptr<QueryNode> Copy() const override;
 
 	//! Serializes a QueryNode to a stand-alone binary blob
-	void Serialize(FieldWriter &writer) const override;
 	//! Deserializes a blob back into a QueryNode
-	static unique_ptr<QueryNode> Deserialize(FieldReader &reader);
 
-	void FormatSerialize(FormatSerializer &serializer) const override;
-	static unique_ptr<QueryNode> FormatDeserialize(FormatDeserializer &source);
+	void Serialize(Serializer &serializer) const override;
+	static unique_ptr<QueryNode> Deserialize(Deserializer &source);
 };
 
 } // namespace duckdb

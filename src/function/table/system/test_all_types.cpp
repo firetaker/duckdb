@@ -1,7 +1,8 @@
+#include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/pair.hpp"
+#include "duckdb/common/types/bit.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/timestamp.hpp"
-#include "duckdb/common/types/bit.hpp"
 #include "duckdb/function/table/system_functions.hpp"
 
 #include <cmath>
@@ -17,7 +18,7 @@ struct TestAllTypesData : public GlobalTableFunctionState {
 	idx_t offset;
 };
 
-vector<TestType> TestAllTypesFun::GetTestTypes() {
+vector<TestType> TestAllTypesFun::GetTestTypes(bool use_large_enum) {
 	vector<TestType> result;
 	// scalar types/numerics
 	result.emplace_back(LogicalType::BOOLEAN, "bool");
@@ -26,10 +27,12 @@ vector<TestType> TestAllTypesFun::GetTestTypes() {
 	result.emplace_back(LogicalType::INTEGER, "int");
 	result.emplace_back(LogicalType::BIGINT, "bigint");
 	result.emplace_back(LogicalType::HUGEINT, "hugeint");
+	result.emplace_back(LogicalType::UHUGEINT, "uhugeint");
 	result.emplace_back(LogicalType::UTINYINT, "utinyint");
 	result.emplace_back(LogicalType::USMALLINT, "usmallint");
 	result.emplace_back(LogicalType::UINTEGER, "uint");
 	result.emplace_back(LogicalType::UBIGINT, "ubigint");
+	result.emplace_back(LogicalType::VARINT, "varint");
 	result.emplace_back(LogicalType::DATE, "date");
 	result.emplace_back(LogicalType::TIME, "time");
 	result.emplace_back(LogicalType::TIMESTAMP, "timestamp");
@@ -70,68 +73,82 @@ vector<TestType> TestAllTypesFun::GetTestTypes() {
 	auto small_enum_ptr = FlatVector::GetData<string_t>(small_enum);
 	small_enum_ptr[0] = StringVector::AddStringOrBlob(small_enum, "DUCK_DUCK_ENUM");
 	small_enum_ptr[1] = StringVector::AddStringOrBlob(small_enum, "GOOSE");
-	result.emplace_back(LogicalType::ENUM("small_enum", small_enum, 2), "small_enum");
+	result.emplace_back(LogicalType::ENUM(small_enum, 2), "small_enum");
 
 	Vector medium_enum(LogicalType::VARCHAR, 300);
 	auto medium_enum_ptr = FlatVector::GetData<string_t>(medium_enum);
 	for (idx_t i = 0; i < 300; i++) {
 		medium_enum_ptr[i] = StringVector::AddStringOrBlob(medium_enum, string("enum_") + to_string(i));
 	}
-	result.emplace_back(LogicalType::ENUM("medium_enum", medium_enum, 300), "medium_enum");
+	result.emplace_back(LogicalType::ENUM(medium_enum, 300), "medium_enum");
 
-	// this is a big one... not sure if we should push this one here, but it's required for completeness
-	Vector large_enum(LogicalType::VARCHAR, 70000);
-	auto large_enum_ptr = FlatVector::GetData<string_t>(large_enum);
-	for (idx_t i = 0; i < 70000; i++) {
-		large_enum_ptr[i] = StringVector::AddStringOrBlob(large_enum, string("enum_") + to_string(i));
+	if (use_large_enum) {
+		// this is a big one... not sure if we should push this one here, but it's required for completeness
+		Vector large_enum(LogicalType::VARCHAR, 70000);
+		auto large_enum_ptr = FlatVector::GetData<string_t>(large_enum);
+		for (idx_t i = 0; i < 70000; i++) {
+			large_enum_ptr[i] = StringVector::AddStringOrBlob(large_enum, string("enum_") + to_string(i));
+		}
+		result.emplace_back(LogicalType::ENUM(large_enum, 70000), "large_enum");
+	} else {
+		Vector large_enum(LogicalType::VARCHAR, 2);
+		auto large_enum_ptr = FlatVector::GetData<string_t>(large_enum);
+		large_enum_ptr[0] = StringVector::AddStringOrBlob(large_enum, string("enum_") + to_string(0));
+		large_enum_ptr[1] = StringVector::AddStringOrBlob(large_enum, string("enum_") + to_string(69999));
+		result.emplace_back(LogicalType::ENUM(large_enum, 2), "large_enum");
 	}
-	result.emplace_back(LogicalType::ENUM("large_enum", large_enum, 70000), "large_enum");
 
 	// arrays
 	auto int_list_type = LogicalType::LIST(LogicalType::INTEGER);
-	auto empty_int_list = Value::EMPTYLIST(LogicalType::INTEGER);
-	auto int_list = Value::LIST({Value::INTEGER(42), Value::INTEGER(999), Value(LogicalType::INTEGER),
-	                             Value(LogicalType::INTEGER), Value::INTEGER(-42)});
+	auto empty_int_list = Value::LIST(LogicalType::INTEGER, vector<Value>());
+	auto int_list =
+	    Value::LIST(LogicalType::INTEGER, {Value::INTEGER(42), Value::INTEGER(999), Value(LogicalType::INTEGER),
+	                                       Value(LogicalType::INTEGER), Value::INTEGER(-42)});
 	result.emplace_back(int_list_type, "int_array", empty_int_list, int_list);
 
 	auto double_list_type = LogicalType::LIST(LogicalType::DOUBLE);
-	auto empty_double_list = Value::EMPTYLIST(LogicalType::DOUBLE);
-	auto double_list = Value::LIST(
-	    {Value::DOUBLE(42), Value::DOUBLE(NAN), Value::DOUBLE(std::numeric_limits<double>::infinity()),
-	     Value::DOUBLE(-std::numeric_limits<double>::infinity()), Value(LogicalType::DOUBLE), Value::DOUBLE(-42)});
+	auto empty_double_list = Value::LIST(LogicalType::DOUBLE, vector<Value>());
+	auto double_list = Value::LIST(LogicalType::DOUBLE, {Value::DOUBLE(42), Value::DOUBLE(NAN),
+	                                                     Value::DOUBLE(std::numeric_limits<double>::infinity()),
+	                                                     Value::DOUBLE(-std::numeric_limits<double>::infinity()),
+	                                                     Value(LogicalType::DOUBLE), Value::DOUBLE(-42)});
 	result.emplace_back(double_list_type, "double_array", empty_double_list, double_list);
 
 	auto date_list_type = LogicalType::LIST(LogicalType::DATE);
-	auto empty_date_list = Value::EMPTYLIST(LogicalType::DATE);
-	auto date_list =
-	    Value::LIST({Value::DATE(date_t()), Value::DATE(date_t::infinity()), Value::DATE(date_t::ninfinity()),
-	                 Value(LogicalType::DATE), Value::DATE(Date::FromString("2022-05-12"))});
+	auto empty_date_list = Value::LIST(LogicalType::DATE, vector<Value>());
+	auto date_list = Value::LIST(LogicalType::DATE, {Value::DATE(date_t()), Value::DATE(date_t::infinity()),
+	                                                 Value::DATE(date_t::ninfinity()), Value(LogicalType::DATE),
+	                                                 Value::DATE(Date::FromString("2022-05-12"))});
 	result.emplace_back(date_list_type, "date_array", empty_date_list, date_list);
 
 	auto timestamp_list_type = LogicalType::LIST(LogicalType::TIMESTAMP);
-	auto empty_timestamp_list = Value::EMPTYLIST(LogicalType::TIMESTAMP);
-	auto timestamp_list = Value::LIST({Value::TIMESTAMP(timestamp_t()), Value::TIMESTAMP(timestamp_t::infinity()),
-	                                   Value::TIMESTAMP(timestamp_t::ninfinity()), Value(LogicalType::TIMESTAMP),
-	                                   Value::TIMESTAMP(Timestamp::FromString("2022-05-12 16:23:45"))});
+	auto empty_timestamp_list = Value::LIST(LogicalType::TIMESTAMP, vector<Value>());
+	auto timestamp_list =
+	    Value::LIST(LogicalType::TIMESTAMP, {Value::TIMESTAMP(timestamp_t()), Value::TIMESTAMP(timestamp_t::infinity()),
+	                                         Value::TIMESTAMP(timestamp_t::ninfinity()), Value(LogicalType::TIMESTAMP),
+	                                         Value::TIMESTAMP(Timestamp::FromString("2022-05-12 16:23:45"))});
 	result.emplace_back(timestamp_list_type, "timestamp_array", empty_timestamp_list, timestamp_list);
 
 	auto timestamptz_list_type = LogicalType::LIST(LogicalType::TIMESTAMP_TZ);
-	auto empty_timestamptz_list = Value::EMPTYLIST(LogicalType::TIMESTAMP_TZ);
-	auto timestamptz_list = Value::LIST({Value::TIMESTAMPTZ(timestamp_t()), Value::TIMESTAMPTZ(timestamp_t::infinity()),
-	                                     Value::TIMESTAMPTZ(timestamp_t::ninfinity()), Value(LogicalType::TIMESTAMP_TZ),
-	                                     Value::TIMESTAMPTZ(Timestamp::FromString("2022-05-12 16:23:45-07"))});
+	auto empty_timestamptz_list = Value::LIST(LogicalType::TIMESTAMP_TZ, vector<Value>());
+	auto timestamptz_list =
+	    Value::LIST(LogicalType::TIMESTAMP_TZ,
+	                {Value::TIMESTAMPTZ(timestamp_tz_t()), Value::TIMESTAMPTZ(timestamp_tz_t(timestamp_t::infinity())),
+	                 Value::TIMESTAMPTZ(timestamp_tz_t(timestamp_t::ninfinity())), Value(LogicalType::TIMESTAMP_TZ),
+	                 Value::TIMESTAMPTZ(timestamp_tz_t(Timestamp::FromString("2022-05-12 16:23:45-07")))});
 	result.emplace_back(timestamptz_list_type, "timestamptz_array", empty_timestamptz_list, timestamptz_list);
 
 	auto varchar_list_type = LogicalType::LIST(LogicalType::VARCHAR);
-	auto empty_varchar_list = Value::EMPTYLIST(LogicalType::VARCHAR);
-	auto varchar_list =
-	    Value::LIST({Value("🦆🦆🦆🦆🦆🦆"), Value("goose"), Value(LogicalType::VARCHAR), Value("")});
+	auto empty_varchar_list = Value::LIST(LogicalType::VARCHAR, vector<Value>());
+	auto varchar_list = Value::LIST(LogicalType::VARCHAR, {Value("🦆🦆🦆🦆🦆🦆"), Value("goose"),
+	                                                       Value(LogicalType::VARCHAR), Value("")});
 	result.emplace_back(varchar_list_type, "varchar_array", empty_varchar_list, varchar_list);
 
 	// nested arrays
 	auto nested_list_type = LogicalType::LIST(int_list_type);
-	auto empty_nested_list = Value::EMPTYLIST(int_list_type);
-	auto nested_int_list = Value::LIST({empty_int_list, int_list, Value(int_list_type), empty_int_list, int_list});
+	auto empty_nested_list = Value::LIST(int_list_type, vector<Value>());
+	auto nested_int_list =
+	    Value::LIST(int_list_type, {empty_int_list, int_list, Value(int_list_type), empty_int_list, int_list});
 	result.emplace_back(nested_list_type, "nested_int_array", empty_nested_list, nested_int_list);
 
 	// structs
@@ -173,8 +190,8 @@ vector<TestType> TestAllTypesFun::GetTestTypes() {
 
 	// array of structs
 	auto array_of_structs_type = LogicalType::LIST(struct_type);
-	auto min_array_of_struct_val = Value::EMPTYLIST(struct_type);
-	auto max_array_of_struct_val = Value::LIST({min_struct_val, max_struct_val, Value(struct_type)});
+	auto min_array_of_struct_val = Value::LIST(struct_type, vector<Value>());
+	auto max_array_of_struct_val = Value::LIST(struct_type, {min_struct_val, max_struct_val, Value(struct_type)});
 	result.emplace_back(array_of_structs_type, "array_of_structs", std::move(min_array_of_struct_val),
 	                    std::move(max_array_of_struct_val));
 
@@ -187,7 +204,7 @@ vector<TestType> TestAllTypesFun::GetTestTypes() {
 	map_struct1.push_back(make_pair("value", Value("🦆🦆🦆🦆🦆🦆")));
 	child_list_t<Value> map_struct2;
 	map_struct2.push_back(make_pair("key", Value("key2")));
-	map_struct2.push_back(make_pair("key", Value("goose")));
+	map_struct2.push_back(make_pair("value", Value("goose")));
 
 	vector<Value> map_values;
 	map_values.push_back(Value::STRUCT(map_struct1));
@@ -196,29 +213,113 @@ vector<TestType> TestAllTypesFun::GetTestTypes() {
 	auto max_map_value = Value::MAP(ListType::GetChildType(map_type), map_values);
 	result.emplace_back(map_type, "map", std::move(min_map_value), std::move(max_map_value));
 
+	// union
+	child_list_t<LogicalType> members = {{"name", LogicalType::VARCHAR}, {"age", LogicalType::SMALLINT}};
+	auto union_type = LogicalType::UNION(members);
+	const Value &min = Value::UNION(members, 0, Value("Frank"));
+	const Value &max = Value::UNION(members, 1, Value::SMALLINT(5));
+	result.emplace_back(union_type, "union", min, max);
+
+	// fixed int array
+	auto fixed_int_array_type = LogicalType::ARRAY(LogicalType::INTEGER, 3);
+	auto fixed_int_min_array_value = Value::ARRAY(LogicalType::INTEGER, {Value(LogicalType::INTEGER), 2, 3});
+	auto fixed_int_max_array_value = Value::ARRAY(LogicalType::INTEGER, {4, 5, 6});
+	result.emplace_back(fixed_int_array_type, "fixed_int_array", fixed_int_min_array_value, fixed_int_max_array_value);
+
+	// fixed varchar array
+	auto fixed_varchar_array_type = LogicalType::ARRAY(LogicalType::VARCHAR, 3);
+	auto fixed_varchar_min_array_value =
+	    Value::ARRAY(LogicalType::VARCHAR, {Value("a"), Value(LogicalType::VARCHAR), Value("c")});
+	auto fixed_varchar_max_array_value = Value::ARRAY(LogicalType::VARCHAR, {Value("d"), Value("e"), Value("f")});
+	result.emplace_back(fixed_varchar_array_type, "fixed_varchar_array", fixed_varchar_min_array_value,
+	                    fixed_varchar_max_array_value);
+
+	// fixed nested int array
+	auto fixed_nested_int_array_type = LogicalType::ARRAY(fixed_int_array_type, 3);
+	auto fixed_nested_int_min_array_value = Value::ARRAY(
+	    fixed_int_array_type, {fixed_int_min_array_value, Value(fixed_int_array_type), fixed_int_min_array_value});
+	auto fixed_nested_int_max_array_value = Value::ARRAY(
+	    fixed_int_array_type, {fixed_int_max_array_value, fixed_int_min_array_value, fixed_int_max_array_value});
+	result.emplace_back(fixed_nested_int_array_type, "fixed_nested_int_array", fixed_nested_int_min_array_value,
+	                    fixed_nested_int_max_array_value);
+
+	// fixed nested varchar array
+	auto fixed_nested_varchar_array_type = LogicalType::ARRAY(fixed_varchar_array_type, 3);
+	auto fixed_nested_varchar_min_array_value =
+	    Value::ARRAY(fixed_varchar_array_type,
+	                 {fixed_varchar_min_array_value, Value(fixed_varchar_array_type), fixed_varchar_min_array_value});
+	auto fixed_nested_varchar_max_array_value =
+	    Value::ARRAY(fixed_varchar_array_type,
+	                 {fixed_varchar_max_array_value, fixed_varchar_min_array_value, fixed_varchar_max_array_value});
+	result.emplace_back(fixed_nested_varchar_array_type, "fixed_nested_varchar_array",
+	                    fixed_nested_varchar_min_array_value, fixed_nested_varchar_max_array_value);
+
+	// fixed array of structs
+	auto fixed_struct_array_type = LogicalType::ARRAY(struct_type, 3);
+	auto fixed_struct_min_array_value = Value::ARRAY(struct_type, {min_struct_val, max_struct_val, min_struct_val});
+	auto fixed_struct_max_array_value = Value::ARRAY(struct_type, {max_struct_val, min_struct_val, max_struct_val});
+	result.emplace_back(fixed_struct_array_type, "fixed_struct_array", fixed_struct_min_array_value,
+	                    fixed_struct_max_array_value);
+
+	// struct of fixed array
+	auto struct_of_fixed_array_type =
+	    LogicalType::STRUCT({{"a", fixed_int_array_type}, {"b", fixed_varchar_array_type}});
+	auto struct_of_fixed_array_min_value =
+	    Value::STRUCT({{"a", fixed_int_min_array_value}, {"b", fixed_varchar_min_array_value}});
+	auto struct_of_fixed_array_max_value =
+	    Value::STRUCT({{"a", fixed_int_max_array_value}, {"b", fixed_varchar_max_array_value}});
+	result.emplace_back(struct_of_fixed_array_type, "struct_of_fixed_array", struct_of_fixed_array_min_value,
+	                    struct_of_fixed_array_max_value);
+
+	// fixed array of list of int
+	auto fixed_array_of_list_of_int_type = LogicalType::ARRAY(int_list_type, 3);
+	auto fixed_array_of_list_of_int_min_value = Value::ARRAY(int_list_type, {empty_int_list, int_list, empty_int_list});
+	auto fixed_array_of_list_of_int_max_value = Value::ARRAY(int_list_type, {int_list, empty_int_list, int_list});
+	result.emplace_back(fixed_array_of_list_of_int_type, "fixed_array_of_int_list",
+	                    fixed_array_of_list_of_int_min_value, fixed_array_of_list_of_int_max_value);
+
+	// list of fixed array of int
+	auto list_of_fixed_array_of_int_type = LogicalType::LIST(fixed_int_array_type);
+	auto list_of_fixed_array_of_int_min_value = Value::LIST(
+	    fixed_int_array_type, {fixed_int_min_array_value, fixed_int_max_array_value, fixed_int_min_array_value});
+	auto list_of_fixed_array_of_int_max_value = Value::LIST(
+	    fixed_int_array_type, {fixed_int_max_array_value, fixed_int_min_array_value, fixed_int_max_array_value});
+	result.emplace_back(list_of_fixed_array_of_int_type, "list_of_fixed_int_array",
+	                    list_of_fixed_array_of_int_min_value, list_of_fixed_array_of_int_max_value);
+
 	return result;
 }
 
+struct TestAllTypesBindData : public TableFunctionData {
+	vector<TestType> test_types;
+};
+
 static unique_ptr<FunctionData> TestAllTypesBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<string> &names) {
-	auto test_types = TestAllTypesFun::GetTestTypes();
-	for (auto &test_type : test_types) {
-		return_types.push_back(std::move(test_type.type));
-		names.push_back(std::move(test_type.name));
+	auto result = make_uniq<TestAllTypesBindData>();
+	bool use_large_enum = false;
+	auto entry = input.named_parameters.find("use_large_enum");
+	if (entry != input.named_parameters.end()) {
+		use_large_enum = BooleanValue::Get(entry->second);
 	}
-	return nullptr;
+	result->test_types = TestAllTypesFun::GetTestTypes(use_large_enum);
+	for (auto &test_type : result->test_types) {
+		return_types.push_back(test_type.type);
+		names.push_back(test_type.name);
+	}
+	return std::move(result);
 }
 
 unique_ptr<GlobalTableFunctionState> TestAllTypesInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<TestAllTypesBindData>();
 	auto result = make_uniq<TestAllTypesData>();
-	auto test_types = TestAllTypesFun::GetTestTypes();
 	// 3 rows: min, max and NULL
 	result->entries.resize(3);
 	// initialize the values
-	for (auto &test_type : test_types) {
-		result->entries[0].push_back(std::move(test_type.min_value));
-		result->entries[1].push_back(std::move(test_type.max_value));
-		result->entries[2].emplace_back(std::move(test_type.type));
+	for (auto &test_type : bind_data.test_types) {
+		result->entries[0].push_back(test_type.min_value);
+		result->entries[1].push_back(test_type.max_value);
+		result->entries[2].emplace_back(test_type.type);
 	}
 	return std::move(result);
 }
@@ -243,7 +344,9 @@ void TestAllTypesFunction(ClientContext &context, TableFunctionInput &data_p, Da
 }
 
 void TestAllTypesFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddFunction(TableFunction("test_all_types", {}, TestAllTypesFunction, TestAllTypesBind, TestAllTypesInit));
+	TableFunction test_all_types("test_all_types", {}, TestAllTypesFunction, TestAllTypesBind, TestAllTypesInit);
+	test_all_types.named_parameters["use_large_enum"] = LogicalType::BOOLEAN;
+	set.AddFunction(test_all_types);
 }
 
 } // namespace duckdb

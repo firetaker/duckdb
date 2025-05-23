@@ -8,7 +8,6 @@
 
 #pragma once
 
-#include "duckdb/common/types/chunk_collection.hpp"
 #include "duckdb/execution/operator/join/physical_join.hpp"
 
 namespace duckdb {
@@ -21,7 +20,7 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::BLOCKWISE_NL_JOIN;
 
 public:
-	PhysicalBlockwiseNLJoin(LogicalOperator &op, unique_ptr<PhysicalOperator> left, unique_ptr<PhysicalOperator> right,
+	PhysicalBlockwiseNLJoin(LogicalOperator &op, PhysicalOperator &left, PhysicalOperator &right,
 	                        unique_ptr<Expression> condition, JoinType join_type, idx_t estimated_cardinality);
 
 	unique_ptr<Expression> condition;
@@ -47,7 +46,7 @@ public:
 	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
 
 	bool IsSource() const override {
-		return IsRightOuterJoin(join_type);
+		return PropagatesBuildSide(join_type);
 	}
 	bool ParallelSource() const override {
 		return true;
@@ -59,7 +58,7 @@ public:
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	                          GlobalSinkState &gstate) const override;
+	                          OperatorSinkFinalizeInput &input) const override;
 
 	bool IsSink() const override {
 		return true;
@@ -69,7 +68,7 @@ public:
 	}
 
 public:
-	string ParamsToString() const override;
+	InsertionOrderPreservingMap<string> ParamsToString() const override;
 };
 
 } // namespace duckdb

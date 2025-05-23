@@ -5,7 +5,6 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_subquery_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/common/field_writer.hpp"
 
 namespace duckdb {
 
@@ -27,29 +26,6 @@ unique_ptr<Expression> JoinCondition::CreateExpression(vector<JoinCondition> con
 			result = std::move(conj);
 		}
 	}
-	return result;
-}
-
-//! Serializes a JoinCondition to a stand-alone binary blob
-void JoinCondition::Serialize(Serializer &serializer) const {
-	FieldWriter writer(serializer);
-	writer.WriteOptional(left);
-	writer.WriteOptional(right);
-	writer.WriteField<ExpressionType>(comparison);
-	writer.Finalize();
-}
-
-//! Deserializes a blob back into a JoinCondition
-JoinCondition JoinCondition::Deserialize(Deserializer &source, PlanDeserializationState &state) {
-	auto result = JoinCondition();
-
-	FieldReader reader(source);
-	auto left = reader.ReadOptional<Expression>(nullptr, state);
-	auto right = reader.ReadOptional<Expression>(nullptr, state);
-	result.left = std::move(left);
-	result.right = std::move(right);
-	result.comparison = reader.ReadRequired<ExpressionType>();
-	reader.Finalize();
 	return result;
 }
 
@@ -81,20 +57,21 @@ JoinSide JoinSide::GetJoinSide(idx_t table_binding, const unordered_set<idx_t> &
 
 JoinSide JoinSide::GetJoinSide(Expression &expression, const unordered_set<idx_t> &left_bindings,
                                const unordered_set<idx_t> &right_bindings) {
-	if (expression.type == ExpressionType::BOUND_COLUMN_REF) {
+	if (expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 		auto &colref = expression.Cast<BoundColumnRefExpression>();
 		if (colref.depth > 0) {
-			throw Exception("Non-inner join on correlated columns not supported");
+			throw NotImplementedException("Non-inner join on correlated columns not supported");
 		}
 		return GetJoinSide(colref.binding.table_index, left_bindings, right_bindings);
 	}
-	D_ASSERT(expression.type != ExpressionType::BOUND_REF);
-	if (expression.type == ExpressionType::SUBQUERY) {
+	D_ASSERT(expression.GetExpressionType() != ExpressionType::BOUND_REF);
+	if (expression.GetExpressionType() == ExpressionType::SUBQUERY) {
 		D_ASSERT(expression.GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY);
 		auto &subquery = expression.Cast<BoundSubqueryExpression>();
 		JoinSide side = JoinSide::NONE;
-		if (subquery.child) {
-			side = GetJoinSide(*subquery.child, left_bindings, right_bindings);
+		for (auto &child : subquery.children) {
+			auto child_side = GetJoinSide(*child, left_bindings, right_bindings);
+			side = CombineJoinSide(side, child_side);
 		}
 		// correlated subquery, check the side of each of correlated columns in the subquery
 		for (auto &corr : subquery.binder->correlated_columns) {

@@ -16,6 +16,7 @@ namespace duckdb {
 struct TupleDataSegment;
 struct TupleDataChunk;
 struct TupleDataChunkPart;
+class ContinuousIdSet;
 
 struct TupleDataBlock {
 public:
@@ -52,17 +53,24 @@ public:
 
 class TupleDataAllocator {
 public:
-	TupleDataAllocator(BufferManager &buffer_manager, const TupleDataLayout &layout);
+	TupleDataAllocator(BufferManager &buffer_manager, shared_ptr<TupleDataLayout> &layout_ptr);
 	TupleDataAllocator(TupleDataAllocator &allocator);
 
+	~TupleDataAllocator();
+
+	//! Get the buffer manager
+	BufferManager &GetBufferManager();
 	//! Get the buffer allocator
 	Allocator &GetAllocator();
 	//! Get the layout
+	shared_ptr<TupleDataLayout> GetLayoutPtr() const;
 	const TupleDataLayout &GetLayout() const;
 	//! Number of row blocks
 	idx_t RowBlockCount() const;
 	//! Number of heap blocks
 	idx_t HeapBlockCount() const;
+	//! Sets the partition index of this tuple data allocator
+	void SetPartitionIndex(idx_t index);
 
 public:
 	//! Builds out the chunks for next append, given the metadata in the append state
@@ -79,20 +87,22 @@ public:
 	                           bool release_heap);
 	//! Releases or stores ALL handles in the management state
 	void ReleaseOrStoreHandles(TupleDataPinState &state, TupleDataSegment &segment);
+	//! Sets 'can_destroy' to true for all blocks so they aren't added to the eviction queue
+	void SetDestroyBufferUponUnpin();
 
 private:
 	//! Builds out a single part (grabs the lock)
 	TupleDataChunkPart BuildChunkPart(TupleDataPinState &pin_state, TupleDataChunkState &chunk_state,
-	                                  const idx_t append_offset, const idx_t append_count);
+	                                  const idx_t append_offset, const idx_t append_count, TupleDataChunk &chunk);
 	//! Internal function for InitializeChunkState
 	void InitializeChunkStateInternal(TupleDataPinState &pin_state, TupleDataChunkState &chunk_state, idx_t offset,
 	                                  bool recompute, bool init_heap_pointers, bool init_heap_sizes,
-	                                  vector<TupleDataChunkPart *> &parts);
+	                                  unsafe_vector<reference<TupleDataChunkPart>> &parts);
 	//! Internal function for ReleaseOrStoreHandles
-	static void ReleaseOrStoreHandlesInternal(TupleDataSegment &segment, vector<BufferHandle> &pinned_row_handles,
-	                                          unordered_map<uint32_t, BufferHandle> &handles,
-	                                          const unordered_set<uint32_t> &block_ids, vector<TupleDataBlock> &blocks,
-	                                          TupleDataPinProperties properties);
+	static void ReleaseOrStoreHandlesInternal(TupleDataSegment &segment,
+	                                          unsafe_vector<BufferHandle> &pinned_row_handles,
+	                                          buffer_handle_map_t &handles, const ContinuousIdSet &block_ids,
+	                                          unsafe_vector<TupleDataBlock> &blocks, TupleDataPinProperties properties);
 	//! Pins the given row block
 	BufferHandle &PinRowBlock(TupleDataPinState &state, const TupleDataChunkPart &part);
 	//! Pins the given heap block
@@ -106,11 +116,18 @@ private:
 	//! The buffer manager
 	BufferManager &buffer_manager;
 	//! The layout of the data
-	const TupleDataLayout layout;
+	shared_ptr<TupleDataLayout> layout_ptr;
+	const TupleDataLayout &layout;
+	//! Partition index (optional, if partitioned)
+	optional_idx partition_index;
 	//! Blocks storing the fixed-size rows
-	vector<TupleDataBlock> row_blocks;
+	unsafe_vector<TupleDataBlock> row_blocks;
 	//! Blocks storing the variable-size data of the fixed-size rows (e.g., string, list)
-	vector<TupleDataBlock> heap_blocks;
+	unsafe_vector<TupleDataBlock> heap_blocks;
+
+	//! Re-usable arrays used while building buffer space
+	unsafe_vector<reference<TupleDataChunkPart>> chunk_parts;
+	unsafe_vector<pair<idx_t, idx_t>> chunk_part_indices;
 };
 
 } // namespace duckdb

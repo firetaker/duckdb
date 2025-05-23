@@ -6,10 +6,8 @@ import glob
 
 os.chdir(os.path.dirname(__file__))
 
-import clang.cindex
-
 # Dont generate serialization for these enums
-blacklist = ["RegexOptions", "Flags"]
+blacklist = ["RegexOptions", "Flags", "ContainerType", "Type", "DictionaryAppendState", "DictFSSTMode"]
 
 enum_util_header_file = os.path.join("..", "src", "include", "duckdb", "common", "enum_util.hpp")
 enum_util_source_file = os.path.join("..", "src", "common", "enum_util.cpp")
@@ -20,28 +18,43 @@ overrides = {
         "SQLNULL": "NULL",
         "TIMESTAMP_TZ": "TIMESTAMP WITH TIME ZONE",
         "TIME_TZ": "TIME WITH TIME ZONE",
-        "TIMESTAMP_SEC": "TIMESTAMP_S", 
+        "TIMESTAMP_SEC": "TIMESTAMP_S",
     },
-    "JoinType": {
-        "OUTER": "FULL"
-    },
+    "JoinType": {"OUTER": "FULL"},
     "OrderType": {
         "ORDER_DEFAULT": ["ORDER_DEFAULT", "DEFAULT"],
         "DESCENDING": ["DESCENDING", "DESC"],
-        "ASCENDING": ["ASCENDING", "ASC"]
+        "ASCENDING": ["ASCENDING", "ASC"],
     },
     "OrderByNullType": {
         "ORDER_DEFAULT": ["ORDER_DEFAULT", "DEFAULT"],
         "NULLS_FIRST": ["NULLS_FIRST", "NULLS FIRST"],
-        "NULLS_LAST": ["NULLS_LAST", "NULLS LAST"]
+        "NULLS_LAST": ["NULLS_LAST", "NULLS LAST"],
     },
-    "SampleMethod": {
-        "SYSTEM_SAMPLE": "System",
-        "BERNOULLI_SAMPLE": "Bernoulli",
-        "RESERVOIR_SAMPLE": "Reservoir"
-    }
+    "CheckpointAbort": {
+        "NO_ABORT": "NONE",
+        "DEBUG_ABORT_BEFORE_TRUNCATE": "BEFORE_TRUNCATE",
+        "DEBUG_ABORT_BEFORE_HEADER": "BEFORE_HEADER",
+        "DEBUG_ABORT_AFTER_FREE_LIST_WRITE": "AFTER_FREE_LIST_WRITE",
+    },
+    "SampleMethod": {"SYSTEM_SAMPLE": "System", "BERNOULLI_SAMPLE": "Bernoulli", "RESERVOIR_SAMPLE": "Reservoir"},
+    "TableReferenceType": {"EMPTY_FROM": "EMPTY"},
+    "LogLevel": {
+        "LOG_TRACE": "TRACE",
+        "LOG_DEBUG": "DEBUG",
+        "LOG_INFO": "INFO",
+        "LOG_WARN": "WARN",
+        "LOG_ERROR": "ERROR",
+        "LOG_FATAL": "FATAL",
+    },
+    "RequestType": {
+        "GET_REQUEST": "GET",
+        "PUT_REQUEST": "PUT",
+        "HEAD_REQUEST": "HEAD",
+        "DELETE_REQUEST": "DELETE",
+        "POST_REQUEST": "POST",
+    },
 }
-
 
 # get all the headers
 hpp_files = []
@@ -50,19 +63,29 @@ for root, dirs, files in os.walk(os.path.join("..", "src")):
         # Dont include the generated header itself recursively
         if file == "enum_util.hpp":
             continue
+        if 'amalgamation' in root:
+            continue
 
         if file.endswith(".hpp"):
             hpp_files.append(os.path.join(root, file))
+
+
+def remove_prefix(str, prefix):
+    if str.startswith(prefix):
+        return str[len(prefix) :]
+    return str
+
 
 # get all the enum classes
 enums = []
 enum_paths = []
 enum_path_set = set()
+
 for hpp_file in hpp_files:
     with open(hpp_file, "r") as f:
         text = f.read()
         for res in re.finditer(r"enum class (\w*)\s*:\s*(\w*)\s*{((?:\s*[^}])*)}", text, re.MULTILINE):
-            file_path = os.path.relpath(hpp_file, os.path.join("..", "src")).removeprefix("include/")
+            file_path = remove_prefix(os.path.relpath(hpp_file, os.path.join("..", "src")), "include/")
             enum_name = res.group(1)
 
             if enum_name in blacklist:
@@ -72,7 +95,7 @@ for hpp_file in hpp_files:
             enum_type = res.group(2)
 
             enum_members = []
-            # Capture All members: \w+(\s*\=\s*\w*)?
+            # Capture All members: \w+(\s*\=\s*-?\w*)?
             # group one is the member name
             # group two is the member value
             # First clean group from comments
@@ -81,7 +104,7 @@ for hpp_file in hpp_files:
             s = re.sub(r"\/\*.*\*\/", "", s)
 
             enum_values = {}
-            for member in re.finditer(r"(\w+)(\s*\=\s*\w*)?", s):
+            for member in re.finditer(r"(\w+)(\s*\=\s*-?\w*)?", s):
                 key = member.group(1)
                 strings = [key]
                 if enum_name in overrides and key in overrides[enum_name]:
@@ -96,7 +119,7 @@ for hpp_file in hpp_files:
                 if member.group(2):
                     # If the member has a value, make sure it isnt already covered by another member
                     # If it is, we cant do anything else than ignore it
-                    value = member.group(2).strip().removeprefix("=").strip()
+                    value = remove_prefix(member.group(2).strip(), "=").strip()
                     if value not in enum_values and value not in dict(enum_members):
                         enum_members.append((key, strings))
                     else:
@@ -107,8 +130,11 @@ for hpp_file in hpp_files:
             if not file_path in enum_path_set:
                 enum_path_set.add(file_path)
                 enum_paths.append(file_path)
-                
+
             enums.append((enum_name, enum_type, enum_members))
+
+enum_paths.sort()
+enums.sort(key=lambda x: x[0])
 
 header = """//-------------------------------------------------------------------------
 // This file is automatically generated by scripts/generate_enum_util.py
@@ -123,16 +149,16 @@ header = """//------------------------------------------------------------------
 
 # Write the enum util header
 with open(enum_util_header_file, "w") as f:
-
     f.write(header)
 
     f.write('#pragma once\n\n')
     f.write('#include <stdint.h>\n')
     f.write('#include "duckdb/common/string.hpp"\n\n')
-    
+
     f.write("namespace duckdb {\n\n")
-    
-    f.write("""struct EnumUtil {
+
+    f.write(
+        """struct EnumUtil {
     // String -> Enum
     template <class T>
     static T FromString(const char *value) = delete;
@@ -146,18 +172,19 @@ with open(enum_util_header_file, "w") as f:
 
     template <class T>
     static string ToString(T value) { return string(ToChars<T>(value)); }
-};\n\n""")
+};\n\n"""
+    )
 
     # Forward declare all enums
     for enum_name, enum_type, _ in enums:
         f.write(f"enum class {enum_name} : {enum_type};\n\n")
     f.write("\n")
-    
+
     # Forward declare all enum serialization functions
     for enum_name, enum_type, _ in enums:
         f.write(f"template<>\nconst char* EnumUtil::ToChars<{enum_name}>({enum_name} value);\n\n")
     f.write("\n")
-    
+
     # Forward declare all enum dserialization functions
     for enum_name, enum_type, _ in enums:
         f.write(f"template<>\n{enum_name} EnumUtil::FromString<{enum_name}>(const char *value);\n\n")
@@ -179,25 +206,31 @@ with open(enum_util_source_file, "w") as f:
     f.write("namespace duckdb {\n\n")
 
     for enum_name, enum_type, enum_members in enums:
+        enum_string_array = "Get" + enum_name + "Values()"
         # Write the enum from string
-        f.write(f"template<>\nconst char* EnumUtil::ToChars<{enum_name}>({enum_name} value) {{\n")
-        f.write("switch(value) {\n")
+        f.write(f"const StringUtil::EnumStringLiteral *{enum_string_array} {{\n")
+        f.write(f"\tstatic constexpr StringUtil::EnumStringLiteral values[] {{\n")
+        member_count = 0
         for key, strings in enum_members:
-            # Always use the first string as the enum string
-            f.write(f"case {enum_name}::{key}: return \"{strings[0]}\";\n")
-        f.write('default: throw NotImplementedException(StringUtil::Format("Enum value: \'%d\' not implemented", value));\n')
-        f.write("}\n")
+            for str_val in strings:
+                if member_count != 0:
+                    f.write(",\n")
+                f.write(f"\t\t{{ static_cast<uint32_t>({enum_name}::{key}), \"{str_val}\" }}")
+                member_count += 1
+        f.write("\n\t};")
+        f.write("\n\treturn values;")
+        f.write("\n}\n\n")
+        f.write(f"template<>\nconst char* EnumUtil::ToChars<{enum_name}>({enum_name} value) {{\n")
+        f.write(
+            f"\treturn StringUtil::EnumToString({enum_string_array}, {member_count}, \"{enum_name}\", static_cast<uint32_t>(value));\n"
+        )
         f.write("}\n\n")
 
         # Write the string to enum
         f.write(f"template<>\n{enum_name} EnumUtil::FromString<{enum_name}>(const char *value) {{\n")
-        for key, strings in enum_members:
-            cond = " || ".join([f'StringUtil::Equals(value, "{string}")' for string in strings])
-            f.write(f'if ({cond}) {{ return {enum_name}::{key}; }}\n')
-        f.write('throw NotImplementedException(StringUtil::Format("Enum value: \'%s\' not implemented", value));\n')
-
-        f.write("}\n\n")
+        f.write(
+            f"\treturn static_cast<{enum_name}>(StringUtil::StringToEnum({enum_string_array}, {member_count}, \"{enum_name}\", value));"
+        )
+        f.write("\n}\n\n")
 
     f.write("}\n\n")
-
-print("Remember to run clang-format on the generated files!")

@@ -29,7 +29,7 @@ PhysicalPerfectHashAggregate::PhysicalPerfectHashAggregate(ClientContext &contex
 	vector<BoundAggregateExpression *> bindings;
 	vector<LogicalType> payload_types_filters;
 	for (auto &expr : aggregates) {
-		D_ASSERT(expr->expression_class == ExpressionClass::BOUND_AGGREGATE);
+		D_ASSERT(expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE);
 		D_ASSERT(expr->IsAggregate());
 		auto &aggr = expr->Cast<BoundAggregateExpression>();
 		bindings.push_back(&aggr);
@@ -122,7 +122,7 @@ SinkResultType PhysicalPerfectHashAggregate::Sink(ExecutionContext &context, Dat
 
 	for (idx_t group_idx = 0; group_idx < groups.size(); group_idx++) {
 		auto &group = groups[group_idx];
-		D_ASSERT(group->type == ExpressionType::BOUND_REF);
+		D_ASSERT(group->GetExpressionType() == ExpressionType::BOUND_REF);
 		auto &bound_ref_expr = group->Cast<BoundReferenceExpression>();
 		group_chunk.data[group_idx].Reference(chunk.data[bound_ref_expr.index]);
 	}
@@ -130,7 +130,7 @@ SinkResultType PhysicalPerfectHashAggregate::Sink(ExecutionContext &context, Dat
 	for (auto &aggregate : aggregates) {
 		auto &aggr = aggregate->Cast<BoundAggregateExpression>();
 		for (auto &child_expr : aggr.children) {
-			D_ASSERT(child_expr->type == ExpressionType::BOUND_REF);
+			D_ASSERT(child_expr->GetExpressionType() == ExpressionType::BOUND_REF);
 			auto &bound_ref_expr = child_expr->Cast<BoundReferenceExpression>();
 			aggregate_input_chunk.data[aggregate_input_idx++].Reference(chunk.data[bound_ref_expr.index]);
 		}
@@ -159,13 +159,15 @@ SinkResultType PhysicalPerfectHashAggregate::Sink(ExecutionContext &context, Dat
 //===--------------------------------------------------------------------===//
 // Combine
 //===--------------------------------------------------------------------===//
-void PhysicalPerfectHashAggregate::Combine(ExecutionContext &context, GlobalSinkState &gstate_p,
-                                           LocalSinkState &lstate_p) const {
-	auto &lstate = lstate_p.Cast<PerfectHashAggregateLocalState>();
-	auto &gstate = gstate_p.Cast<PerfectHashAggregateGlobalState>();
+SinkCombineResultType PhysicalPerfectHashAggregate::Combine(ExecutionContext &context,
+                                                            OperatorSinkCombineInput &input) const {
+	auto &lstate = input.local_state.Cast<PerfectHashAggregateLocalState>();
+	auto &gstate = input.global_state.Cast<PerfectHashAggregateGlobalState>();
 
 	lock_guard<mutex> l(gstate.lock);
 	gstate.ht->Combine(*lstate.ht);
+
+	return SinkCombineResultType::FINISHED;
 }
 
 //===--------------------------------------------------------------------===//
@@ -186,7 +188,7 @@ unique_ptr<GlobalSourceState> PhysicalPerfectHashAggregate::GetGlobalSourceState
 
 SourceResultType PhysicalPerfectHashAggregate::GetData(ExecutionContext &context, DataChunk &chunk,
                                                        OperatorSourceInput &input) const {
-	auto &state = (PerfectHashAggregateState &)input.global_state;
+	auto &state = input.global_state.Cast<PerfectHashAggregateState>();
 	auto &gstate = sink_state->Cast<PerfectHashAggregateGlobalState>();
 
 	gstate.ht->Scan(state.ht_scan_position, chunk);
@@ -198,24 +200,29 @@ SourceResultType PhysicalPerfectHashAggregate::GetData(ExecutionContext &context
 	}
 }
 
-string PhysicalPerfectHashAggregate::ParamsToString() const {
-	string result;
+InsertionOrderPreservingMap<string> PhysicalPerfectHashAggregate::ParamsToString() const {
+	InsertionOrderPreservingMap<string> result;
+	string groups_info;
 	for (idx_t i = 0; i < groups.size(); i++) {
 		if (i > 0) {
-			result += "\n";
+			groups_info += "\n";
 		}
-		result += groups[i]->GetName();
+		groups_info += groups[i]->GetName();
 	}
+	result["Groups"] = groups_info;
+
+	string aggregate_info;
 	for (idx_t i = 0; i < aggregates.size(); i++) {
-		if (i > 0 || !groups.empty()) {
-			result += "\n";
+		if (i > 0) {
+			aggregate_info += "\n";
 		}
-		result += aggregates[i]->GetName();
+		aggregate_info += aggregates[i]->GetName();
 		auto &aggregate = aggregates[i]->Cast<BoundAggregateExpression>();
 		if (aggregate.filter) {
-			result += " Filter: " + aggregate.filter->GetName();
+			aggregate_info += " Filter: " + aggregate.filter->GetName();
 		}
 	}
+	result["Aggregates"] = aggregate_info;
 	return result;
 }
 

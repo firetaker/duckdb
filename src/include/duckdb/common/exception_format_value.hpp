@@ -15,6 +15,28 @@
 
 namespace duckdb {
 
+// Helper class to support custom overloading
+// Escaping " and quoting the value with "
+class SQLIdentifier {
+public:
+	explicit SQLIdentifier(const string &raw_string) : raw_string(raw_string) {
+	}
+
+public:
+	string raw_string;
+};
+
+// Helper class to support custom overloading
+// Escaping ' and quoting the value with '
+class SQLString {
+public:
+	explicit SQLString(const string &raw_string) : raw_string(raw_string) {
+	}
+
+public:
+	string raw_string;
+};
+
 enum class PhysicalType : uint8_t;
 struct LogicalType;
 
@@ -25,10 +47,11 @@ enum class ExceptionFormatValueType : uint8_t {
 };
 
 struct ExceptionFormatValue {
-	DUCKDB_API ExceptionFormatValue(double dbl_val);   // NOLINT
-	DUCKDB_API ExceptionFormatValue(int64_t int_val);  // NOLINT
-	DUCKDB_API ExceptionFormatValue(string str_val);   // NOLINT
-	DUCKDB_API ExceptionFormatValue(hugeint_t hg_val); // NOLINT
+	DUCKDB_API ExceptionFormatValue(double dbl_val);     // NOLINT
+	DUCKDB_API ExceptionFormatValue(int64_t int_val);    // NOLINT
+	DUCKDB_API ExceptionFormatValue(string str_val);     // NOLINT
+	DUCKDB_API ExceptionFormatValue(hugeint_t hg_val);   // NOLINT
+	DUCKDB_API ExceptionFormatValue(uhugeint_t uhg_val); // NOLINT
 
 	ExceptionFormatValueType type;
 
@@ -47,6 +70,10 @@ public:
 template <>
 DUCKDB_API ExceptionFormatValue ExceptionFormatValue::CreateFormatValue(PhysicalType value);
 template <>
+DUCKDB_API ExceptionFormatValue ExceptionFormatValue::CreateFormatValue(SQLString value);
+template <>
+DUCKDB_API ExceptionFormatValue ExceptionFormatValue::CreateFormatValue(SQLIdentifier value);
+template <>
 DUCKDB_API ExceptionFormatValue ExceptionFormatValue::CreateFormatValue(LogicalType value);
 template <>
 DUCKDB_API ExceptionFormatValue ExceptionFormatValue::CreateFormatValue(float value);
@@ -60,5 +87,7 @@ template <>
 DUCKDB_API ExceptionFormatValue ExceptionFormatValue::CreateFormatValue(char *value);
 template <>
 DUCKDB_API ExceptionFormatValue ExceptionFormatValue::CreateFormatValue(hugeint_t value);
+template <>
+DUCKDB_API ExceptionFormatValue ExceptionFormatValue::CreateFormatValue(uhugeint_t value);
 
 } // namespace duckdb

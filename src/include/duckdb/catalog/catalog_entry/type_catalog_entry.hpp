@@ -11,10 +11,9 @@
 #include "duckdb/catalog/standard_entry.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/parser/parsed_data/create_type_info.hpp"
+#include "duckdb/catalog/dependency_list.hpp"
 
 namespace duckdb {
-class Serializer;
-class Deserializer;
 
 //! A type catalog entry
 class TypeCatalogEntry : public StandardEntry {
@@ -28,11 +27,11 @@ public:
 
 	LogicalType user_type;
 
+	bind_logical_type_function_t bind_function;
+
 public:
-	//! Serialize the meta information of the TypeCatalogEntry a serializer
-	virtual void Serialize(Serializer &serializer) const;
-	//! Deserializes to a TypeCatalogEntry
-	static unique_ptr<CreateTypeInfo> Deserialize(Deserializer &source);
+	unique_ptr<CreateInfo> GetInfo() const override;
+	unique_ptr<CatalogEntry> Copy(ClientContext &context) const override;
 
 	string ToSQL() const override;
 };

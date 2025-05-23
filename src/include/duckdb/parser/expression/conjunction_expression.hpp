@@ -31,21 +31,19 @@ public:
 
 	string ToString() const override;
 
-	static bool Equal(const ConjunctionExpression *a, const ConjunctionExpression *b);
+	static bool Equal(const ConjunctionExpression &a, const ConjunctionExpression &b);
 
 	unique_ptr<ParsedExpression> Copy() const override;
 
-	void Serialize(FieldWriter &writer) const override;
-	static unique_ptr<ParsedExpression> Deserialize(ExpressionType type, FieldReader &source);
-	void FormatSerialize(FormatSerializer &serializer) const override;
-	static unique_ptr<ParsedExpression> FormatDeserialize(ExpressionType type, FormatDeserializer &deserializer);
+	void Serialize(Serializer &serializer) const override;
+	static unique_ptr<ParsedExpression> Deserialize(Deserializer &deserializer);
 
 public:
 	template <class T, class BASE>
 	static string ToString(const T &entry) {
 		string result = "(" + entry.children[0]->ToString();
 		for (idx_t i = 1; i < entry.children.size(); i++) {
-			result += " " + ExpressionTypeToOperator(entry.type) + " " + entry.children[i]->ToString();
+			result += " " + ExpressionTypeToOperator(entry.GetExpressionType()) + " " + entry.children[i]->ToString();
 		}
 		return result + ")";
 	}

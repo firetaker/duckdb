@@ -7,6 +7,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "include/icu-datefunc.hpp"
+#include "duckdb/main/extension_util.hpp"
 
 namespace duckdb {
 
@@ -59,7 +60,7 @@ struct ICUListRange : public ICUDateFunc {
 			increment_value = ListIncrementValue(row_idx);
 		}
 
-		uint64_t ListLength(idx_t row_idx, icu::Calendar *calendar) {
+		uint64_t ListLength(idx_t row_idx, TZCalendar &calendar) {
 			timestamp_t start_value;
 			timestamp_t end_value;
 			interval_t increment_value;
@@ -67,7 +68,7 @@ struct ICUListRange : public ICUDateFunc {
 			return ListLength(start_value, end_value, increment_value, INCLUSIVE_BOUND, calendar);
 		}
 
-		void Increment(timestamp_t &input, interval_t increment, icu::Calendar *calendar) {
+		void Increment(timestamp_t &input, interval_t increment, TZCalendar &calendar) {
 			input = Add(calendar, input, increment);
 		}
 
@@ -76,7 +77,7 @@ struct ICUListRange : public ICUDateFunc {
 		UnifiedVectorFormat vdata[3];
 
 		uint64_t ListLength(timestamp_t start_value, timestamp_t end_value, interval_t increment_value,
-		                    bool inclusive_bound, icu::Calendar *calendar) {
+		                    bool inclusive_bound, TZCalendar &calendar) {
 			bool is_positive = increment_value.months > 0 || increment_value.days > 0 || increment_value.micros > 0;
 			bool is_negative = increment_value.months < 0 || increment_value.days < 0 || increment_value.micros < 0;
 			if (!is_negative && !is_positive) {
@@ -128,9 +129,8 @@ struct ICUListRange : public ICUDateFunc {
 		D_ASSERT(args.ColumnCount() == 3);
 
 		auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-		auto &bind_info = (BindData &)*func_expr.bind_info;
-		CalendarPtr calendar_ptr(bind_info.calendar->clone());
-		auto calendar = calendar_ptr.get();
+		auto &bind_info = func_expr.bind_info->Cast<BindData>();
+		TZCalendar calendar(*bind_info.calendar, bind_info.cal_setting);
 
 		RangeInfoStruct<INCLUSIVE_BOUND> info(args);
 		idx_t args_size = 1;
@@ -180,28 +180,25 @@ struct ICUListRange : public ICUDateFunc {
 		result.Verify(args.size());
 	}
 
-	static void AddICUListRangeFunction(ClientContext &context) {
-		auto &catalog = Catalog::GetSystemCatalog(context);
+	static void AddICUListRangeFunction(DatabaseInstance &db) {
 
 		ScalarFunctionSet range("range");
 		range.AddFunction(ScalarFunction({LogicalType::TIMESTAMP_TZ, LogicalType::TIMESTAMP_TZ, LogicalType::INTERVAL},
 		                                 LogicalType::LIST(LogicalType::TIMESTAMP_TZ), ICUListRangeFunction<false>,
 		                                 Bind));
-		CreateScalarFunctionInfo range_func_info(range);
-		catalog.AddFunction(context, range_func_info);
+		ExtensionUtil::RegisterFunction(db, range);
 
 		// generate_series: similar to range, but inclusive instead of exclusive bounds on the RHS
 		ScalarFunctionSet generate_series("generate_series");
 		generate_series.AddFunction(
 		    ScalarFunction({LogicalType::TIMESTAMP_TZ, LogicalType::TIMESTAMP_TZ, LogicalType::INTERVAL},
 		                   LogicalType::LIST(LogicalType::TIMESTAMP_TZ), ICUListRangeFunction<true>, Bind));
-		CreateScalarFunctionInfo generate_series_func_info(generate_series);
-		catalog.AddFunction(context, generate_series_func_info);
+		ExtensionUtil::RegisterFunction(db, generate_series);
 	}
 };
 
-void RegisterICUListRangeFunctions(ClientContext &context) {
-	ICUListRange::AddICUListRangeFunction(context);
+void RegisterICUListRangeFunctions(DatabaseInstance &db) {
+	ICUListRange::AddICUListRangeFunction(db);
 }
 
 } // namespace duckdb

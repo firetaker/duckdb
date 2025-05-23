@@ -20,119 +20,6 @@
 
 namespace duckdb {
 
-static void BindExtraColumns(TableCatalogEntry &table, LogicalGet &get, LogicalProjection &proj, LogicalUpdate &update,
-                             physical_index_set_t &bound_columns) {
-	if (bound_columns.size() <= 1) {
-		return;
-	}
-	idx_t found_column_count = 0;
-	physical_index_set_t found_columns;
-	for (idx_t i = 0; i < update.columns.size(); i++) {
-		if (bound_columns.find(update.columns[i]) != bound_columns.end()) {
-			// this column is referenced in the CHECK constraint
-			found_column_count++;
-			found_columns.insert(update.columns[i]);
-		}
-	}
-	if (found_column_count > 0 && found_column_count != bound_columns.size()) {
-		// columns in this CHECK constraint were referenced, but not all were part of the UPDATE
-		// add them to the scan and update set
-		for (auto &check_column_id : bound_columns) {
-			if (found_columns.find(check_column_id) != found_columns.end()) {
-				// column is already projected
-				continue;
-			}
-			// column is not projected yet: project it by adding the clause "i=i" to the set of updated columns
-			auto &column = table.GetColumns().GetColumn(check_column_id);
-			update.expressions.push_back(make_uniq<BoundColumnRefExpression>(
-			    column.Type(), ColumnBinding(proj.table_index, proj.expressions.size())));
-			proj.expressions.push_back(make_uniq<BoundColumnRefExpression>(
-			    column.Type(), ColumnBinding(get.table_index, get.column_ids.size())));
-			get.column_ids.push_back(check_column_id.index);
-			update.columns.push_back(check_column_id);
-		}
-	}
-}
-
-static bool TypeSupportsRegularUpdate(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::LIST:
-	case LogicalTypeId::MAP:
-	case LogicalTypeId::UNION:
-		// lists and maps and unions don't support updates directly
-		return false;
-	case LogicalTypeId::STRUCT: {
-		auto &child_types = StructType::GetChildTypes(type);
-		for (auto &entry : child_types) {
-			if (!TypeSupportsRegularUpdate(entry.second)) {
-				return false;
-			}
-		}
-		return true;
-	}
-	default:
-		return true;
-	}
-}
-
-static void BindUpdateConstraints(TableCatalogEntry &table, LogicalGet &get, LogicalProjection &proj,
-                                  LogicalUpdate &update) {
-	if (!table.IsDuckTable()) {
-		return;
-	}
-	// check the constraints and indexes of the table to see if we need to project any additional columns
-	// we do this for indexes with multiple columns and CHECK constraints in the UPDATE clause
-	// suppose we have a constraint CHECK(i + j < 10); now we need both i and j to check the constraint
-	// if we are only updating one of the two columns we add the other one to the UPDATE set
-	// with a "useless" update (i.e. i=i) so we can verify that the CHECK constraint is not violated
-	for (auto &constraint : table.GetBoundConstraints()) {
-		if (constraint->type == ConstraintType::CHECK) {
-			auto &check = *reinterpret_cast<BoundCheckConstraint *>(constraint.get());
-			// check constraint! check if we need to add any extra columns to the UPDATE clause
-			BindExtraColumns(table, get, proj, update, check.bound_columns);
-		}
-	}
-	auto &storage = table.GetStorage();
-	if (update.return_chunk) {
-		physical_index_set_t all_columns;
-		for (idx_t i = 0; i < storage.column_definitions.size(); i++) {
-			all_columns.insert(PhysicalIndex(i));
-		}
-		BindExtraColumns(table, get, proj, update, all_columns);
-	}
-	// for index updates we always turn any update into an insert and a delete
-	// we thus need all the columns to be available, hence we check if the update touches any index columns
-	// If the returning keyword is used, we need access to the whole row in case the user requests it.
-	// Therefore switch the update to a delete and insert.
-	update.update_is_del_and_insert = false;
-	storage.info->indexes.Scan([&](Index &index) {
-		if (index.IndexIsUpdated(update.columns)) {
-			update.update_is_del_and_insert = true;
-			return true;
-		}
-		return false;
-	});
-
-	// we also convert any updates on LIST columns into delete + insert
-	for (auto &col_index : update.columns) {
-		auto &column = table.GetColumns().GetColumn(col_index);
-		if (!TypeSupportsRegularUpdate(column.Type())) {
-			update.update_is_del_and_insert = true;
-			break;
-		}
-	}
-
-	if (update.update_is_del_and_insert) {
-		// the update updates a column required by an index or requires returning the updated rows,
-		// push projections for all columns
-		physical_index_set_t all_columns;
-		for (idx_t i = 0; i < storage.column_definitions.size(); i++) {
-			all_columns.insert(PhysicalIndex(i));
-		}
-		BindExtraColumns(table, get, proj, update, all_columns);
-	}
-}
-
 // This creates a LogicalProjection and moves 'root' into it as a child
 // unless there are no expressions to project, in which case it just returns 'root'
 unique_ptr<LogicalOperator> Binder::BindUpdateSet(LogicalOperator &op, unique_ptr<LogicalOperator> root,
@@ -146,7 +33,12 @@ unique_ptr<LogicalOperator> Binder::BindUpdateSet(LogicalOperator &op, unique_pt
 		auto &colname = set_info.columns[i];
 		auto &expr = set_info.expressions[i];
 		if (!table.ColumnExists(colname)) {
-			throw BinderException("Referenced update column %s not found in table!", colname);
+			vector<string> column_names;
+			for (auto &col : table.GetColumns().Physical()) {
+				column_names.push_back(col.Name());
+			}
+			auto candidates = StringUtil::CandidatesErrorMessage(column_names, colname, "Did you mean");
+			throw BinderException("Referenced update column %s not found in table!\n%s", colname, candidates);
 		}
 		auto &column = table.GetColumn(colname);
 		if (column.Generated()) {
@@ -156,7 +48,7 @@ unique_ptr<LogicalOperator> Binder::BindUpdateSet(LogicalOperator &op, unique_pt
 			throw BinderException("Multiple assignments to same column \"%s\"", colname);
 		}
 		columns.push_back(column.Physical());
-		if (expr->type == ExpressionType::VALUE_DEFAULT) {
+		if (expr->GetExpressionType() == ExpressionType::VALUE_DEFAULT) {
 			op.expressions.push_back(make_uniq<BoundDefaultExpression>(column.Type()));
 		} else {
 			UpdateBinder binder(*this, context);
@@ -176,6 +68,32 @@ unique_ptr<LogicalOperator> Binder::BindUpdateSet(LogicalOperator &op, unique_pt
 	auto proj = make_uniq<LogicalProjection>(proj_index, std::move(projection_expressions));
 	proj->AddChild(std::move(root));
 	return unique_ptr_cast<LogicalProjection, LogicalOperator>(std::move(proj));
+}
+
+void Binder::BindRowIdColumns(TableCatalogEntry &table, LogicalGet &get, vector<unique_ptr<Expression>> &expressions) {
+	auto row_id_columns = table.GetRowIdColumns();
+	auto virtual_columns = table.GetVirtualColumns();
+	auto &column_ids = get.GetColumnIds();
+	for (auto &row_id_column : row_id_columns) {
+		auto row_id_entry = virtual_columns.find(row_id_column);
+		if (row_id_entry == virtual_columns.end()) {
+			throw InternalException(
+			    "BindRowIdColumns could not find the row id column in the virtual columns list of the table");
+		}
+		// check if this column has alraedy been projected
+		idx_t column_idx;
+		for (column_idx = 0; column_idx < column_ids.size(); ++column_idx) {
+			if (column_ids[column_idx].GetPrimaryIndex() == row_id_column) {
+				// it has! avoid projecting it again
+				break;
+			}
+		}
+		expressions.push_back(
+		    make_uniq<BoundColumnRefExpression>(row_id_entry->second.type, ColumnBinding(get.table_index, column_idx)));
+		if (column_idx == column_ids.size()) {
+			get.AddColumnId(row_id_column);
+		}
+	}
 }
 
 BoundStatement Binder::Bind(UpdateStatement &stmt) {
@@ -209,7 +127,8 @@ BoundStatement Binder::Bind(UpdateStatement &stmt) {
 
 	if (!table.temporary) {
 		// update of persistent table: not read only!
-		properties.modified_databases.insert(table.catalog.GetName());
+		auto &properties = GetStatementProperties();
+		properties.RegisterDBModify(table.catalog, context);
 	}
 	auto update = make_uniq<LogicalUpdate>(table);
 
@@ -218,7 +137,10 @@ BoundStatement Binder::Bind(UpdateStatement &stmt) {
 		update->return_chunk = true;
 	}
 	// bind the default values
-	BindDefaultValues(table.GetColumns(), update->bound_defaults);
+	auto &catalog_name = table.ParentCatalog().GetName();
+	auto &schema_name = table.ParentSchema().name;
+	BindDefaultValues(table.GetColumns(), update->bound_defaults, catalog_name, schema_name);
+	update->bound_constraints = BindConstraints(table);
 
 	// project any additional columns required for the condition/expressions
 	if (stmt.set_info->condition) {
@@ -239,11 +161,10 @@ BoundStatement Binder::Bind(UpdateStatement &stmt) {
 	auto proj = unique_ptr_cast<LogicalOperator, LogicalProjection>(std::move(proj_tmp));
 
 	// bind any extra columns necessary for CHECK constraints or indexes
-	BindUpdateConstraints(table, *get, *proj, *update);
-	// finally add the row id column to the projection list
-	proj->expressions.push_back(make_uniq<BoundColumnRefExpression>(
-	    LogicalType::ROW_TYPE, ColumnBinding(get->table_index, get->column_ids.size())));
-	get->column_ids.push_back(COLUMN_IDENTIFIER_ROW_ID);
+	table.BindUpdateConstraints(*this, *get, *proj, *update, context);
+
+	// finally bind the row id column and add them to the projection list
+	BindRowIdColumns(table, *get, proj->expressions);
 
 	// set the projection as child of the update node and finalize the result
 	update->AddChild(std::move(proj));
@@ -260,6 +181,8 @@ BoundStatement Binder::Bind(UpdateStatement &stmt) {
 	result.names = {"Count"};
 	result.types = {LogicalType::BIGINT};
 	result.plan = std::move(update);
+
+	auto &properties = GetStatementProperties();
 	properties.allow_stream_result = false;
 	properties.return_type = StatementReturnType::CHANGED_ROWS;
 	return result;

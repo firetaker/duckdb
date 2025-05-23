@@ -1,3 +1,4 @@
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -10,103 +11,52 @@
 
 #include "duckdb_python/import_cache/python_import_cache_item.hpp"
 
+//! Note: This class is generated using scripts.
+//! If you need to add a new object to the cache you must:
+//! 1. adjust tools/pythonpkg/scripts/imports.py
+//! 2. run python3 tools/pythonpkg/scripts/generate_import_cache_json.py
+//! 3. run python3 tools/pythonpkg/scripts/generate_import_cache_cpp.py
+//! 4. run make format-main (the generator doesn't respect the formatting rules ;))
+
 namespace duckdb {
 
-// pandas.core.arrays.arrow.dtype
-struct PandasCoreArraysArrowDtypeCacheItem : public PythonImportCacheItem {
-public:
-	~PandasCoreArraysArrowDtypeCacheItem() override {
-	}
-	virtual void LoadSubtypes(PythonImportCache &cache) override {
-		ArrowDtype.LoadAttribute("ArrowDtype", cache, *this);
-	}
-
-public:
-	PythonImportCacheItem ArrowDtype;
-};
-
-// pandas.core.arrays.arrow
-struct PandasCoreArraysArrowCacheItem : public PythonImportCacheItem {
-public:
-	~PandasCoreArraysArrowCacheItem() override {
-	}
-	virtual void LoadSubtypes(PythonImportCache &cache) override {
-		dtype.LoadModule("pandas.core.arrays.arrow.dtype", cache);
-	}
-
-public:
-	PandasCoreArraysArrowDtypeCacheItem dtype;
-
-protected:
-	bool IsRequired() const override final {
-		return false;
-	}
-};
-
-// pandas.core.arrays
-struct PandasCoreArraysCacheItem : public PythonImportCacheItem {
-public:
-	~PandasCoreArraysCacheItem() override {
-	}
-	virtual void LoadSubtypes(PythonImportCache &cache) override {
-		arrow.LoadModule("pandas.core.arrays.arrow", cache);
-	}
-
-public:
-	PandasCoreArraysArrowCacheItem arrow;
-};
-
-// pandas.core
-struct PandasCoreCacheItem : public PythonImportCacheItem {
-public:
-	~PandasCoreCacheItem() override {
-	}
-	virtual void LoadSubtypes(PythonImportCache &cache) override {
-		arrays.LoadModule("pandas.core.arrays", cache);
-	}
-
-public:
-	PandasCoreArraysCacheItem arrays;
-};
-
-// pandas.libs
-struct PandasLibsCacheItem : public PythonImportCacheItem {
-public:
-	~PandasLibsCacheItem() override {
-	}
-	virtual void LoadSubtypes(PythonImportCache &cache) override {
-		NAType.LoadAttribute("NAType", cache, *this);
-	}
-
-public:
-	PythonImportCacheItem NAType;
-
-protected:
-	bool IsRequired() const override final {
-		return false;
-	}
-};
-
 struct PandasCacheItem : public PythonImportCacheItem {
+
 public:
 	static constexpr const char *Name = "pandas";
 
 public:
+	PandasCacheItem()
+	    : PythonImportCacheItem("pandas"), DataFrame("DataFrame", this), Categorical("Categorical", this),
+	      CategoricalDtype("CategoricalDtype", this), Series("Series", this), NaT("NaT", this), NA("NA", this),
+	      isnull("isnull", this), ArrowDtype("ArrowDtype", this), BooleanDtype("BooleanDtype", this),
+	      UInt8Dtype("UInt8Dtype", this), UInt16Dtype("UInt16Dtype", this), UInt32Dtype("UInt32Dtype", this),
+	      UInt64Dtype("UInt64Dtype", this), Int8Dtype("Int8Dtype", this), Int16Dtype("Int16Dtype", this),
+	      Int32Dtype("Int32Dtype", this), Int64Dtype("Int64Dtype", this), Float32Dtype("Float32Dtype", this),
+	      Float64Dtype("Float64Dtype", this) {
+	}
 	~PandasCacheItem() override {
 	}
-	virtual void LoadSubtypes(PythonImportCache &cache) override {
-		DataFrame.LoadAttribute("DataFrame", cache, *this);
-		libs.LoadModule("pandas._libs.missing", cache);
-		core.LoadModule("pandas.core", cache);
-		isnull.LoadAttribute("isnull", cache, *this);
-	}
 
-public:
-	//! pandas.DataFrame
 	PythonImportCacheItem DataFrame;
-	PandasLibsCacheItem libs;
-	PandasCoreCacheItem core;
+	PythonImportCacheItem Categorical;
+	PythonImportCacheItem CategoricalDtype;
+	PythonImportCacheItem Series;
+	PythonImportCacheItem NaT;
+	PythonImportCacheItem NA;
 	PythonImportCacheItem isnull;
+	PythonImportCacheItem ArrowDtype;
+	PythonImportCacheItem BooleanDtype;
+	PythonImportCacheItem UInt8Dtype;
+	PythonImportCacheItem UInt16Dtype;
+	PythonImportCacheItem UInt32Dtype;
+	PythonImportCacheItem UInt64Dtype;
+	PythonImportCacheItem Int8Dtype;
+	PythonImportCacheItem Int16Dtype;
+	PythonImportCacheItem Int32Dtype;
+	PythonImportCacheItem Int64Dtype;
+	PythonImportCacheItem Float32Dtype;
+	PythonImportCacheItem Float64Dtype;
 
 protected:
 	bool IsRequired() const override final {

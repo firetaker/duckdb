@@ -8,85 +8,60 @@
 
 #pragma once
 
+#include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/execution/index/art/art.hpp"
-#include "duckdb/execution/index/art/fixed_size_allocator.hpp"
 #include "duckdb/execution/index/art/node.hpp"
-#include "duckdb/execution/index/art/prefix.hpp"
 
 namespace duckdb {
 
-// classes
-class Node;
-class ARTKey;
-class MetaBlockWriter;
-class MetaBlockReader;
-
-// structs
-struct BlockPointer;
-
+//! There are three types of leaves.
+//! 1. LEAF_INLINED: Inlines a row ID in a Node pointer.
+//! 2. LEAF: Deprecated. A list of Leaf nodes containing row IDs.
+//! 3. Nested leaves indicated by gate nodes. If an ART key contains multiple row IDs,
+//! then we use the row IDs as keys and create a nested ART behind the gate node.
+//! As row IDs are always unique, these nested ARTs never contain duplicates themselves.
 class Leaf {
 public:
-	//! Number of row IDs
-	uint32_t count;
-	//! Compressed path (prefix)
-	Prefix prefix;
-	union {
-		//! The pointer to the head of the list of leaf segments
-		Node ptr;
-		//! Inlined row ID
-		row_t inlined;
-	} row_ids;
+	static constexpr NType LEAF = NType::LEAF;
+	static constexpr NType INLINED = NType::LEAF_INLINED;
+
+	static constexpr uint8_t LEAF_SIZE = 4; // Deprecated.
 
 public:
-	//! Get a new leaf node, might cause a new buffer allocation, and initializes a leaf holding one
-	//! row ID and a prefix starting at depth
-	static Leaf &New(ART &art, Node &node, const ARTKey &key, const uint32_t depth, const row_t row_id);
-	//! Get a new leaf node, might cause a new buffer allocation, and initializes a leaf holding
-	//! n_row_ids row IDs and a prefix starting at depth
-	static Leaf &New(ART &art, Node &node, const ARTKey &key, const uint32_t depth, const row_t *row_ids,
-	                 const idx_t count);
-	//! Free the leaf
-	static void Free(ART &art, Node &node);
-	//! Get a reference to the leaf
-	static inline Leaf &Get(const ART &art, const Node ptr) {
-		return *Node::GetAllocator(art, NType::LEAF).Get<Leaf>(ptr);
-	}
-
-	//! Initializes a merge by incrementing the buffer IDs of the leaf segments
-	void InitializeMerge(const ART &art, const idx_t buffer_count);
-	//! Merge leaves
-	void Merge(ART &art, Node &other);
-
-	//! Insert a row ID into a leaf
-	void Insert(ART &art, const row_t row_id);
-	//! Remove a row ID from a leaf
-	void Remove(ART &art, const row_t row_id);
-
-	//! Returns whether this leaf is inlined
-	inline bool IsInlined() const {
-		return count <= 1;
-	}
-	//! Get the row ID at the position
-	row_t GetRowId(const ART &art, const idx_t position) const;
-	//! Returns the position of a row ID, and an invalid index, if the leaf does not contain the row ID,
-	//! and sets the ptr to point to the segment containing the row ID
-	uint32_t FindRowId(const ART &art, Node &ptr, const row_t row_id) const;
-
-	//! Returns the string representation of a leaf
-	string ToString(const ART &art) const;
-
-	//! Serialize this leaf
-	BlockPointer Serialize(const ART &art, MetaBlockWriter &writer) const;
-	//! Deserialize this leaf
-	void Deserialize(ART &art, MetaBlockReader &reader);
-
-	//! Vacuum the leaf segments of a leaf, if not inlined
-	void Vacuum(ART &art);
+	Leaf() = delete;
+	Leaf(const Leaf &) = delete;
+	Leaf &operator=(const Leaf &) = delete;
 
 private:
-	//! Moves the inlined row ID onto a leaf segment, does not change the size
-	//! so this will be a (temporarily) invalid leaf
-	void MoveInlinedToSegment(ART &art);
+	uint8_t count;            // Deprecated.
+	row_t row_ids[LEAF_SIZE]; // Deprecated.
+	Node ptr;                 // Deprecated.
+
+public:
+	//! Inline a row ID into a node pointer.
+	static void New(Node &node, const row_t row_id);
+
+	//! Merge two inlined leaf nodes.
+	static void MergeInlined(ArenaAllocator &arena, ART &art, Node &left, Node &right, GateStatus status, idx_t depth);
+
+	//! Transforms a deprecated leaf to a nested leaf.
+	static void TransformToNested(ART &art, Node &node);
+	//! Transforms a nested leaf to a deprecated leaf.
+	static void TransformToDeprecated(ART &art, Node &node);
+
+public:
+	//! Frees the linked list of leaves.
+	static void DeprecatedFree(ART &art, Node &node);
+	//! Fills the row_ids vector with the row IDs of this linked list of leaves.
+	//! Never pushes more than max_count row IDs.
+	static bool DeprecatedGetRowIds(ART &art, const Node &node, unsafe_vector<row_t> &row_ids, const idx_t max_count);
+	//! Vacuums the linked list of leaves.
+	static void DeprecatedVacuum(ART &art, Node &node);
+	//! Returns the string representation of the linked list of leaves, if only_verify is true.
+	//! Else, it traverses and verifies the linked list of leaves.
+	static string DeprecatedVerifyAndToString(ART &art, const Node &node, const bool only_verify);
+	//! Count the number of leaves.
+	void DeprecatedVerifyAllocations(ART &art, unordered_map<uint8_t, idx_t> &node_counts) const;
 };
 
 } // namespace duckdb

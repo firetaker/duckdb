@@ -18,6 +18,8 @@ static int64_t TargetTypeCost(const LogicalType &type) {
 		return 104;
 	case LogicalTypeId::DECIMAL:
 		return 105;
+	case LogicalTypeId::BIGNUM:
+		return 106;
 	case LogicalTypeId::TIMESTAMP_NS:
 		return 119;
 	case LogicalTypeId::TIMESTAMP:
@@ -28,9 +30,12 @@ static int64_t TargetTypeCost(const LogicalType &type) {
 		return 122;
 	case LogicalTypeId::TIMESTAMP_TZ:
 		return 123;
+	case LogicalTypeId::TIMESTAMP_TZ_NS:
+		return 124;
 	case LogicalTypeId::VARCHAR:
 		return 149;
 	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::TUPLE:
 	case LogicalTypeId::MAP:
 	case LogicalTypeId::LIST:
 	case LogicalTypeId::UNION:
@@ -38,6 +43,9 @@ static int64_t TargetTypeCost(const LogicalType &type) {
 		return 160;
 	case LogicalTypeId::ANY:
 		return int64_t(AnyType::GetCastScore(type));
+	case LogicalTypeId::TEMPLATE:
+		// we can cast anything to a template type, but prefer to cast to anything else!
+		return 1000000;
 	default:
 		return 110;
 	}
@@ -52,6 +60,7 @@ static int64_t ImplicitCastTinyint(const LogicalType &to) {
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::BIGNUM:
 		return TargetTypeCost(to);
 	default:
 		return -1;
@@ -66,6 +75,7 @@ static int64_t ImplicitCastSmallint(const LogicalType &to) {
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::BIGNUM:
 		return TargetTypeCost(to);
 	default:
 		return -1;
@@ -79,6 +89,7 @@ static int64_t ImplicitCastInteger(const LogicalType &to) {
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::BIGNUM:
 		return TargetTypeCost(to);
 	default:
 		return -1;
@@ -91,6 +102,7 @@ static int64_t ImplicitCastBigint(const LogicalType &to) {
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::HUGEINT:
 	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::BIGNUM:
 		return TargetTypeCost(to);
 	default:
 		return -1;
@@ -110,6 +122,7 @@ static int64_t ImplicitCastUTinyint(const LogicalType &to) {
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::BIGNUM:
 		return TargetTypeCost(to);
 	default:
 		return -1;
@@ -127,6 +140,7 @@ static int64_t ImplicitCastUSmallint(const LogicalType &to) {
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::BIGNUM:
 		return TargetTypeCost(to);
 	default:
 		return -1;
@@ -135,7 +149,6 @@ static int64_t ImplicitCastUSmallint(const LogicalType &to) {
 
 static int64_t ImplicitCastUInteger(const LogicalType &to) {
 	switch (to.id()) {
-
 	case LogicalTypeId::UBIGINT:
 	case LogicalTypeId::BIGINT:
 	case LogicalTypeId::UHUGEINT:
@@ -143,6 +156,7 @@ static int64_t ImplicitCastUInteger(const LogicalType &to) {
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::BIGNUM:
 		return TargetTypeCost(to);
 	default:
 		return -1;
@@ -156,6 +170,7 @@ static int64_t ImplicitCastUBigint(const LogicalType &to) {
 	case LogicalTypeId::UHUGEINT:
 	case LogicalTypeId::HUGEINT:
 	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::BIGNUM:
 		return TargetTypeCost(to);
 	default:
 		return -1;
@@ -164,6 +179,7 @@ static int64_t ImplicitCastUBigint(const LogicalType &to) {
 
 static int64_t ImplicitCastFloat(const LogicalType &to) {
 	switch (to.id()) {
+	case LogicalTypeId::BIGNUM:
 	case LogicalTypeId::DOUBLE:
 		return TargetTypeCost(to);
 	default:
@@ -173,6 +189,8 @@ static int64_t ImplicitCastFloat(const LogicalType &to) {
 
 static int64_t ImplicitCastDouble(const LogicalType &to) {
 	switch (to.id()) {
+	case LogicalTypeId::BIGNUM:
+		return TargetTypeCost(to);
 	default:
 		return -1;
 	}
@@ -193,6 +211,7 @@ static int64_t ImplicitCastHugeint(const LogicalType &to) {
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::BIGNUM:
 		return TargetTypeCost(to);
 	default:
 		return -1;
@@ -204,6 +223,7 @@ static int64_t ImplicitCastUhugeint(const LogicalType &to) {
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::BIGNUM:
 		return TargetTypeCost(to);
 	default:
 		return -1;
@@ -214,6 +234,7 @@ static int64_t ImplicitCastDate(const LogicalType &to) {
 	switch (to.id()) {
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::TIMESTAMP_TZ_NS:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_NS:
 	case LogicalTypeId::TIMESTAMP_SEC:
@@ -269,12 +290,14 @@ static int64_t ImplicitCastTimestamp(const LogicalType &to) {
 		return TargetTypeCost(to);
 	case LogicalTypeId::TIMESTAMP_TZ:
 		return TargetTypeCost(to);
+	case LogicalTypeId::TIMESTAMP_TZ_NS:
+		return TargetTypeCost(to);
 	default:
 		return -1;
 	}
 }
 
-static int64_t ImplicitCastVarint(const LogicalType &to) {
+static int64_t ImplicitCastBignum(const LogicalType &to) {
 	switch (to.id()) {
 	case LogicalTypeId::DOUBLE:
 		return TargetTypeCost(to);
@@ -283,10 +306,16 @@ static int64_t ImplicitCastVarint(const LogicalType &to) {
 	}
 }
 
+static int64_t ImplicitCastVariant(const LogicalType &to) {
+	return TargetTypeCost(to);
+}
+
 bool LogicalTypeIsValid(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::TUPLE:
 	case LogicalTypeId::UNION:
+	case LogicalTypeId::VARIANT:
 	case LogicalTypeId::LIST:
 	case LogicalTypeId::MAP:
 	case LogicalTypeId::ARRAY:
@@ -304,7 +333,8 @@ bool LogicalTypeIsValid(const LogicalType &type) {
 	case LogicalTypeId::INVALID:
 	case LogicalTypeId::UNKNOWN:
 		return false;
-	case LogicalTypeId::STRUCT: {
+	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::TUPLE: {
 		auto child_count = StructType::GetChildCount(type);
 		for (idx_t i = 0; i < child_count; i++) {
 			if (!LogicalTypeIsValid(StructType::GetChildType(type, i))) {
@@ -332,9 +362,37 @@ bool LogicalTypeIsValid(const LogicalType &type) {
 	}
 }
 
+int64_t ImplicitCastToUnionMember(const LogicalType &from, const LogicalType &to) {
+	// check that the union type is fully resolved.
+	if (to.AuxInfo() == nullptr) {
+		return -1;
+	}
+	// check if the union contains something castable from the source type
+	// in which case the least expensive (most specific) cast should be used
+	bool found = false;
+	auto cost = NumericLimits<int64_t>::Maximum();
+	for (idx_t i = 0; i < UnionType::GetMemberCount(to); i++) {
+		auto target_member = UnionType::GetMemberType(to, i);
+		auto target_cost = CastRules::ImplicitCast(from, target_member);
+		if (target_cost != -1) {
+			found = true;
+			cost = MinValue(cost, target_cost);
+		}
+	}
+	return found ? cost : -1;
+}
+
 int64_t CastRules::ImplicitCast(const LogicalType &from, const LogicalType &to) {
-	if (from.id() == LogicalTypeId::SQLNULL || to.id() == LogicalTypeId::ANY) {
+	if (from.id() == LogicalTypeId::SQLNULL && to.id() == LogicalTypeId::TEMPLATE) {
+		// Prefer the TEMPLATE type for NULL casts, as it is the most generic
+		return 5;
+	}
+	if (from.id() == LogicalTypeId::SQLNULL || to.id() == LogicalTypeId::ANY || to.id() == LogicalTypeId::TEMPLATE) {
 		// NULL expression can be cast to anything
+		return TargetTypeCost(to);
+	}
+	if (from.id() == LogicalTypeId::ANY && to.IsTemplated()) {
+		// This can happen when changing a function from using ANY to using TEMPLATE.
 		return TargetTypeCost(to);
 	}
 	if (from.id() == LogicalTypeId::UNKNOWN) {
@@ -370,8 +428,15 @@ int64_t CastRules::ImplicitCast(const LogicalType &from, const LogicalType &to) 
 		// in any other case we use the casting rules of the preferred type of the literal
 		return CastRules::ImplicitCast(IntegerLiteral::GetType(from), to);
 	}
+
 	if (from.GetAlias() != to.GetAlias()) {
 		// if aliases are different, an implicit cast is not possible
+
+		// Special case: Anything can be cast to a union if the source type is a member of the union
+		if (to.id() == LogicalTypeId::UNION) {
+			return ImplicitCastToUnionMember(from, to);
+		}
+
 		return -1;
 	}
 	if (from.id() == LogicalTypeId::LIST && to.id() == LogicalTypeId::LIST) {
@@ -432,7 +497,7 @@ int64_t CastRules::ImplicitCast(const LogicalType &from, const LogicalType &to) 
 			for (idx_t to_member_idx = 0; to_member_idx < UnionType::GetMemberCount(to); to_member_idx++) {
 				auto &to_member_name = UnionType::GetMemberName(to, to_member_idx);
 
-				if (StringUtil::CIEquals(from_member_name, to_member_name)) {
+				if (from_member_name == to_member_name) {
 					auto &from_member_type = UnionType::GetMemberType(from, from_member_idx);
 					auto &to_member_type = UnionType::GetMemberType(to, to_member_idx);
 
@@ -446,9 +511,12 @@ int64_t CastRules::ImplicitCast(const LogicalType &from, const LogicalType &to) 
 				return -1;
 			}
 		}
-		return cost;
+		// If not found, try casting source to member of target (below)
+		if (cost != -1) {
+			return cost;
+		}
 	}
-	if (from.id() == LogicalTypeId::STRUCT && to.id() == LogicalTypeId::STRUCT) {
+	if (StructType::IsStruct(from) && StructType::IsStruct(to)) {
 		if (to.AuxInfo() == nullptr) {
 			// If this struct is not fully resolved, we'll leave it to the actual cast logic to handle it.
 			return 0;
@@ -462,15 +530,19 @@ int64_t CastRules::ImplicitCast(const LogicalType &from, const LogicalType &to) 
 			return -1;
 		}
 
+		if (source_children.empty()) {
+			// both are empty - empty STRUCT and empty TUPLE are trivially inter-castable
+			return 0;
+		}
+
 		auto target_is_unnamed = StructType::IsUnnamed(to);
 		auto source_is_unnamed = StructType::IsUnnamed(from);
 		auto named_struct_cast = !source_is_unnamed && !target_is_unnamed;
 
 		int64_t cost = -1;
 		if (named_struct_cast) {
-
 			// Collect the target members in a map for easy lookup
-			case_insensitive_map_t<idx_t> target_members;
+			identifier_map_t<idx_t> target_members;
 			for (idx_t target_idx = 0; target_idx < target_children.size(); target_idx++) {
 				auto &target_name = target_children[target_idx].first;
 				if (target_members.find(target_name) != target_members.end()) {
@@ -514,26 +586,9 @@ int64_t CastRules::ImplicitCast(const LogicalType &from, const LogicalType &to) 
 		// arguments match: do nothing
 		return 0;
 	}
-
 	// Special case: Anything can be cast to a union if the source type is a member of the union
 	if (to.id() == LogicalTypeId::UNION) {
-		// check that the union type is fully resolved.
-		if (to.AuxInfo() == nullptr) {
-			return -1;
-		}
-		// check if the union contains something castable from the source type
-		// in which case the least expensive (most specific) cast should be used
-		bool found = false;
-		auto cost = NumericLimits<int64_t>::Maximum();
-		for (idx_t i = 0; i < UnionType::GetMemberCount(to); i++) {
-			auto target_member = UnionType::GetMemberType(to, i);
-			auto target_cost = ImplicitCast(from, target_member);
-			if (target_cost != -1) {
-				found = true;
-				cost = MinValue(cost, target_cost);
-			}
-		}
-		return found ? cost : -1;
+		return ImplicitCastToUnionMember(from, to);
 	}
 
 	switch (from.id()) {
@@ -575,8 +630,10 @@ int64_t CastRules::ImplicitCast(const LogicalType &from, const LogicalType &to) 
 		return ImplicitCastTimestampNS(to);
 	case LogicalTypeId::TIMESTAMP:
 		return ImplicitCastTimestamp(to);
-	case LogicalTypeId::VARINT:
-		return ImplicitCastVarint(to);
+	case LogicalTypeId::BIGNUM:
+		return ImplicitCastBignum(to);
+	case LogicalTypeId::VARIANT:
+		return ImplicitCastVariant(to);
 	default:
 		return -1;
 	}

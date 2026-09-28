@@ -1,16 +1,15 @@
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
-#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 
 namespace duckdb {
 
-CreateMacroInfo::CreateMacroInfo(CatalogType type) : CreateFunctionInfo(type, INVALID_SCHEMA) {
+CreateMacroInfo::CreateMacroInfo(CatalogType type) : CreateFunctionInfo(type, Identifier::InvalidSchema()) {
 }
 
 CreateMacroInfo::CreateMacroInfo(CatalogType type, unique_ptr<MacroFunction> function,
                                  vector<unique_ptr<MacroFunction>> extra_functions)
-    : CreateFunctionInfo(type, INVALID_SCHEMA) {
+    : CreateFunctionInfo(type, Identifier::InvalidSchema()) {
 	macros.push_back(std::move(function));
 	for (auto &macro : extra_functions) {
 		macros.push_back(std::move(macro));
@@ -18,26 +17,16 @@ CreateMacroInfo::CreateMacroInfo(CatalogType type, unique_ptr<MacroFunction> fun
 }
 
 string CreateMacroInfo::ToString() const {
-	string result;
+	auto prefix = GetCreatePrefix("MACRO");
+	prefix += QualifiedNameToString() + " ";
+	string definitions;
 	for (auto &function : macros) {
-		if (!result.empty()) {
-			result += ", ";
+		if (!definitions.empty()) {
+			definitions += ", ";
 		}
-		result += function->ToSQL();
+		definitions += function->ToSQL();
 	}
-	// prefix with CREATE MACRO
-	string prefix = "CREATE MACRO ";
-	if (!catalog.empty()) {
-		prefix += KeywordHelper::WriteOptionallyQuoted(catalog);
-		prefix += ".";
-	}
-	if (!schema.empty()) {
-		prefix += KeywordHelper::WriteOptionallyQuoted(schema);
-		prefix += ".";
-	}
-	prefix += KeywordHelper::WriteOptionallyQuoted(name);
-	result = prefix + " " + result + ";";
-	return result;
+	return prefix + definitions + ";";
 }
 
 unique_ptr<CreateInfo> CreateMacroInfo::Copy() const {
@@ -45,7 +34,7 @@ unique_ptr<CreateInfo> CreateMacroInfo::Copy() const {
 	for (auto &macro : macros) {
 		result->macros.push_back(macro->Copy());
 	}
-	result->name = name;
+	result->SetFunctionName(GetFunctionName());
 	CopyFunctionProperties(*result);
 	return std::move(result);
 }

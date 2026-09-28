@@ -1,6 +1,7 @@
 #include "duckdb/common/operator/multiply.hpp"
 
 #include "duckdb/common/limits.hpp"
+#include "duckdb/common/operator/add.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/uhugeint.hpp"
@@ -41,7 +42,7 @@ interval_t MultiplyOperator::Operation(int64_t left, interval_t right) {
 
 // TSROUND.
 // Avoid std::rint because it can raise exceptions and we know that can't happen.
-inline double PGTimestampRound(const double &j) {
+static inline double PGTimestampRound(const double &j) {
 	return (std::nearbyint(((double)(j)) * Interval::MICROS_PER_SEC) / Interval::MICROS_PER_SEC);
 }
 
@@ -91,12 +92,17 @@ bool TryMultiplyOperator::Operation(interval_t left, double right, interval_t &r
 	 * of cascade and the seconds factor operation itself.
 	 */
 	if (std::fabs(sec_remainder) >= Interval::SECS_PER_DAY) {
-		result.days += LossyNumericCast<int32_t>(sec_remainder / Interval::SECS_PER_DAY);
-		sec_remainder -= LossyNumericCast<int32_t>(sec_remainder / Interval::SECS_PER_DAY) * Interval::SECS_PER_DAY;
+		const auto extra_days = LossyNumericCast<int32_t>(sec_remainder / Interval::SECS_PER_DAY);
+		if (!TryAddOperator::Operation<int32_t, int32_t, int32_t>(result.days, extra_days, result.days)) {
+			return false;
+		}
+		sec_remainder -= extra_days * Interval::SECS_PER_DAY;
 	}
 
 	/* cascade units down */
-	result.days += day_remainder;
+	if (!TryAddOperator::Operation<int32_t, int32_t, int32_t>(result.days, day_remainder, result.days)) {
+		return false;
+	}
 	if (!TryCast::Operation<int64_t, double>(left.micros, d)) {
 		return false;
 	}
@@ -125,6 +131,7 @@ interval_t MultiplyOperator::Operation(double left, interval_t right) {
 //===--------------------------------------------------------------------===//
 // * [multiply] with overflow check
 //===--------------------------------------------------------------------===//
+namespace {
 struct OverflowCheckedMultiply {
 	template <class SRCTYPE, class UTYPE>
 	static inline bool Operation(SRCTYPE left, SRCTYPE right, SRCTYPE &result) {
@@ -136,6 +143,7 @@ struct OverflowCheckedMultiply {
 		return true;
 	}
 };
+} // namespace
 
 template <>
 bool TryMultiplyOperator::Operation(uint8_t left, uint8_t right, uint8_t &result) {
@@ -276,7 +284,7 @@ bool TryMultiplyOperator::Operation(uhugeint_t left, uhugeint_t right, uhugeint_
 // multiply  decimal with overflow check
 //===--------------------------------------------------------------------===//
 template <class T, T min, T max>
-bool TryDecimalMultiplyTemplated(T left, T right, T &result) {
+static bool TryDecimalMultiplyTemplated(T left, T right, T &result) {
 	if (!TryMultiplyOperator::Operation(left, right, result) || result < min || result > max) {
 		return false;
 	}

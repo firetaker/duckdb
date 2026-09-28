@@ -2,23 +2,32 @@
 #include "duckdb/common/arrow/physical_arrow_collector.hpp"
 #include "duckdb/common/arrow/physical_arrow_batch_collector.hpp"
 #include "duckdb/common/arrow/arrow_query_result.hpp"
+#include "duckdb/common/assert.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 
 namespace duckdb {
 
-unique_ptr<PhysicalResultCollector> PhysicalArrowCollector::Create(ClientContext &context, PreparedStatementData &data,
-                                                                   idx_t batch_size) {
-	if (!PhysicalPlanGenerator::PreserveInsertionOrder(context, data.physical_plan->Root())) {
-		// the plan is not order preserving, so we just use the parallel materialized collector
-		return make_uniq_base<PhysicalResultCollector, PhysicalArrowCollector>(data, true, batch_size);
-	} else if (!PhysicalPlanGenerator::UseBatchIndex(context, data.physical_plan->Root())) {
-		// the plan is order preserving, but we cannot use the batch index: use a single-threaded result collector
-		return make_uniq_base<PhysicalResultCollector, PhysicalArrowCollector>(data, false, batch_size);
-	} else {
-		return make_uniq_base<PhysicalResultCollector, PhysicalArrowBatchCollector>(data, batch_size);
+unique_ptr<PhysicalOperator> PhysicalArrowCollector::Create(ClientContext &context, PreparedStatementData &data,
+                                                            idx_t batch_size) {
+	auto &physical_plan = *data.physical_plan;
+	auto &root = physical_plan.Root();
+
+	if (!PhysicalPlanGenerator::PreserveInsertionOrder(context, root)) {
+		// Not an order-preserving plan: use the parallel materialized collector.
+		return make_uniq<PhysicalArrowCollector>(physical_plan, data, true, batch_size);
 	}
+
+	if (!PhysicalPlanGenerator::UseBatchIndex(context, root)) {
+		// Order-preserving plan, and we cannot use the batch index: use single-threaded result collector.
+		return make_uniq<PhysicalArrowCollector>(physical_plan, data, false, batch_size);
+	}
+
+	// Order-preserving plan, and we can use the batch index: use a batch collector.
+	return make_uniq<PhysicalArrowBatchCollector>(physical_plan, data, batch_size);
 }
 
 SinkResultType PhysicalArrowCollector::Sink(ExecutionContext &context, DataChunk &chunk,
@@ -82,7 +91,7 @@ SinkCombineResultType PhysicalArrowCollector::Combine(ExecutionContext &context,
 	return SinkCombineResultType::FINISHED;
 }
 
-unique_ptr<QueryResult> PhysicalArrowCollector::GetResult(GlobalSinkState &state_p) {
+unique_ptr<QueryResult> PhysicalArrowCollector::GetResult(GlobalSinkState &state_p) const {
 	auto &gstate = state_p.Cast<ArrowCollectorGlobalState>();
 	return std::move(gstate.result);
 }

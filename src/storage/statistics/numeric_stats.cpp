@@ -1,12 +1,27 @@
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 
+#include "duckdb/common/algorithm.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
+#include "duckdb/common/operator/subtract.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 
+#include <limits>
+
 namespace duckdb {
+
+namespace {
+
+template <class T>
+void InitializeEmptyFloatingPointStats(BaseStatistics &result) {
+	NumericStats::SetMin(result, std::numeric_limits<T>::quiet_NaN());
+	NumericStats::SetMax(result, NumericLimits<T>::Minimum());
+}
+
+} // namespace
 
 BaseStatistics NumericStats::CreateUnknown(LogicalType type) {
 	BaseStatistics result(std::move(type));
@@ -19,8 +34,18 @@ BaseStatistics NumericStats::CreateUnknown(LogicalType type) {
 BaseStatistics NumericStats::CreateEmpty(LogicalType type) {
 	BaseStatistics result(std::move(type));
 	result.InitializeEmpty();
-	SetMin(result, Value::MaximumValue(result.GetType()));
-	SetMax(result, Value::MinimumValue(result.GetType()));
+	switch (result.GetType().InternalType()) {
+	case PhysicalType::FLOAT:
+		InitializeEmptyFloatingPointStats<float>(result);
+		break;
+	case PhysicalType::DOUBLE:
+		InitializeEmptyFloatingPointStats<double>(result);
+		break;
+	default:
+		SetMin(result, Value::MaximumValue(result.GetType()));
+		SetMax(result, Value::MinimumValue(result.GetType()));
+		break;
+	}
 	return result;
 }
 
@@ -39,6 +64,13 @@ void NumericStats::Merge(BaseStatistics &stats, const BaseStatistics &other) {
 		return;
 	}
 	D_ASSERT(stats.GetType() == other.GetType());
+	// If the min and max of the stats are not valid, we need to merge the min and max of the other stats.
+	if (NumericStats::HasMin(stats) && NumericStats::HasMax(stats) &&
+	    NumericStats::Min(stats) > NumericStats::Max(stats)) {
+		NumericStats::SetMin(stats, NumericStats::HasMin(other) ? NumericStats::Min(other) : Value());
+		NumericStats::SetMax(stats, NumericStats::HasMax(other) ? NumericStats::Max(other) : Value());
+		return;
+	}
 	if (NumericStats::HasMin(other) && NumericStats::HasMin(stats)) {
 		auto other_min = NumericStats::Min(other);
 		if (other_min < NumericStats::Min(stats)) {
@@ -61,6 +93,11 @@ struct GetNumericValueUnion {
 	template <class T>
 	static T Operation(const NumericValueUnion &v);
 };
+
+template <>
+bool GetNumericValueUnion::Operation(const NumericValueUnion &v) {
+	return v.value_.boolean;
+}
 
 template <>
 int8_t GetNumericValueUnion::Operation(const NumericValueUnion &v) {
@@ -120,6 +157,11 @@ float GetNumericValueUnion::Operation(const NumericValueUnion &v) {
 template <>
 double GetNumericValueUnion::Operation(const NumericValueUnion &v) {
 	return v.value_.double_;
+}
+
+template <>
+interval_t GetNumericValueUnion::Operation(const NumericValueUnion &v) {
+	return v.value_.interval;
 }
 
 template <class T>
@@ -237,7 +279,10 @@ FilterPropagateResult NumericStats::CheckZonemap(const BaseStatistics &stats, Ex
 	if (!NumericStats::HasMinMax(stats)) {
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
+	D_ASSERT(stats.CanHaveNoNull());
 	switch (stats.GetType().InternalType()) {
+	case PhysicalType::BOOL:
+		return CheckZonemapTemplated<bool>(stats, comparison_type, constants);
 	case PhysicalType::INT8:
 		return CheckZonemapTemplated<int8_t>(stats, comparison_type, constants);
 	case PhysicalType::INT16:
@@ -262,9 +307,47 @@ FilterPropagateResult NumericStats::CheckZonemap(const BaseStatistics &stats, Ex
 		return CheckZonemapTemplated<float>(stats, comparison_type, constants);
 	case PhysicalType::DOUBLE:
 		return CheckZonemapTemplated<double>(stats, comparison_type, constants);
+	case PhysicalType::INTERVAL:
+		return CheckZonemapTemplated<interval_t>(stats, comparison_type, constants);
 	default:
 		throw InternalException("Unsupported type for NumericStats::CheckZonemap");
 	}
+}
+
+bool NumericStats::ConstantsCoverRange(const BaseStatistics &stats, array_ptr<const Value> constants) {
+	auto &type = stats.GetType();
+	// values are compared as hugeint_t, which cannot hold large UINT128 values
+	if (!type.IsIntegral() || type.InternalType() == PhysicalType::UINT128 || !NumericStats::HasMinMax(stats)) {
+		return false;
+	}
+	auto min_value = NumericStats::Min(stats).GetValue<hugeint_t>();
+	auto max_value = NumericStats::Max(stats).GetValue<hugeint_t>();
+	// covering [min, max] requires at least max - min + 1 constants
+	hugeint_t range;
+	if (!TrySubtractOperator::Operation(max_value, min_value, range) ||
+	    range >= NumericCast<int64_t>(constants.size())) {
+		return false;
+	}
+	vector<hugeint_t> values;
+	for (auto &constant_value : constants) {
+		if (constant_value.type() != type) {
+			return false;
+		}
+		auto constant = constant_value.GetValue<hugeint_t>();
+		if (constant >= min_value && constant <= max_value) {
+			values.push_back(constant);
+		}
+	}
+	std::sort(values.begin(), values.end());
+	if (values.empty() || values.front() != min_value || values.back() != max_value) {
+		return false;
+	}
+	for (idx_t i = 1; i < values.size(); i++) {
+		if (values[i - 1] != values[i] && values[i - 1] + 1 != values[i]) {
+			return false;
+		}
+	}
+	return true;
 }
 
 bool NumericStats::IsConstant(const BaseStatistics &stats) {
@@ -320,6 +403,9 @@ void SetNumericValueInternal(const Value &input, const LogicalType &type, Numeri
 	case PhysicalType::DOUBLE:
 		val.value_.double_ = DoubleValue::Get(input);
 		break;
+	case PhysicalType::INTERVAL:
+		val.value_.interval = IntervalValue::Get(input);
+		break;
 	default:
 		throw InternalException("Unsupported type for NumericStatistics::SetValueInternal");
 	}
@@ -363,19 +449,20 @@ Value NumericValueUnionToValueInternal(const LogicalType &type, const NumericVal
 		return Value::FLOAT(val.value_.float_);
 	case PhysicalType::DOUBLE:
 		return Value::DOUBLE(val.value_.double_);
+	case PhysicalType::INTERVAL:
+		return Value::INTERVAL(val.value_.interval);
 	default:
 		throw InternalException("Unsupported type for NumericValueUnionToValue");
 	}
 }
 
 Value NumericValueUnionToValue(const LogicalType &type, const NumericValueUnion &val) {
-	Value result = NumericValueUnionToValueInternal(type, val);
-	result.GetTypeMutable() = type;
-	return result;
+	return NumericValueUnionToValueInternal(type, val).WithType(type);
 }
 
 bool NumericStats::HasMinMax(const BaseStatistics &stats) {
-	return NumericStats::HasMin(stats) && NumericStats::HasMax(stats);
+	return NumericStats::HasMin(stats) && NumericStats::HasMax(stats) &&
+	       NumericStats::Min(stats) <= NumericStats::Max(stats);
 }
 
 bool NumericStats::HasMin(const BaseStatistics &stats) {
@@ -466,6 +553,9 @@ static void SerializeNumericStatsValue(const LogicalType &type, NumericValueUnio
 	case PhysicalType::DOUBLE:
 		serializer.WriteProperty(101, "value", val.value_.double_);
 		break;
+	case PhysicalType::INTERVAL:
+		serializer.WriteProperty(101, "value", val.value_.interval);
+		break;
 	default:
 		throw InternalException("Unsupported type for serializing numeric statistics");
 	}
@@ -519,6 +609,9 @@ static void DeserializeNumericStatsValue(const LogicalType &type, NumericValueUn
 	case PhysicalType::DOUBLE:
 		result.value_.double_ = deserializer.ReadProperty<double>(101, "value");
 		break;
+	case PhysicalType::INTERVAL:
+		result.value_.interval = deserializer.ReadProperty<interval_t>(101, "value");
+		break;
 	default:
 		throw InternalException("Unsupported type for serializing numeric statistics");
 	}
@@ -526,57 +619,65 @@ static void DeserializeNumericStatsValue(const LogicalType &type, NumericValueUn
 
 void NumericStats::Serialize(const BaseStatistics &stats, Serializer &serializer) {
 	auto &numeric_stats = NumericStats::GetDataUnsafe(stats);
-	serializer.WriteObject(200, "max", [&](Serializer &object) {
+	// INTERVAL stats are only serialized in V2.0.0 and later.
+	if (stats.GetType().id() == LogicalTypeId::INTERVAL && !serializer.ShouldSerialize(StorageVersion::V2_0_0)) {
+		return;
+	}
+	serializer.WriteObject(200, "min", [&](Serializer &object) {
 		SerializeNumericStatsValue(stats.GetType(), numeric_stats.min, numeric_stats.has_min, object);
 	});
-	serializer.WriteObject(201, "min", [&](Serializer &object) {
+	serializer.WriteObject(201, "max", [&](Serializer &object) {
 		SerializeNumericStatsValue(stats.GetType(), numeric_stats.max, numeric_stats.has_max, object);
 	});
 }
 
 void NumericStats::Deserialize(Deserializer &deserializer, BaseStatistics &result) {
 	auto &numeric_stats = NumericStats::GetDataUnsafe(result);
-
-	deserializer.ReadObject(200, "max", [&](Deserializer &object) {
+	if (!deserializer.CanDeserializeProperty(200, "min")) {
+		return;
+	}
+	deserializer.ReadObject(200, "min", [&](Deserializer &object) {
 		DeserializeNumericStatsValue(result.GetType(), numeric_stats.min, numeric_stats.has_min, object);
 	});
-	deserializer.ReadObject(201, "min", [&](Deserializer &object) {
+	deserializer.ReadObject(201, "max", [&](Deserializer &object) {
 		DeserializeNumericStatsValue(result.GetType(), numeric_stats.max, numeric_stats.has_max, object);
 	});
 }
 
-string NumericStats::ToString(const BaseStatistics &stats) {
-	return StringUtil::Format("[Min: %s, Max: %s]", NumericStats::MinOrNull(stats).ToString(),
-	                          NumericStats::MaxOrNull(stats).ToString());
+child_list_t<Value> NumericStats::ToStruct(const BaseStatistics &stats) {
+	child_list_t<Value> result;
+	if (NumericStats::HasMinMax(stats)) {
+		result.emplace_back("min", NumericStats::MinOrNull(stats));
+		result.emplace_back("max", NumericStats::MaxOrNull(stats));
+	}
+	return result;
 }
 
 template <class T>
-void NumericStats::TemplatedVerify(const BaseStatistics &stats, Vector &vector, const SelectionVector &sel,
+void NumericStats::TemplatedVerify(const BaseStatistics &stats, const Vector &vector, const SelectionVector &sel,
                                    idx_t count) {
-	UnifiedVectorFormat vdata;
-	vector.ToUnifiedFormat(count, vdata);
-
-	auto data = UnifiedVectorFormat::GetData<T>(vdata);
+	auto entries = vector.Values<T>();
 	auto min_value = NumericStats::MinOrNull(stats);
 	auto max_value = NumericStats::MaxOrNull(stats);
 	for (idx_t i = 0; i < count; i++) {
 		auto idx = sel.get_index(i);
-		auto index = vdata.sel->get_index(idx);
-		if (!vdata.validity.RowIsValid(index)) {
+		auto entry = entries[idx];
+		if (!entry.IsValid()) {
 			continue;
 		}
-		if (!min_value.IsNull() && LessThan::Operation(data[index], min_value.GetValueUnsafe<T>())) { // LCOV_EXCL_START
+		if (!min_value.IsNull() &&
+		    LessThan::Operation(entry.GetValue(), min_value.GetValueUnsafe<T>())) { // LCOV_EXCL_START
 			throw InternalException("Statistics mismatch: value is smaller than min.\nStatistics: %s\nVector: %s",
-			                        stats.ToString(), vector.ToString(count));
+			                        stats.ToString(), vector.ToString());
 		} // LCOV_EXCL_STOP
-		if (!max_value.IsNull() && GreaterThan::Operation(data[index], max_value.GetValueUnsafe<T>())) {
+		if (!max_value.IsNull() && GreaterThan::Operation(entry.GetValue(), max_value.GetValueUnsafe<T>())) {
 			throw InternalException("Statistics mismatch: value is bigger than max.\nStatistics: %s\nVector: %s",
-			                        stats.ToString(), vector.ToString(count));
+			                        stats.ToString(), vector.ToString());
 		}
 	}
 }
 
-void NumericStats::Verify(const BaseStatistics &stats, Vector &vector, const SelectionVector &sel, idx_t count) {
+void NumericStats::Verify(const BaseStatistics &stats, const Vector &vector, const SelectionVector &sel, idx_t count) {
 	auto &type = stats.GetType();
 	switch (type.InternalType()) {
 	case PhysicalType::BOOL:
@@ -617,9 +718,14 @@ void NumericStats::Verify(const BaseStatistics &stats, Vector &vector, const Sel
 	case PhysicalType::DOUBLE:
 		TemplatedVerify<double>(stats, vector, sel, count);
 		break;
+	case PhysicalType::INTERVAL:
+		TemplatedVerify<interval_t>(stats, vector, sel, count);
+		break;
 	default:
 		throw InternalException("Unsupported type %s for numeric statistics verify", type.ToString());
 	}
 }
 
+template uint32_t NumericStats::GetMinUnsafe(const BaseStatistics &stats);
+template uint32_t NumericStats::GetMaxUnsafe(const BaseStatistics &stats);
 } // namespace duckdb

@@ -1,5 +1,8 @@
 #include "duckdb/planner/logical_operator.hpp"
 
+#include "duckdb/planner/expression_iterator.hpp"
+
+#include "duckdb/original/std/sstream.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
@@ -7,6 +10,7 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/tree_renderer.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -27,9 +31,22 @@ LogicalOperator::~LogicalOperator() {
 }
 
 vector<ColumnBinding> LogicalOperator::GetColumnBindings() {
-	return {ColumnBinding(0, 0)};
+	return {ColumnBinding(TableIndex(0), ProjectionIndex(0))};
 }
 
+TableIndex LogicalOperator::GetRootIndex() {
+	auto bindings = GetColumnBindings();
+	if (bindings.empty()) {
+		throw InternalException("Empty bindings in GetRootIndex");
+	}
+	auto root_index = bindings[0].table_index;
+	for (idx_t i = 1; i < bindings.size(); i++) {
+		if (bindings[i].table_index != root_index) {
+			throw InternalException("GetRootIndex - multiple column bindings found");
+		}
+	}
+	return root_index;
+}
 void LogicalOperator::SetParamsEstimatedCardinality(InsertionOrderPreservingMap<string> &result) const {
 	if (has_estimated_cardinality) {
 		result[RenderTreeNode::ESTIMATED_CARDINALITY] = StringUtil::Format("%llu", estimated_cardinality);
@@ -76,6 +93,43 @@ InsertionOrderPreservingMap<string> LogicalOperator::ParamsToString() const {
 	return result;
 }
 
+bool LogicalOperator::HasSideEffects() const {
+	switch (type) {
+	case LogicalOperatorType::LOGICAL_INSERT:
+	case LogicalOperatorType::LOGICAL_UPDATE:
+	case LogicalOperatorType::LOGICAL_DELETE:
+	case LogicalOperatorType::LOGICAL_MERGE_INTO:
+	case LogicalOperatorType::LOGICAL_COPY_TO_FILE:
+		return true;
+	default:
+		break;
+	}
+	for (auto &child : children) {
+		if (child && child->HasSideEffects()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool LogicalOperator::HasVolatileExpressions() const {
+	bool is_volatile = false;
+	LogicalOperatorVisitor::EnumerateExpressions(*this, [&](const unique_ptr<Expression> *expression) {
+		if ((*expression)->IsVolatile()) {
+			is_volatile = true;
+		}
+	});
+	if (is_volatile) {
+		return true;
+	}
+	for (auto &child : children) {
+		if (child && child->HasVolatileExpressions()) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void LogicalOperator::ResolveOperatorTypes() {
 	types.clear();
 	// first resolve child types
@@ -87,16 +141,17 @@ void LogicalOperator::ResolveOperatorTypes() {
 	D_ASSERT(types.size() == GetColumnBindings().size());
 }
 
-vector<ColumnBinding> LogicalOperator::GenerateColumnBindings(idx_t table_idx, idx_t column_count) {
+vector<ColumnBinding> LogicalOperator::GenerateColumnBindings(TableIndex table_idx, idx_t column_count) {
 	vector<ColumnBinding> result;
 	result.reserve(column_count);
 	for (idx_t i = 0; i < column_count; i++) {
-		result.emplace_back(table_idx, i);
+		result.emplace_back(table_idx, ProjectionIndex(i));
 	}
 	return result;
 }
 
-vector<LogicalType> LogicalOperator::MapTypes(const vector<LogicalType> &types, const vector<idx_t> &projection_map) {
+vector<LogicalType> LogicalOperator::MapTypes(const vector<LogicalType> &types,
+                                              const vector<ProjectionIndex> &projection_map) {
 	if (projection_map.empty()) {
 		return types;
 	} else {
@@ -110,23 +165,26 @@ vector<LogicalType> LogicalOperator::MapTypes(const vector<LogicalType> &types, 
 }
 
 vector<ColumnBinding> LogicalOperator::MapBindings(const vector<ColumnBinding> &bindings,
-                                                   const vector<idx_t> &projection_map) {
+                                                   const vector<ProjectionIndex> &projection_map) {
 	if (projection_map.empty()) {
 		return bindings;
 	} else {
 		vector<ColumnBinding> result_bindings;
 		result_bindings.reserve(projection_map.size());
 		for (auto index : projection_map) {
-			D_ASSERT(index < bindings.size());
 			result_bindings.push_back(bindings[index]);
 		}
 		return result_bindings;
 	}
 }
 
-string LogicalOperator::ToString(ExplainFormat format) const {
-	auto renderer = TreeRenderer::CreateRenderer(format);
-	stringstream ss;
+string LogicalOperator::ToString(optional_ptr<ClientContext> context, const ProfilerPrintFormat &format) const {
+	auto renderer = context ? TreeRenderer::CreateRenderer(*context, format) : TreeRenderer::CreateRenderer(format);
+	if (!renderer) {
+		// formats without output (e.g. "no_output") render nothing
+		return string();
+	}
+	StringTreeRenderer ss;
 	auto tree = RenderTree::CreateRenderTree(*this);
 	renderer->ToStream(*tree, ss);
 	return ss.str();
@@ -164,7 +222,15 @@ void LogicalOperator::Verify(ClientContext &context) {
 		MemoryStream stream(Allocator::Get(context));
 		// We are serializing a query plan
 		try {
-			BinarySerializer::Serialize(*expressions[expr_idx], stream);
+			auto &config = DBConfig::GetConfig(context);
+			SerializationOptions options;
+			if (config.options.storage_compatibility.manually_set) {
+				options.storage_compatibility = config.options.storage_compatibility;
+			} else {
+				options.storage_compatibility = StorageCompatibility::Latest();
+			}
+
+			BinarySerializer::Serialize(*expressions[expr_idx], stream, options);
 		} catch (NotImplementedException &ex) {
 			// ignore for now (FIXME)
 			continue;
@@ -210,14 +276,14 @@ void LogicalOperator::Print() {
 	Printer::Print(ToString());
 }
 
-vector<idx_t> LogicalOperator::GetTableIndex() const {
-	return vector<idx_t> {};
+vector<TableIndex> LogicalOperator::GetTableIndex() const {
+	return vector<TableIndex> {};
 }
 
 unique_ptr<LogicalOperator> LogicalOperator::Copy(ClientContext &context) const {
 	MemoryStream stream(Allocator::Get(context));
 	SerializationOptions options;
-	options.serialization_compatibility = SerializationCompatibility::Latest();
+	options.storage_compatibility = StorageCompatibility::Latest();
 	BinarySerializer serializer(stream, options);
 	try {
 		serializer.Begin();

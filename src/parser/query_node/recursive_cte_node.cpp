@@ -1,5 +1,4 @@
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 
 namespace duckdb {
@@ -10,7 +9,7 @@ string RecursiveCTENode::ToString() const {
 	result += "(" + left->ToString() + ")";
 	result += " UNION ";
 	if (union_all) {
-		result += " ALL ";
+		result += "ALL ";
 	}
 	result += "(" + right->ToString() + ")";
 	return result;

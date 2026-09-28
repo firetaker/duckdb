@@ -15,11 +15,13 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/random_engine.hpp"
+#include "duckdb/common/time_point.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 
 namespace duckdb {
 
+struct EncryptionMetadata;
 class TemporaryFileManager;
 
 //===--------------------------------------------------------------------===//
@@ -39,6 +41,28 @@ enum class TemporaryBufferSize : uint64_t {
 	DEFAULT = DEFAULT_BLOCK_ALLOC_SIZE,
 };
 
+//! The instance a temporary file belongs to: the process that created it, and which
+//! DatabaseInstance within that process.
+struct TemporaryFileOwner {
+	int64_t pid = 0;
+	idx_t instance = 0;
+
+	bool operator==(const TemporaryFileOwner &other) const {
+		return pid == other.pid && instance == other.instance;
+	}
+};
+
+//! "duckdb_temp_<pid>_<instance>_", the start of every temporary file name. It keeps instances
+//! sharing a temp_directory off each other's paths, and says who to ask whether they are still live.
+DUCKDB_API string TemporaryFilePrefix(const TemporaryFileOwner &owner);
+//! An empty file that exists for as long as an instance uses the directory. Creating it exclusively
+//! is what claims an id; no file of an instance's own is proof, since every one of them can be
+//! deleted again while the instance is still live and about to write more.
+DUCKDB_API string TemporaryOwnerMarkerName(const TemporaryFileOwner &owner);
+//! Extracts the owner, if the name carries one. Names from a version that did not name files after
+//! their owner do not, and are left alone: a running instance of that version may still own them.
+DUCKDB_API bool TryParseTemporaryFileOwner(const string &file_name, TemporaryFileOwner &owner);
+
 //===--------------------------------------------------------------------===//
 // TemporaryFileIdentifier/TemporaryFileIndex
 //===--------------------------------------------------------------------===//
@@ -46,6 +70,7 @@ struct TemporaryFileIdentifier {
 public:
 	TemporaryFileIdentifier();
 	TemporaryFileIdentifier(TemporaryBufferSize size, idx_t file_index);
+	TemporaryFileIdentifier(DatabaseInstance &db, TemporaryBufferSize size, idx_t file_index, bool encrypted);
 
 public:
 	//! Whether this temporary file identifier is valid (fields have been set)
@@ -56,12 +81,15 @@ public:
 	TemporaryBufferSize size;
 	//! The index of the temp file
 	optional_idx file_index;
+	// Indicates whether the file is encrypted
+	bool encrypted = false;
 };
 
 struct TemporaryFileIndex {
 public:
 	TemporaryFileIndex();
-	TemporaryFileIndex(TemporaryFileIdentifier identifier, idx_t block_index);
+	TemporaryFileIndex(TemporaryFileIdentifier identifier, idx_t block_index, idx_t block_header_size,
+	                   FileBufferType buffer_type);
 
 public:
 	//! Whether this temporary file index is valid (fields have been set)
@@ -72,6 +100,10 @@ public:
 	TemporaryFileIdentifier identifier;
 	//! The block index within the temporary file
 	optional_idx block_index;
+	//! The block header size
+	optional_idx block_header_size;
+	//! The buffer type
+	FileBufferType buffer_type = FileBufferType::MANAGED_BUFFER;
 };
 
 //===--------------------------------------------------------------------===//
@@ -80,7 +112,7 @@ public:
 struct BlockIndexManager {
 public:
 	BlockIndexManager();
-	explicit BlockIndexManager(TemporaryFileManager &manager);
+	explicit BlockIndexManager(TemporaryFileManager &manager, bool encrypted = false);
 
 public:
 	//! Obtains a new block index from the index manager
@@ -91,6 +123,8 @@ public:
 	idx_t GetMaxIndex() const;
 	//! Whether there are free blocks available within the file
 	bool HasFreeBlocks() const;
+	//! Get the count of blocks currently holding data
+	idx_t GetUsedBlockCount() const;
 
 private:
 	//! Get/set max block index
@@ -106,6 +140,8 @@ private:
 	set<idx_t> indexes_in_use;
 	//! The TemporaryFileManager that "owns" this BlockIndexManager
 	optional_ptr<TemporaryFileManager> manager;
+	//! Whether the tracked file is encrypted
+	bool encrypted;
 };
 
 //===--------------------------------------------------------------------===//
@@ -116,6 +152,7 @@ class TemporaryFileHandle {
 
 public:
 	TemporaryFileHandle(TemporaryFileManager &manager, TemporaryFileIdentifier identifier, idx_t temp_file_count);
+	~TemporaryFileHandle();
 
 public:
 	struct TemporaryFileLock {
@@ -128,16 +165,19 @@ public:
 
 public:
 	//! Try to get an index of where to write in this file. Returns an invalid index if full
-	TemporaryFileIndex TryGetBlockIndex();
+	TemporaryFileIndex TryGetBlockIndex(idx_t block_header_size, FileBufferType buffer_type);
 	//! Remove block index from this TemporaryFileHandle
 	void EraseBlockIndex(block_id_t block_index);
 
 	//! Read/Write temporary buffers at given positions in this file (potentially compressed)
-	unique_ptr<FileBuffer> ReadTemporaryBuffer(idx_t block_index, unique_ptr<FileBuffer> reusable_buffer) const;
-	void WriteTemporaryBuffer(FileBuffer &buffer, idx_t block_index, AllocatedData &compressed_buffer) const;
+	unique_ptr<FileBuffer> ReadTemporaryBuffer(QueryContext context, const TemporaryFileIndex &index_in_file,
+	                                           unique_ptr<FileBuffer> buffer) const;
+	void WriteTemporaryBuffer(QueryContext context, FileBuffer &buffer, idx_t block_index,
+	                          AllocatedData &compressed_buffer) const;
 
 	//! Deletes the file if there are no more blocks
 	bool DeleteIfEmpty();
+	bool IsEncrypted() const;
 	//! Get information about this temporary file
 	TemporaryFileInformation GetTemporaryFile();
 
@@ -209,12 +249,10 @@ public:
 	TemporaryFileCompressionAdaptivity();
 
 public:
-	//! Get current time in nanoseconds to measure write times
-	static int64_t GetCurrentTimeNanos();
 	//! Get the compression level to use based on current write times
 	TemporaryCompressionLevel GetCompressionLevel();
 	//! Update write time for given compression level
-	void Update(TemporaryCompressionLevel level, int64_t time_before_ns);
+	void Update(TemporaryCompressionLevel level, const TimePoint &time_before);
 
 private:
 	//! Convert from level to index into write time array and back
@@ -252,7 +290,8 @@ class TemporaryFileManager {
 	friend class TemporaryFileHandle;
 
 public:
-	TemporaryFileManager(DatabaseInstance &db, const string &temp_directory_p, atomic<idx_t> &size_on_disk);
+	TemporaryFileManager(DatabaseInstance &db, const string &temp_directory_p, atomic<idx_t> &size_on_disk,
+	                     string file_prefix);
 	~TemporaryFileManager();
 
 private:
@@ -271,10 +310,12 @@ public:
 	};
 
 	//! Create/Read/Update/Delete operations for temporary buffers
-	void WriteTemporaryBuffer(block_id_t block_id, FileBuffer &buffer);
+	idx_t WriteTemporaryBuffer(QueryContext context, block_id_t block_id, FileBuffer &buffer);
 	bool HasTemporaryBuffer(block_id_t block_id);
-	unique_ptr<FileBuffer> ReadTemporaryBuffer(block_id_t id, unique_ptr<FileBuffer> reusable_buffer);
-	void DeleteTemporaryBuffer(block_id_t id);
+	unique_ptr<FileBuffer> ReadTemporaryBuffer(QueryContext context, block_id_t id,
+	                                           unique_ptr<FileBuffer> reusable_buffer, idx_t *eviction_size = nullptr);
+	idx_t DeleteTemporaryBuffer(block_id_t id);
+	bool IsEncrypted() const;
 
 	//! Get the list of temporary files and their sizes
 	vector<TemporaryFileInformation> GetTemporaryFiles();
@@ -310,6 +351,8 @@ private:
 
 private:
 	//! Reference to the DB instance
+	//! Prefix shared by every file this manager creates
+	string file_prefix;
 	DatabaseInstance &db;
 	//! The temporary directory
 	string temp_directory;
@@ -344,9 +387,30 @@ public:
 	TemporaryFileManager &GetTempFile() const;
 
 private:
+	//! Removes this instance's temporary files and, if it created it, the directory. May throw; the
+	//! destructor is what guarantees nothing escapes.
+	void CleanupTemporaryDirectory();
+	//! Removes files of instances whose process is gone. Never throws.
+	void SweepAbandonedInstances();
+	//! Files in the directory that belong to this instance.
+	vector<string> ListOwnFiles();
+	//! Names this instance after its process, taking an id by creating its marker exclusively.
+	//! Sets owner and file_prefix.
+	void ClaimOwner();
+
+public:
+	//! Prefix every temporary file of this instance carries.
+	const string &GetFilePrefix() const {
+		return file_prefix;
+	}
+
+private:
 	DatabaseInstance &db;
 	string temp_directory;
 	bool created_directory = false;
+	//! Who this instance is in the directory, and the prefix built from it
+	TemporaryFileOwner owner;
+	string file_prefix;
 	unique_ptr<TemporaryFileManager> temp_file;
 };
 

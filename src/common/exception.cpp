@@ -1,9 +1,11 @@
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/query_location.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/exception/list.hpp"
 #include "duckdb/parser/tableref.hpp"
+#include "duckdb/parser/parsed_expression.hpp"
 #include "duckdb/planner/expression.hpp"
 
 #ifdef DUCKDB_CRASH_ON_ASSERT
@@ -19,20 +21,20 @@ Exception::Exception(ExceptionType exception_type, const string &message)
     : std::runtime_error(ToJSON(exception_type, message)) {
 }
 
-Exception::Exception(ExceptionType exception_type, const string &message,
-                     const unordered_map<string, string> &extra_info)
-    : std::runtime_error(ToJSON(exception_type, message, extra_info)) {
+Exception::Exception(const unordered_map<string, string> &extra_info, ExceptionType exception_type,
+                     const string &message)
+    : std::runtime_error(ToJSON(extra_info, exception_type, message)) {
 }
 
 string Exception::ToJSON(ExceptionType type, const string &message) {
 	unordered_map<string, string> extra_info;
-	return ToJSON(type, message, extra_info);
+	return ToJSON(extra_info, type, message);
 }
 
-string Exception::ToJSON(ExceptionType type, const string &message, const unordered_map<string, string> &extra_info) {
+string Exception::ToJSON(const unordered_map<string, string> &extra_info, ExceptionType type, const string &message) {
 #ifndef DUCKDB_DEBUG_STACKTRACE
 	// by default we only enable stack traces for internal exceptions
-	if (type == ExceptionType::INTERNAL || type == ExceptionType::FATAL)
+	if (type == ExceptionType::INTERNAL)
 #endif
 	{
 		auto extended_extra_info = extra_info;
@@ -63,6 +65,7 @@ bool Exception::InvalidatesTransaction(ExceptionType exception_type) {
 	case ExceptionType::PARAMETER_NOT_ALLOWED:
 	case ExceptionType::PARSER:
 	case ExceptionType::PERMISSION:
+	case ExceptionType::RESOURCE_IN_USE:
 		return false;
 	default:
 		return true;
@@ -71,6 +74,7 @@ bool Exception::InvalidatesTransaction(ExceptionType exception_type) {
 
 bool Exception::InvalidatesDatabase(ExceptionType exception_type) {
 	switch (exception_type) {
+	case ExceptionType::DATA_CORRUPTION:
 	case ExceptionType::FATAL:
 		return true;
 	default:
@@ -152,7 +156,9 @@ static constexpr ExceptionEntry EXCEPTION_MAP[] = {{ExceptionType::INVALID, "Inv
                                                    {ExceptionType::HTTP, "HTTP"},
                                                    {ExceptionType::AUTOLOAD, "Extension Autoloading"},
                                                    {ExceptionType::SEQUENCE, "Sequence"},
-                                                   {ExceptionType::INVALID_CONFIGURATION, "Invalid Configuration"}};
+                                                   {ExceptionType::INVALID_CONFIGURATION, "Invalid Configuration"},
+                                                   {ExceptionType::DATA_CORRUPTION, "Data Corruption"},
+                                                   {ExceptionType::RESOURCE_IN_USE, "Resource In Use"}};
 
 string Exception::ExceptionTypeToString(ExceptionType type) {
 	for (auto &e : EXCEPTION_MAP) {
@@ -188,7 +194,7 @@ unordered_map<string, string> Exception::InitializeExtraInfo(const TableRef &ref
 	return InitializeExtraInfo(ref.query_location);
 }
 
-unordered_map<string, string> Exception::InitializeExtraInfo(optional_idx error_location) {
+unordered_map<string, string> Exception::InitializeExtraInfo(QueryLocation error_location) {
 	unordered_map<string, string> result;
 	SetQueryLocation(error_location, result);
 	return result;
@@ -205,16 +211,19 @@ bool Exception::IsExecutionError(ExceptionType type) {
 	}
 }
 
-unordered_map<string, string> Exception::InitializeExtraInfo(const string &subtype, optional_idx error_location) {
+unordered_map<string, string> Exception::InitializeExtraInfo(const string &subtype, QueryLocation error_location) {
 	unordered_map<string, string> result;
 	result["error_subtype"] = subtype;
 	SetQueryLocation(error_location, result);
 	return result;
 }
 
-void Exception::SetQueryLocation(optional_idx error_location, unordered_map<string, string> &extra_info) {
+void Exception::SetQueryLocation(QueryLocation error_location, unordered_map<string, string> &extra_info) {
 	if (error_location.IsValid()) {
-		extra_info["position"] = to_string(error_location.GetIndex());
+		// "position" is the start offset (kept for backwards compatibility with existing consumers)
+		extra_info["position"] = to_string(error_location.offset);
+		// "location" is the structured [start, length] source range
+		extra_info["location"] = "[" + to_string(error_location.offset) + "," + to_string(error_location.length) + "]";
 	}
 }
 
@@ -235,14 +244,13 @@ TypeMismatchException::TypeMismatchException(const PhysicalType type_1, const Ph
 }
 
 TypeMismatchException::TypeMismatchException(const LogicalType &type_1, const LogicalType &type_2, const string &msg)
-    : TypeMismatchException(optional_idx(), type_1, type_2, msg) {
+    : TypeMismatchException(QueryLocation(), type_1, type_2, msg) {
 }
 
-TypeMismatchException::TypeMismatchException(optional_idx error_location, const LogicalType &type_1,
+TypeMismatchException::TypeMismatchException(QueryLocation error_location, const LogicalType &type_1,
                                              const LogicalType &type_2, const string &msg)
-    : Exception(ExceptionType::MISMATCH_TYPE,
-                "Type " + type_1.ToString() + " does not match with " + type_2.ToString() + ". " + msg,
-                Exception::InitializeExtraInfo(error_location)) {
+    : Exception(Exception::InitializeExtraInfo(error_location), ExceptionType::MISMATCH_TYPE,
+                "Type " + type_1.ToString() + " does not match with " + type_2.ToString() + ". " + msg) {
 }
 
 TypeMismatchException::TypeMismatchException(const string &msg) : Exception(ExceptionType::MISMATCH_TYPE, msg) {
@@ -306,8 +314,18 @@ DependencyException::DependencyException(const string &msg) : Exception(Exceptio
 IOException::IOException(const string &msg) : Exception(ExceptionType::IO, msg) {
 }
 
-IOException::IOException(const string &msg, const unordered_map<string, string> &extra_info)
-    : Exception(ExceptionType::IO, msg, extra_info) {
+IOException::IOException(const unordered_map<string, string> &extra_info, const string &msg)
+    : Exception(extra_info, ExceptionType::IO, msg) {
+}
+
+DataCorruptionException::DataCorruptionException(const string &msg) : Exception(ExceptionType::DATA_CORRUPTION, msg) {
+}
+
+ResourceInUseException::ResourceInUseException(const string &msg) : Exception(ExceptionType::RESOURCE_IN_USE, msg) {
+}
+
+NotImplementedException::NotImplementedException(const unordered_map<string, string> &extra_info, const string &msg)
+    : Exception(extra_info, ExceptionType::NOT_IMPLEMENTED, msg) {
 }
 
 MissingExtensionException::MissingExtensionException(const string &msg)
@@ -315,9 +333,10 @@ MissingExtensionException::MissingExtensionException(const string &msg)
 }
 
 AutoloadException::AutoloadException(const string &extension_name, const string &message)
-    : Exception(ExceptionType::AUTOLOAD,
-                "An error occurred while trying to automatically install the required extension '" + extension_name +
-                    "':\n" + message) {
+    : Exception(
+          ExceptionType::AUTOLOAD,
+          StringUtil::Format("An error occurred while trying to automatically install the required extension '%s:\n%s",
+                             extension_name, message)) {
 }
 
 SerializationException::SerializationException(const string &msg) : Exception(ExceptionType::SERIALIZATION, msg) {
@@ -326,33 +345,42 @@ SerializationException::SerializationException(const string &msg) : Exception(Ex
 SequenceException::SequenceException(const string &msg) : Exception(ExceptionType::SEQUENCE, msg) {
 }
 
-InterruptException::InterruptException() : Exception(ExceptionType::INTERRUPT, "Interrupted!") {
+InterruptException::InterruptException() : Exception(ExceptionType::INTERRUPT, INTERRUPT_MESSAGE) {
+}
+
+InterruptException::InterruptException(const string &message) : Exception(ExceptionType::INTERRUPT, message) {
 }
 
 FatalException::FatalException(ExceptionType type, const string &msg) : Exception(type, msg) {
+	// FIXME: Make any log context available to add error logging.
 }
 
 InternalException::InternalException(const string &msg) : Exception(ExceptionType::INTERNAL, msg) {
+	// FIXME: Make any log context available to add error logging.
 #ifdef DUCKDB_CRASH_ON_ASSERT
 	Printer::Print("ABORT THROWN BY INTERNAL EXCEPTION: " + msg + "\n" + StackTrace::GetStackTrace());
 	abort();
 #endif
 }
 
+InternalException::InternalException(const unordered_map<string, string> &extra_info, const string &msg)
+    : Exception(extra_info, ExceptionType::INTERNAL, msg) {
+}
+
 InvalidInputException::InvalidInputException(const string &msg) : Exception(ExceptionType::INVALID_INPUT, msg) {
 }
 
-InvalidInputException::InvalidInputException(const string &msg, const unordered_map<string, string> &extra_info)
-    : Exception(ExceptionType::INVALID_INPUT, msg, extra_info) {
+InvalidInputException::InvalidInputException(const unordered_map<string, string> &extra_info, const string &msg)
+    : Exception(extra_info, ExceptionType::INVALID_INPUT, msg) {
 }
 
 InvalidConfigurationException::InvalidConfigurationException(const string &msg)
     : Exception(ExceptionType::INVALID_CONFIGURATION, msg) {
 }
 
-InvalidConfigurationException::InvalidConfigurationException(const string &msg,
-                                                             const unordered_map<string, string> &extra_info)
-    : Exception(ExceptionType::INVALID_CONFIGURATION, msg, extra_info) {
+InvalidConfigurationException::InvalidConfigurationException(const unordered_map<string, string> &extra_info,
+                                                             const string &msg)
+    : Exception(extra_info, ExceptionType::INVALID_CONFIGURATION, msg) {
 }
 
 OutOfMemoryException::OutOfMemoryException(const string &msg)
@@ -360,7 +388,7 @@ OutOfMemoryException::OutOfMemoryException(const string &msg)
 }
 
 string OutOfMemoryException::ExtendOutOfMemoryError(const string &msg) {
-	string link = "https://duckdb.org/docs/stable/guides/performance/how_to_tune_workloads";
+	string link = "https://duckdb.org/docs/current/guides/performance/how_to_tune_workloads";
 	if (StringUtil::Contains(msg, link)) {
 		// already extended
 		return msg;

@@ -18,64 +18,6 @@ using namespace duckdb_yyjson; // NOLINT
 
 namespace duckdb {
 
-class JSONAllocator;
-
-class JSONStringVectorBuffer : public VectorBuffer {
-public:
-	explicit JSONStringVectorBuffer(shared_ptr<JSONAllocator> allocator_p)
-	    : VectorBuffer(VectorBufferType::OPAQUE_BUFFER), allocator(std::move(allocator_p)) {
-	}
-
-private:
-	shared_ptr<JSONAllocator> allocator;
-};
-
-//! JSON allocator is a custom allocator for yyjson that prevents many tiny allocations
-class JSONAllocator : public enable_shared_from_this<JSONAllocator> {
-public:
-	explicit JSONAllocator(Allocator &allocator)
-	    : arena_allocator(allocator), yyjson_allocator({Allocate, Reallocate, Free, this}) {
-	}
-
-	inline yyjson_alc *GetYYAlc() {
-		return &yyjson_allocator;
-	}
-
-	void Reset() {
-		arena_allocator.Reset();
-	}
-
-	void AddBuffer(Vector &vector) {
-		if (vector.GetType().InternalType() == PhysicalType::VARCHAR) {
-			StringVector::AddBuffer(vector, make_buffer<JSONStringVectorBuffer>(shared_from_this()));
-		}
-	}
-
-	static void AddBuffer(Vector &vector, yyjson_alc *alc) {
-		auto alloc = (JSONAllocator *)alc->ctx; // NOLINT
-		alloc->AddBuffer(vector);
-	}
-
-private:
-	static inline void *Allocate(void *ctx, size_t size) {
-		auto alloc = (JSONAllocator *)ctx; // NOLINT
-		return alloc->arena_allocator.AllocateAligned(size);
-	}
-
-	static inline void *Reallocate(void *ctx, void *ptr, size_t old_size, size_t size) {
-		auto alloc = (JSONAllocator *)ctx; // NOLINT
-		return alloc->arena_allocator.ReallocateAligned(data_ptr_cast(ptr), old_size, size);
-	}
-
-	static inline void Free(void *ctx, void *ptr) {
-		// NOP because ArenaAllocator can't free
-	}
-
-private:
-	ArenaAllocator arena_allocator;
-	yyjson_alc yyjson_allocator;
-};
-
 //! JSONKey / json_key_map_t speeds up mapping from JSON key to column ID
 struct JSONKey {
 	const char *ptr;
@@ -89,7 +31,7 @@ struct JSONKeyHash {
 			memcpy(&result, k.ptr + k.len - sizeof(size_t), sizeof(size_t));
 		} else {
 			result = 0;
-			FastMemcpy(&result, k.ptr, k.len);
+			memcpy(&result, k.ptr, k.len);
 		}
 		return result;
 	}
@@ -100,7 +42,7 @@ struct JSONKeyEquality {
 		if (a.len != b.len) {
 			return false;
 		}
-		return FastMemcmp(a.ptr, b.ptr, a.len) == 0;
+		return memcmp(a.ptr, b.ptr, a.len) == 0;
 	}
 };
 
@@ -108,9 +50,50 @@ template <typename T>
 using json_key_map_t = unordered_map<JSONKey, T, JSONKeyHash, JSONKeyEquality>;
 using json_key_set_t = unordered_set<JSONKey, JSONKeyHash, JSONKeyEquality>;
 
+//! The type of a single element of a JSON path
+enum class JSONPathElementType : uint8_t {
+	//! Object key ($.key)
+	KEY,
+	//! Array index ($[0])
+	INDEX,
+	//! Array index counting from the back ($[#-1] or $[-1])
+	REVERSE_INDEX,
+	//! The position after the last array element ($[#])
+	APPEND,
+	//! Wildcard ($.* or $[*])
+	WILDCARD,
+	//! Recursive wildcard ($.**)
+	RECURSIVE_WILDCARD,
+};
+
+//! A single element of a JSON path
+struct JSONPathElement {
+	JSONPathElementType type = JSONPathElementType::KEY;
+	//! Key for KEY elements
+	string key;
+	//! Index for INDEX and REVERSE_INDEX elements
+	idx_t index = 0;
+};
+
+//! Iterates over the elements of a JSON path ($.field[index]... syntax)
+class JSONPathIterator {
+public:
+	//! The path must start with '$' (validate before constructing)
+	JSONPathIterator(const char *ptr, idx_t len, bool binder);
+	//! Get the next path element, returns false when the path is exhausted. Throws on a malformed path.
+	bool Next(JSONPathElement &element);
+
+private:
+	const char *ptr;
+	const char *const end;
+	const bool binder;
+};
+
 //! Common JSON functionality for most JSON functions
 struct JSONCommon {
 public:
+	//! Maximum recursion depth for recursive functions
+	static constexpr idx_t MAX_RECURSION_DEPTH = 128;
 	//! Read/Write flags
 	static constexpr auto READ_FLAG =
 	    YYJSON_READ_ALLOW_INF_AND_NAN | YYJSON_READ_ALLOW_TRAILING_COMMAS | YYJSON_READ_BIGNUM_AS_RAW;
@@ -228,11 +211,8 @@ public:
 
 	static string FormatParseError(const char *data, idx_t length, yyjson_read_err &error, const string &extra = "") {
 		D_ASSERT(error.code != YYJSON_READ_SUCCESS);
-		// Go to blob so we can have a better error message for weird strings
-		auto blob = Value::BLOB(string(data, length));
 		// Truncate, so we don't print megabytes worth of JSON
-		string input = blob.ToString();
-		input = input.length() > 50 ? string(input.c_str(), 47) + "..." : input;
+		auto input = length > 50 ? string(data, 47) + "..." : string(data, length);
 		// Have to replace \r, otherwise output is unreadable
 		input = StringUtil::Replace(input, "\r", "\\r");
 		return StringUtil::Format("Malformed JSON at byte %lld of input: %s. %s Input: \"%s\"", error.pos, error.msg,
@@ -327,15 +307,19 @@ public:
 	//! Validate JSON Path ($.field[index]... syntax), returns true if there are wildcards in the path
 	static JSONPathType ValidatePath(const char *ptr, const idx_t &len, const bool binder);
 
+	//! Parse a JSON path ($.field[index]... syntax, no wildcards) into path elements
+	static vector<JSONPathElement> ParsePathElements(const char *ptr, idx_t len, bool binder);
+	//! Get JSON value by walking pre-parsed path elements
+	static yyjson_val *GetPathElements(yyjson_val *val, const vector<JSONPathElement> &elements);
+
 public:
 	//! Same as BigQuery json_value
-	static inline string_t JSONValue(yyjson_val *val, yyjson_alc *alc, Vector &, ValidityMask &mask, idx_t idx) {
+	static inline optional<string_t> JSONValue(yyjson_val *val, yyjson_alc *alc, Vector &) {
 		switch (yyjson_get_tag(val)) {
 		case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
 		case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE:
 		case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE:
-			mask.SetInvalid(idx);
-			return string_t {};
+			return nullopt;
 		default:
 			return JSONCommon::WriteVal<yyjson_val>(val, alc);
 		}
@@ -353,11 +337,38 @@ private:
 
 template <>
 inline char *JSONCommon::WriteVal(yyjson_val *val, yyjson_alc *alc, idx_t &len) {
-	return yyjson_val_write_opts(val, JSONCommon::WRITE_FLAG, alc, reinterpret_cast<size_t *>(&len), nullptr);
+	size_t len_size_t;
+	// yyjson_val_write_opts must not throw
+	auto ret = yyjson_val_write_opts(val, JSONCommon::WRITE_FLAG, alc, &len_size_t, nullptr);
+	len = len_size_t;
+	return ret;
 }
 template <>
 inline char *JSONCommon::WriteVal(yyjson_mut_val *val, yyjson_alc *alc, idx_t &len) {
-	return yyjson_mut_val_write_opts(val, JSONCommon::WRITE_FLAG, alc, reinterpret_cast<size_t *>(&len), nullptr);
+	size_t len_size_t;
+	// yyjson_mut_val_write_opts must not throw
+	auto ret = yyjson_mut_val_write_opts(val, JSONCommon::WRITE_FLAG, alc, &len_size_t, nullptr);
+	len = len_size_t;
+	return ret;
 }
+
+struct yyjson_doc_deleter {
+	void operator()(yyjson_doc *doc) {
+		if (doc) {
+			yyjson_doc_free(doc);
+		}
+	}
+};
+
+struct yyjson_mut_doc_deleter {
+	void operator()(yyjson_mut_doc *doc) {
+		if (doc) {
+			yyjson_mut_doc_free(doc);
+		}
+	}
+};
+
+using yyjson_doc_ptr = unique_ptr<yyjson_doc, yyjson_doc_deleter>;
+using yyjson_mut_doc_ptr = unique_ptr<yyjson_mut_doc, yyjson_mut_doc_deleter>;
 
 } // namespace duckdb

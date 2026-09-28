@@ -10,10 +10,11 @@
 
 namespace duckdb {
 
-PhysicalBlockwiseNLJoin::PhysicalBlockwiseNLJoin(LogicalOperator &op, PhysicalOperator &left, PhysicalOperator &right,
+PhysicalBlockwiseNLJoin::PhysicalBlockwiseNLJoin(PhysicalPlan &physical_plan, LogicalOperator &op,
+                                                 PhysicalOperator &left, PhysicalOperator &right,
                                                  unique_ptr<Expression> condition, JoinType join_type,
                                                  idx_t estimated_cardinality)
-    : PhysicalJoin(op, PhysicalOperatorType::BLOCKWISE_NL_JOIN, join_type, estimated_cardinality),
+    : PhysicalJoin(physical_plan, op, PhysicalOperatorType::BLOCKWISE_NL_JOIN, join_type, estimated_cardinality),
       condition(std::move(condition)) {
 	children.push_back(left);
 	children.push_back(right);
@@ -215,7 +216,8 @@ OperatorResultType PhysicalBlockwiseNLJoin::ExecuteInternal(ExecutionContext &co
 InsertionOrderPreservingMap<string> PhysicalBlockwiseNLJoin::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
 	result["Join Type"] = EnumUtil::ToString(join_type);
-	result["Condition"] = condition->GetName();
+	result["Condition"] = condition->GetName().GetIdentifierName();
+	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
 }
 
@@ -251,6 +253,10 @@ public:
 	OuterJoinLocalScanState scan_state;
 };
 
+ProgressData PhysicalBlockwiseNLJoin::GetProgress(ClientContext &context, GlobalSourceState &gstate) const {
+	return gstate.Cast<BlockwiseNLJoinGlobalScanState>().scan_state.GetProgress();
+}
+
 unique_ptr<GlobalSourceState> PhysicalBlockwiseNLJoin::GetGlobalSourceState(ClientContext &context) const {
 	return make_uniq<BlockwiseNLJoinGlobalScanState>(*this);
 }
@@ -260,8 +266,8 @@ unique_ptr<LocalSourceState> PhysicalBlockwiseNLJoin::GetLocalSourceState(Execut
 	return make_uniq<BlockwiseNLJoinLocalScanState>(*this, gstate.Cast<BlockwiseNLJoinGlobalScanState>());
 }
 
-SourceResultType PhysicalBlockwiseNLJoin::GetData(ExecutionContext &context, DataChunk &chunk,
-                                                  OperatorSourceInput &input) const {
+SourceResultType PhysicalBlockwiseNLJoin::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                          OperatorSourceInput &input) const {
 	D_ASSERT(PropagatesBuildSide(join_type));
 	// check if we need to scan any unmatched tuples from the RHS for the full/right outer join
 	auto &sink = sink_state->Cast<BlockwiseNLJoinGlobalState>();

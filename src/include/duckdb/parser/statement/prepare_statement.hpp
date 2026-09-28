@@ -8,7 +8,6 @@
 
 #pragma once
 
-#include "duckdb/parser/parsed_expression.hpp"
 #include "duckdb/parser/sql_statement.hpp"
 
 namespace duckdb {
@@ -21,7 +20,7 @@ public:
 	PrepareStatement();
 
 	unique_ptr<SQLStatement> statement;
-	string name;
+	Identifier name;
 
 protected:
 	PrepareStatement(const PrepareStatement &other);

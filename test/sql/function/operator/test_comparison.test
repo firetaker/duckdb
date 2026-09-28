@@ -2,9 +2,6 @@
 # description: Test basic comparison statements
 # group: [operator]
 
-statement ok
-PRAGMA enable_verification
-
 # = and == are the same
 query TTTTT
 SELECT 1 == 1, 1 = 1, 1 == 0, 1 = 0, 1 == NULL
@@ -16,6 +13,27 @@ query TTTTT
 SELECT 1 <> 1, 1 != 1, 1 <> 0, 1 != 0, 1 <> NULL
 ----
 0	0	1	1	NULL
+
+# chained comparisons are not supported; combine separate comparisons with AND
+statement error
+SELECT 1 = 1 = 1;
+----
+Parser Error: Chained comparisons are not supported, use AND to combine comparisons
+
+statement error
+SELECT 1 < 2 < 3;
+----
+Parser Error: Chained comparisons are not supported, use AND to combine comparisons
+
+statement error
+SELECT 1 IS DISTINCT FROM 2 IS DISTINCT FROM 3;
+----
+Parser Error: Chained comparisons are not supported, use AND to combine comparisons
+
+query I
+SELECT 1 < 2 AND 2 < 3
+----
+1
 
 # Test auto casting of comparison statements
 # string <> number comparisons should result in the string being cast to a number
@@ -47,4 +65,3 @@ query T
 select ('abc' between '20' and 'true');
 ----
 1
-

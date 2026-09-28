@@ -23,12 +23,12 @@
 namespace duckdb {
 
 //! Sanitizes a string to have only low case chars and underscores
-string SanitizeExportIdentifier(const string &str) {
+string SanitizeExportIdentifier(const Identifier &str) {
 	// Copy the original string to result
-	string result(str);
+	string result(str.GetIdentifierName());
 
-	for (idx_t i = 0; i < str.length(); ++i) {
-		auto c = str[i];
+	for (idx_t i = 0; i < result.length(); ++i) {
+		auto c = result[i];
 		if (c >= 'a' && c <= 'z') {
 			// If it is lower case just continue
 			continue;
@@ -46,10 +46,10 @@ string SanitizeExportIdentifier(const string &str) {
 	return result;
 }
 
-bool ReferencedTableIsOrdered(string &referenced_table, catalog_entry_vector_t &ordered) {
+bool ReferencedTableIsOrdered(const Identifier &referenced_table, catalog_entry_vector_t &ordered) {
 	for (auto &entry : ordered) {
 		auto &table_entry = entry.get().Cast<TableCatalogEntry>();
-		if (StringUtil::CIEquals(table_entry.name, referenced_table)) {
+		if (table_entry.name == referenced_table) {
 			// The referenced table is already ordered
 			return true;
 		}
@@ -119,9 +119,7 @@ string CreateFileName(const string &id_suffix, TableCatalogEntry &table, const s
 
 static unique_ptr<QueryNode> CreateSelectStatement(CopyStatement &stmt, child_list_t<LogicalType> &select_list) {
 	auto ref = make_uniq<BaseTableRef>();
-	ref->catalog_name = stmt.info->catalog;
-	ref->schema_name = stmt.info->schema;
-	ref->table_name = stmt.info->table;
+	ref->SetQualifiedName(stmt.info->GetQualifiedName());
 
 	auto statement = make_uniq<SelectNode>();
 	statement->from_table = std::move(ref);
@@ -140,21 +138,11 @@ unique_ptr<LogicalOperator> Binder::UnionOperators(vector<unique_ptr<LogicalOper
 	if (nodes.empty()) {
 		return nullptr;
 	}
-	while (nodes.size() > 1) {
-		vector<unique_ptr<LogicalOperator>> new_nodes;
-		for (idx_t i = 0; i < nodes.size(); i += 2) {
-			if (i + 1 == nodes.size()) {
-				new_nodes.push_back(std::move(nodes[i]));
-			} else {
-				auto copy_union = make_uniq<LogicalSetOperation>(GenerateTableIndex(), 1U, std::move(nodes[i]),
-				                                                 std::move(nodes[i + 1]),
-				                                                 LogicalOperatorType::LOGICAL_UNION, true, false);
-				new_nodes.push_back(std::move(copy_union));
-			}
-		}
-		nodes = std::move(new_nodes);
+	if (nodes.size() == 1) {
+		return std::move(nodes[0]);
 	}
-	return std::move(nodes[0]);
+	return make_uniq<LogicalSetOperation>(GenerateTableIndex(), 1U, std::move(nodes),
+	                                      LogicalOperatorType::LOGICAL_UNION, true, false);
 }
 
 BoundStatement Binder::Bind(ExportStatement &stmt) {
@@ -163,18 +151,26 @@ BoundStatement Binder::Bind(ExportStatement &stmt) {
 	result.types = {LogicalType::BOOLEAN};
 	result.names = {"Success"};
 
+	// bind copy options
+	BindCopyOptions(*stmt.info);
+
 	// lookup the format in the catalog
-	auto &copy_function =
-	    Catalog::GetEntry<CopyFunctionCatalogEntry>(context, INVALID_CATALOG, DEFAULT_SCHEMA, stmt.info->format);
+	auto &copy_function = Catalog::GetEntry<CopyFunctionCatalogEntry>(
+	    context,
+	    QualifiedName(Identifier::InvalidCatalog(), Identifier::DefaultSchema(), Identifier(stmt.info->format)));
 	if (!copy_function.function.copy_to_bind && !copy_function.function.plan) {
 		throw NotImplementedException("COPY TO is not supported for FORMAT \"%s\"", stmt.info->format);
 	}
 
 	// gather a list of all the tables
-	string catalog = stmt.database.empty() ? INVALID_CATALOG : stmt.database;
+	string catalog = stmt.database;
 	catalog_entry_vector_t tables;
 	auto schemas = Catalog::GetSchemas(context, catalog);
 	for (auto &schema : schemas) {
+		auto &schema_entry = schema.get();
+		if (schema_entry.ParentCatalog().IsTemporaryCatalog()) {
+			continue;
+		}
 		schema.get().Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
 			if (entry.type == CatalogType::TABLE_ENTRY) {
 				tables.push_back(entry.Cast<TableCatalogEntry>());
@@ -184,6 +180,23 @@ BoundStatement Binder::Bind(ExportStatement &stmt) {
 
 	// reorder tables because of foreign key constraint
 	ReorderTableEntries(tables);
+
+	// check for self-referencing foreign keys, which cannot be exported currently, until ALTER TABLE constraints
+	// is supported, and we can export additional ALTER TABLEs for the self-references.
+	for (auto &t : tables) {
+		auto &table = t.get().Cast<TableCatalogEntry>();
+		for (auto &constraint : table.GetConstraints()) {
+			if (constraint->type != ConstraintType::FOREIGN_KEY) {
+				continue;
+			}
+			auto &fk = constraint->Cast<ForeignKeyConstraint>();
+			if (fk.info.type == ForeignKeyType::FK_TYPE_SELF_REFERENCE_TABLE) {
+				throw BinderException("Failed to export database: table \"%s\" has a self-referencing foreign key "
+				                      "constraint which is currently not supported for exporting",
+				                      table.name);
+			}
+		}
+	}
 
 	// now generate the COPY statements for each of the tables
 	auto &fs = FileSystem::GetFileSystem(context);
@@ -215,28 +228,25 @@ BoundStatement Binder::Bind(ExportStatement &stmt) {
 			id++;
 		}
 		info->is_from = false;
-		info->catalog = catalog;
-		info->schema = table.schema.name;
-		info->table = table.name;
+		// carry the full (possibly nested) schema path of the exported table
+		info->SetQualifiedName(table.schema.GetQualifiedName(table.name));
 
 		// We can not export generated columns
 		child_list_t<LogicalType> select_list;
 		// Let's verify if any on these columns have not null constraints
-		vector<string> not_null_columns;
-		for (auto &constaint : table.GetConstraints()) {
-			if (constaint->type == ConstraintType::NOT_NULL) {
-				auto &not_null_constraint = constaint->Cast<NotNullConstraint>();
-				not_null_columns.push_back(table.GetColumn(not_null_constraint.index).GetName());
+		vector<Identifier> not_null_columns;
+		for (auto &constraint : table.GetConstraints()) {
+			if (constraint->type == ConstraintType::NOT_NULL) {
+				auto &not_null_constraint = constraint->Cast<NotNullConstraint>();
+				not_null_columns.emplace_back(table.GetColumn(not_null_constraint.index).GetName().GetIdentifierName());
 			}
 		}
 		for (auto &col : table.GetColumns().Physical()) {
-			select_list.push_back(std::make_pair(col.Name(), col.Type()));
+			select_list.emplace_back(std::make_pair(col.Name(), col.Type()));
 		}
 
 		ExportedTableData exported_data;
-		exported_data.database_name = catalog;
-		exported_data.table_name = info->table;
-		exported_data.schema_name = info->schema;
+		exported_data.qualified_name = info->GetQualifiedName();
 
 		exported_data.file_path = info->file_path;
 
@@ -264,7 +274,41 @@ BoundStatement Binder::Bind(ExportStatement &stmt) {
 		fs.CreateDirectory(stmt.info->file_path);
 	}
 
-	stmt.info->catalog = catalog;
+	stmt.info->SetQualifiedName(QualifiedName(Identifier(catalog), stmt.info->GetQualifiedName().Schema(),
+	                                          stmt.info->GetQualifiedName().Name()));
+	// prepare the options for export
+	auto &format = stmt.info->format;
+	auto &options = stmt.info->options;
+	if (format == "csv") {
+		// insert default csv options, if not specified
+		if (options.find("header") == options.end()) {
+			options["header"].push_back(Value::INTEGER(1));
+		}
+		if (options.find("delimiter") == options.end() && options.find("sep") == options.end() &&
+		    options.find("delim") == options.end()) {
+			options["delimiter"].push_back(Value(","));
+		}
+		if (options.find("quote") == options.end()) {
+			options["quote"].push_back(Value("\""));
+		}
+		options.erase("force_quote");
+	}
+	// for any options that are write-only, use them for writing but don't put them in the COPY statements we generate
+	// for reading
+	auto &function = copy_function.function;
+	if (function.copy_options) {
+		auto copy_options = GetFullCopyOptionsList(function, CopyOptionMode::READ_ONLY);
+		vector<Identifier> erased_options;
+		for (auto &entry : options) {
+			if (copy_options.find(entry.first) == copy_options.end()) {
+				erased_options.push_back(entry.first);
+			}
+		}
+		for (auto &erased : erased_options) {
+			options.erase(erased);
+		}
+	}
+
 	// create the export node
 	auto export_node =
 	    make_uniq<LogicalExport>(copy_function.function, std::move(stmt.info), std::move(exported_tables));
@@ -276,7 +320,7 @@ BoundStatement Binder::Bind(ExportStatement &stmt) {
 	result.plan = std::move(export_node);
 
 	auto &properties = GetStatementProperties();
-	properties.allow_stream_result = false;
+	properties.result_eagerness = ResultEagerness::FORCED;
 	properties.return_type = StatementReturnType::NOTHING;
 	return result;
 }

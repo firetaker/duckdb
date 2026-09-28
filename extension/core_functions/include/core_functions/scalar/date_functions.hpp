@@ -17,7 +17,7 @@ namespace duckdb {
 
 struct AgeFun {
 	static constexpr const char *Name = "age";
-	static constexpr const char *Parameters = "timestamp,timestamp";
+	static constexpr const char *Parameters = "timestamp1,timestamp2";
 	static constexpr const char *Description = "Subtract arguments, resulting in the time difference between the two timestamps";
 	static constexpr const char *Example = "age(TIMESTAMP '2001-04-10', TIMESTAMP '1992-09-20')";
 	static constexpr const char *Categories = "";
@@ -53,7 +53,7 @@ struct DatediffFun {
 
 struct DatePartFun {
 	static constexpr const char *Name = "date_part";
-	static constexpr const char *Parameters = "ts";
+	static constexpr const char *Parameters = "part,ts";
 	static constexpr const char *Description = "Get subfield (equivalent to extract)";
 	static constexpr const char *Example = "date_part('minute', TIMESTAMP '1992-09-20 20:38:40')";
 	static constexpr const char *Categories = "";
@@ -306,6 +306,16 @@ struct MakeTimestampFun {
 	static constexpr const char *Parameters = "year,month,day,hour,minute,seconds";
 	static constexpr const char *Description = "The timestamp for the given parts";
 	static constexpr const char *Example = "make_timestamp(1992, 9, 20, 13, 34, 27.123456)";
+	static constexpr const char *Categories = "";
+
+	static ScalarFunctionSet GetFunctions();
+};
+
+struct MakeTimestampMsFun {
+	static constexpr const char *Name = "make_timestamp_ms";
+	static constexpr const char *Parameters = "nanos";
+	static constexpr const char *Description = "The timestamp for the given microseconds since the epoch";
+	static constexpr const char *Example = "make_timestamp_ms(1732117793000000)";
 	static constexpr const char *Categories = "";
 
 	static ScalarFunctionSet GetFunctions();

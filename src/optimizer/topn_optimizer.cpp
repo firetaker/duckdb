@@ -5,16 +5,21 @@
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/dynamic_filter.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/optimizer/join_filter_pushdown_optimizer.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/common/optional_ptr.hpp"
 
 namespace duckdb {
 
-bool TopN::CanOptimize(LogicalOperator &op) {
+TopN::TopN(ClientContext &context_p) : context(context_p) {
+}
+
+bool TopN::CanOptimize(LogicalOperator &op, optional_ptr<ClientContext> context) {
 	if (op.type == LogicalOperatorType::LOGICAL_LIMIT) {
 		auto &limit = op.Cast<LogicalLimit>();
 
@@ -28,14 +33,24 @@ bool TopN::CanOptimize(LogicalOperator &op) {
 		}
 
 		auto child_op = op.children[0].get();
+		if (context) {
+			// estimate child cardinality if the context is available
+			child_op->EstimateCardinality(*context);
+		}
 
-		auto constant_limit = static_cast<double>(limit.limit_val.GetConstantValue());
-		auto child_card = static_cast<double>(child_op->estimated_cardinality);
+		if (child_op->has_estimated_cardinality) {
+			// only check if we should switch to full sorting if we have estimated cardinality
+			auto constant_limit = static_cast<double>(limit.limit_val.GetConstantValue());
+			if (limit.offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
+				constant_limit += static_cast<double>(limit.offset_val.GetConstantValue());
+			}
+			auto child_card = static_cast<double>(child_op->estimated_cardinality);
 
-		// if the child cardinality is not 98 times more than the
-		bool limit_is_large = constant_limit > 5000;
-		if (constant_limit > child_card * 0.007 && limit_is_large) {
-			return false;
+			// if the limit is > 0.7% of the child cardinality, sorting the whole table is faster
+			bool limit_is_large = constant_limit > 5000;
+			if (constant_limit > child_card * 0.007 && limit_is_large) {
+				return false;
+			}
 		}
 
 		while (child_op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
@@ -50,14 +65,10 @@ bool TopN::CanOptimize(LogicalOperator &op) {
 
 void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 	// pushdown dynamic filters through the Top-N operator
-	if (op.orders[0].null_order == OrderByNullType::NULLS_FIRST) {
-		// FIXME: not supported for NULLS FIRST quite yet
-		// we can support NULLS FIRST by doing (x IS NULL) OR [boundary value]
-		return;
-	}
-	auto &type = op.orders[0].expression->return_type;
-	if (!TypeIsIntegral(type.InternalType()) && type.id() != LogicalTypeId::VARCHAR) {
-		// only supported for integral types currently
+	bool nulls_first = op.orders[0].null_order == OrderByNullType::NULLS_FIRST;
+	auto &type = op.orders[0].expression->GetReturnType();
+	if (!TypeIsNumeric(type.InternalType()) && type.id() != LogicalTypeId::VARCHAR) {
+		// only supported for numeric and varchar types
 		return;
 	}
 	if (op.orders[0].expression->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
@@ -71,13 +82,24 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 	auto &colref = op.orders[0].expression->Cast<BoundColumnRefExpression>();
 	vector<JoinFilterPushdownColumn> columns;
 	JoinFilterPushdownColumn column;
-	column.probe_column_index = colref.binding;
+	column.probe_column_index = colref.Binding();
 	columns.emplace_back(column);
 	vector<PushdownFilterTarget> pushdown_targets;
 	JoinFilterPushdownOptimizer::GetPushdownFilterTargets(*op.children[0], std::move(columns), pushdown_targets);
 	if (pushdown_targets.empty()) {
 		// no pushdown targets
 		return;
+	}
+	for (auto &target : pushdown_targets) {
+		auto &pushed_column = target.columns[0];
+		if (pushed_column.mode != JoinFilterPushdownMode::RECONSTRUCT_EXPRESSION ||
+		    RuntimeFilterCastUtil::RuntimeFilterUsesTryCast(pushed_column) ||
+		    RuntimeFilterCastUtil::GetRuntimeFilterInputType(pushed_column, type) != type) {
+			// the pushed expression cannot be reconstructed on top of the raw scan value in the sort
+			// key's type (e.g. a non-integral cast or a VARIANT in between), or the cast chain is not
+			// order-preserving (an explicit TRY_CAST, or a cast that can throw) - bail out
+			return;
+		}
 	}
 	// found pushdown targets! generate dynamic filters
 	ExpressionType comparison_type;
@@ -93,9 +115,7 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 		    op.orders.size() == 1 ? ExpressionType::COMPARE_GREATERTHAN : ExpressionType::COMPARE_GREATERTHANOREQUALTO;
 	}
 	Value minimum_value = type.InternalType() == PhysicalType::VARCHAR ? Value("") : Value::MinimumValue(type);
-	auto base_filter = make_uniq<ConstantFilter>(comparison_type, std::move(minimum_value));
-	auto filter_data = make_shared_ptr<DynamicFilterData>();
-	filter_data->filter = std::move(base_filter);
+	auto filter_data = make_shared_ptr<DynamicFilterData>(comparison_type, std::move(minimum_value));
 
 	// put the filter into the Top-N clause
 	op.dynamic_filter = filter_data;
@@ -103,21 +123,41 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 	for (auto &target : pushdown_targets) {
 		auto &get = target.get;
 		D_ASSERT(target.columns.size() == 1);
-		auto col_idx = target.columns[0].probe_column_index.column_index;
+		auto &pushed_column = target.columns[0];
+		auto col_binding = pushed_column.probe_column_index;
+
+		// reconstruct the sort key on top of the raw scan column (an order-preserving cast chain,
+		// possibly empty), and evaluate the dynamic filter on the reconstructed value so the boundary
+		// constant - which is built in the sort key's type - is compared against values in that same
+		// type
+		bool preserves_cast_errors = false;
+		auto filter_input =
+		    RuntimeFilterCastUtil::CreateRuntimeFilterInputExpression(context, pushed_column, preserves_cast_errors);
+		D_ASSERT(filter_input->GetReturnType() == type);
+		D_ASSERT(!preserves_cast_errors);
 
 		// create the actual dynamic filter
-		auto dynamic_filter = make_uniq<DynamicFilter>(filter_data);
-		auto optional_filter = make_uniq<OptionalFilter>(std::move(dynamic_filter));
+		auto pushed_expr = CreateDynamicFilterExpression(filter_data, type, filter_input->Copy());
+		if (nulls_first) {
+			// rows whose sort key evaluates to NULL must not be dropped by the filter: with
+			// NULLS FIRST they can be part of the top-N
+			auto or_filter = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_OR);
+			auto is_null =
+			    ExpressionFilter::CreateNullCheckExpression(std::move(filter_input), ExpressionType::OPERATOR_IS_NULL);
+			or_filter->GetChildrenMutable().push_back(std::move(is_null));
+			or_filter->GetChildrenMutable().push_back(std::move(pushed_expr));
+			pushed_expr = std::move(or_filter);
+		}
 
 		// push the filter into the table scan
-		auto &column_index = get.GetColumnIds()[col_idx];
-		get.table_filters.PushFilter(column_index, std::move(optional_filter));
+		get.table_filters.PushFilter(col_binding.column_index,
+		                             make_uniq<ExpressionFilter>(CreateOptionalFilterExpression(
+		                                 std::move(pushed_expr), pushed_column.storage_type)));
 	}
 }
 
 unique_ptr<LogicalOperator> TopN::Optimize(unique_ptr<LogicalOperator> op) {
-	if (CanOptimize(*op)) {
-
+	if (CanOptimize(*op, &context)) {
 		vector<unique_ptr<LogicalOperator>> projections;
 
 		// traverse operator tree and collect all projection nodes until we reach
@@ -144,6 +184,7 @@ unique_ptr<LogicalOperator> TopN::Optimize(unique_ptr<LogicalOperator> op) {
 			offset_val = limit.offset_val.GetConstantValue();
 		}
 		auto topn = make_uniq<LogicalTopN>(std::move(order_by.orders), limit_val, offset_val);
+		topn->unpruned_offset = limit.unpruned_offset;
 		topn->AddChild(std::move(order_by.children[0]));
 		auto cardinality = limit_val;
 		if (topn->children[0]->has_estimated_cardinality && topn->children[0]->estimated_cardinality < limit_val) {

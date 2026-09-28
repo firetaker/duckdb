@@ -21,7 +21,9 @@ enum class SimplifiedTokenType : uint8_t {
 	SIMPLIFIED_TOKEN_OPERATOR,
 	SIMPLIFIED_TOKEN_KEYWORD,
 	SIMPLIFIED_TOKEN_COMMENT,
-	SIMPLIFIED_TOKEN_ERROR
+	SIMPLIFIED_TOKEN_ERROR,
+	SIMPLIFIED_TOKEN_ERROR_EMPHASIS,
+	SIMPLIFIED_TOKEN_ERROR_SUGGESTION
 };
 
 struct SimplifiedToken {
@@ -34,12 +36,13 @@ enum class KeywordCategory : uint8_t {
 	KEYWORD_UNRESERVED,
 	KEYWORD_TYPE_FUNC,
 	KEYWORD_COL_NAME,
-	KEYWORD_NONE
+	KEYWORD_NONE,
+	KEYWORD_TYPE_NAME
 };
 
 struct ParserKeyword {
 	string name;
-	KeywordCategory category;
+	string category;
 };
 
 } // namespace duckdb

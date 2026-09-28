@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "duckdb/common/bswap.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include <string.h>
@@ -22,6 +23,17 @@
 #elif defined(__unix__) || defined(__unix) || (defined(__APPLE__) && defined(__MACH__))
 #define DUCKDB_POSIX
 #endif
+// On macOS, sys/cdefs.h doesn't contain c++:
+// #if __STDC_VERSION__ < 199901
+// #define __restrict
+// #else
+// #define __restrict      restrict
+// #endif
+#ifdef __APPLE__
+#undef __restrict
+#define __restrict __restrict__
+#endif
+
 
 namespace duckdb {
 
@@ -58,7 +70,7 @@ struct TemplatedUniqueIf<DATA_TYPE[N]>
 };
 
 template<class DATA_TYPE, class... ARGS>
-inline 
+inline
 typename TemplatedUniqueIf<DATA_TYPE, true>::templated_unique_single_t
 make_uniq(ARGS&&... args) // NOLINT: mimic std style
 {
@@ -66,15 +78,15 @@ make_uniq(ARGS&&... args) // NOLINT: mimic std style
 }
 
 template<class DATA_TYPE, class... ARGS>
-inline 
+inline
 shared_ptr<DATA_TYPE>
 make_shared_ptr(ARGS&&... args) // NOLINT: mimic std style
 {
-	return shared_ptr<DATA_TYPE>(std::make_shared<DATA_TYPE>(std::forward<ARGS>(args)...));
+	return shared_ptr<DATA_TYPE>(duckdb_base_std::make_shared<DATA_TYPE>(std::forward<ARGS>(args)...));
 }
 
 template<class DATA_TYPE, class... ARGS>
-inline 
+inline
 typename TemplatedUniqueIf<DATA_TYPE, false>::templated_unique_single_t
 make_unsafe_uniq(ARGS&&... args) // NOLINT: mimic std style
 {
@@ -82,31 +94,31 @@ make_unsafe_uniq(ARGS&&... args) // NOLINT: mimic std style
 }
 
 template<class DATA_TYPE>
-inline unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE>, true>
+inline unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE[]>, true>
 make_uniq_array(size_t n) // NOLINT: mimic std style
 {
-	return unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE>, true>(new DATA_TYPE[n]());
+	return unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE[]>, true>(new DATA_TYPE[n]());
 }
 
 template<class DATA_TYPE>
-inline unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE>, true>
+inline unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE[]>, true>
 make_uniq_array_uninitialized(size_t n) // NOLINT: mimic std style
 {
-	return unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE>, true>(new DATA_TYPE[n]);
+	return unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE[]>, true>(new DATA_TYPE[n]);
 }
 
 template<class DATA_TYPE>
-inline unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE>, false>
+inline unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE[]>, false>
 make_unsafe_uniq_array(size_t n) // NOLINT: mimic std style
 {
-	return unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE>, false>(new DATA_TYPE[n]());
+	return unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE[]>, false>(new DATA_TYPE[n]());
 }
 
 template<class DATA_TYPE>
-inline unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE>, false>
+inline unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE[]>, false>
 make_unsafe_uniq_array_uninitialized(size_t n) // NOLINT: mimic std style
 {
-	return unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE>, false>(new DATA_TYPE[n]);
+	return unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE[]>, false>(new DATA_TYPE[n]);
 }
 
 template<class DATA_TYPE, class... ARGS>
@@ -135,20 +147,6 @@ template <typename SRC, typename TGT>
 shared_ptr<TGT> shared_ptr_cast(shared_ptr<SRC> src) { // NOLINT: mimic std style
 	return shared_ptr<TGT>(std::static_pointer_cast<TGT, SRC>(src.internal));
 }
-
-struct SharedConstructor {
-	template <class T, typename... ARGS>
-	static shared_ptr<T> Create(ARGS &&...args) {
-		return make_shared_ptr<T>(std::forward<ARGS>(args)...);
-	}
-};
-
-struct UniqueConstructor {
-	template <class T, typename... ARGS>
-	static unique_ptr<T> Create(ARGS &&...args) {
-		return make_uniq<T>(std::forward<ARGS>(args)...);
-	}
-};
 
 #ifdef DUCKDB_DEBUG_MOVE
 template<class T>
@@ -192,12 +190,17 @@ constexpr T ClampValue(T v, T min, T max) {
 
 template <typename T>
 T AbsValue(T a) {
-	return a < 0 ? -a : a;
+	return a < 0 ? static_cast<T>(-a) : a;
 }
 
 //! Align value (ceiling) (not for pointer types)
 template<class T, T val=8, typename = typename std::enable_if<!std::is_pointer<T>::value>::type>
 static inline T AlignValue(T n) {
+	return ((n + (val - 1)) / val) * val;
+}
+
+template <class T>
+static T AlignValue(T n, T val) {
 	return ((n + (val - 1)) / val) * val;
 }
 
@@ -230,6 +233,11 @@ const T Load(const_data_ptr_t ptr) {
 }
 
 template <typename T>
+const T LoadLE(const_data_ptr_t ptr) {
+	return BSwapIfBE(Load<T>(ptr));
+}
+
+template <typename T>
 void Store(const T &val, data_ptr_t ptr) {
 	memcpy(ptr, (void *)&val, sizeof(val)); // NOLINT
 }
@@ -251,14 +259,16 @@ template<typename T>
 using const_reference = std::reference_wrapper<const T>;
 
 //! Returns whether or not two reference wrappers refer to the same object
-template<class T>
-bool RefersToSameObject(const reference<T> &a, const reference<T> &b) {
-	return &a.get() == &b.get();
+template<class T, class U>
+bool RefersToSameObject(const reference<T> &a, const reference<U> &b) {
+	return RefersToSameObject(a.get(), b.get());
 }
 
-template<class T>
-bool RefersToSameObject(const T &a, const T &b) {
-	return &a == &b;
+template<class T, class U>
+bool RefersToSameObject(const T &a, const U &b) {
+	static_assert(std::is_same_v<T, U> || std::is_base_of_v<T, U> || std::is_base_of_v<U, T>,
+	              "RefersToSameObject requires T and U to be related by inheritance");
+	return static_cast<const void *>(&a) == static_cast<const void *>(&b);
 }
 
 template<class T, class SRC>
@@ -268,5 +278,18 @@ void DynamicCastCheck(const SRC *source) {
 	D_ASSERT(reinterpret_cast<const T *>(source) == dynamic_cast<const T *>(source));
 #endif
 }
+
+//! Used to increment counters that need to be exception-proof
+template<typename T>
+class PostIncrement {
+public:
+	explicit PostIncrement(T &t) : t(t) {
+	}
+	~PostIncrement() {
+		++t;
+	}
+private:
+	T &t;
+};
 
 } // namespace duckdb

@@ -15,7 +15,9 @@ enum class JSONScanType : uint8_t {
 	//! Read JSON straight to columnar data
 	READ_JSON = 1,
 	//! Read JSON values as strings
-	READ_JSON_OBJECTS = 2
+	READ_JSON_OBJECTS = 2,
+	//! Sample run for schema detection
+	SAMPLE = 3,
 };
 
 enum class JSONRecordType : uint8_t {
@@ -24,6 +26,8 @@ enum class JSONRecordType : uint8_t {
 	RECORDS = 1,
 	//! Any other JSON type, e.g., ARRAY
 	VALUES = 2,
+	//! GeoJSON Features, unnested into a geometry column plus one column per property
+	FEATURES = 3,
 };
 
 enum class JSONFormat : uint8_t {

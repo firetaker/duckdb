@@ -4,8 +4,11 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
 #include "utf8proc.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
+
+namespace {
 
 struct CurrentQueryIdData : FunctionData {
 	explicit CurrentQueryIdData(Value query_id_p) : query_id(std::move(query_id_p)) {
@@ -20,8 +23,8 @@ struct CurrentQueryIdData : FunctionData {
 	}
 };
 
-unique_ptr<FunctionData> CurrentQueryIdBind(ClientContext &context, ScalarFunction &bound_function,
-                                            vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> CurrentQueryIdBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
 	Value query_id;
 	if (context.transaction.HasActiveTransaction()) {
 		query_id = Value::UBIGINT(context.transaction.GetActiveQuery());
@@ -31,15 +34,17 @@ unique_ptr<FunctionData> CurrentQueryIdBind(ClientContext &context, ScalarFuncti
 	return make_uniq<CurrentQueryIdData>(query_id);
 }
 
-static void CurrentQueryIdFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+void CurrentQueryIdFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	const auto &info = func_expr.bind_info->Cast<CurrentQueryIdData>();
-	result.Reference(info.query_id);
+	const auto &info = func_expr.BindInfo()->Cast<CurrentQueryIdData>();
+	result.Reference(info.query_id, count_t(args.size()));
 }
+
+} // namespace
 
 ScalarFunction CurrentQueryId::GetFunction() {
 	return ScalarFunction({}, LogicalType::UBIGINT, CurrentQueryIdFunction, CurrentQueryIdBind, nullptr, nullptr,
-	                      nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	                      LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
 }
 
 } // namespace duckdb

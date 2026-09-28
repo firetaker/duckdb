@@ -30,6 +30,18 @@ struct QuoteEscapeCombination {
 	char escape;
 };
 
+//! Current stats of candidate analysis
+struct CandidateStats {
+	//! Number of rows read
+	idx_t rows_read = 0;
+	//! Best Number of consistent rows (i.e., presenting all columns)
+	idx_t best_consistent_rows = 0;
+	//! If padding was necessary (i.e., rows are missing some columns, how many)
+	idx_t prev_padding_count = 0;
+	//! Min number of ignored rows
+	idx_t min_ignored_rows = 0;
+};
+
 //! All the options that will be used to sniff the dialect of the CSV file
 struct DialectCandidates {
 	//! The constructor populates all of our the options that will be used in our sniffer search space
@@ -75,13 +87,13 @@ public:
 	SnifferResult SniffCSV(bool force_match = false);
 
 	//! I call it adaptive, since that's a sexier term.
-	//! In practice this Function that only sniffs the first two rows, to verify if a header exists and what are the
-	//! data types It does this considering a priorly set CSV schema. If there is a mismatch of the schema it runs the
+	//! In practice this function sniffs up to STANDARD_VECTOR_SIZE rows to verify if a header exists and determine the
+	//! data types. It does this considering a priorly set CSV schema. If there is a mismatch of the schema it runs the
 	//! full on blazing all guns sniffer, if that still fails it tells the user to union_by_name.
 	//! It returns the projection order.
 	SnifferResult AdaptiveSniff(const CSVSchema &file_schema);
 
-	//! Function that only sniffs the first two rows, to verify if a header exists and what are the data types
+	//! Function that sniffs up to STANDARD_VECTOR_SIZE rows to detect a header and data types
 	AdaptiveSnifferResult MinimalSniff();
 
 	static NewLineIdentifier DetectNewLineDelimiter(CSVBufferManager &buffer_manager);
@@ -90,6 +102,7 @@ public:
 	static bool CanYouCastIt(ClientContext &context, const string_t value, const LogicalType &type,
 	                         const DialectOptions &dialect_options, const bool is_null, const char decimal_separator,
 	                         const char thousands_separator);
+	static bool CanYouCastBignum(const char *value_ptr, idx_t value_size);
 
 	idx_t LinesSniffed() const;
 
@@ -104,6 +117,7 @@ private:
 	//! Highest number of columns found
 	idx_t max_columns_found = 0;
 	idx_t max_columns_found_error = 0;
+	bool best_candidate_is_strict = false;
 	//! Current Candidates being considered
 	vector<unique_ptr<ColumnCountScanner>> candidates;
 	//! Reference to original CSV Options, it will be modified as a result of the sniffer.
@@ -131,9 +145,9 @@ private:
 	void GenerateStateMachineSearchSpace(vector<unique_ptr<ColumnCountScanner>> &column_count_scanners,
 	                                     const DialectCandidates &dialect_candidates);
 
-	//! 2. Analyzes if dialect candidate is a good candidate to be considered, if so, it adds it to the candidates
-	void AnalyzeDialectCandidate(unique_ptr<ColumnCountScanner>, idx_t &rows_read, idx_t &best_consistent_rows,
-	                             idx_t &prev_padding_count, idx_t &min_ignored_rows);
+	//! 2. Analyzes if a dialect candidate is a good candidate to be considered, if so, it adds it to the candidates
+	void AnalyzeDialectCandidate(unique_ptr<ColumnCountScanner>, CandidateStats &stats,
+	                             vector<unique_ptr<ColumnCountScanner>> &successful_candidates);
 	//! 3. Refine Candidates over remaining chunks
 	void RefineCandidates();
 
@@ -193,13 +207,13 @@ private:
 	void DetectHeader();
 	static bool DetectHeaderWithSetColumn(ClientContext &context, vector<HeaderValue> &best_header_row,
 	                                      const SetColumns &set_columns, CSVReaderOptions &options);
-	static vector<string>
+	static vector<Identifier>
 	DetectHeaderInternal(ClientContext &context, vector<HeaderValue> &best_header_row, CSVStateMachine &state_machine,
 	                     const SetColumns &set_columns,
 	                     unordered_map<idx_t, vector<LogicalType>> &best_sql_types_candidates_per_column_idx,
 	                     CSVReaderOptions &options, const MultiFileOptions &file_options,
 	                     CSVErrorHandler &error_handler);
-	vector<string> names;
+	vector<Identifier> names;
 	//! If the file only has a header
 	bool single_row_file = false;
 

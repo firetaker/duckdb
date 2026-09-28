@@ -22,7 +22,8 @@ public:
 	static constexpr const LogicalOperatorType TYPE = LogicalOperatorType::LOGICAL_PREPARE;
 
 public:
-	LogicalPrepare(string name_p, shared_ptr<PreparedStatementData> prepared, unique_ptr<LogicalOperator> logical_plan)
+	LogicalPrepare(Identifier name_p, shared_ptr<PreparedStatementData> prepared,
+	               unique_ptr<LogicalOperator> logical_plan)
 	    : LogicalOperator(LogicalOperatorType::LOGICAL_PREPARE), name(std::move(name_p)),
 	      prepared(std::move(prepared)) {
 		if (logical_plan) {
@@ -30,7 +31,7 @@ public:
 		}
 	}
 
-	string name;
+	Identifier name;
 	shared_ptr<PreparedStatementData> prepared;
 
 public:
@@ -46,7 +47,7 @@ protected:
 	}
 
 	bool RequireOptimizer() const override {
-		if (!prepared->properties.bound_all_parameters) {
+		if (!prepared->properties.bound_all_parameters || prepared->properties.always_require_rebind) {
 			return false;
 		}
 		return children[0]->RequireOptimizer();

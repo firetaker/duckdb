@@ -87,7 +87,7 @@ void sleep_thread(Benchmark *benchmark, BenchmarkRunner *runner, BenchmarkState 
 			if (!hotrun) {
 				runner->Log(StringUtil::Format("%s\t%d\t", benchmark->name, 0));
 			}
-			runner->LogResult("KILLED");
+			runner->LogResult("Benchmark timeout reached; Interrupt failed. Benchmark killed by benchmark runner");
 			exit(1);
 		}
 	}
@@ -139,7 +139,7 @@ void BenchmarkRunner::RunBenchmark(Benchmark *benchmark) {
 		LogLine(error_data.Message());
 		return;
 	}
-	auto nruns = benchmark->NRuns();
+	auto nruns = BenchmarkRunner::GetInstance().timed_runs;
 	for (size_t i = 0; i < nruns + 1; i++) {
 		bool hotrun = i > 0;
 		if (hotrun) {
@@ -208,6 +208,9 @@ void print_help() {
 	fprintf(stderr, "              --detailed-profile     Prints detailed query profile information\n");
 	fprintf(stderr, "              --threads=n            Sets the amount of threads to use during execution (default: "
 	                "hardware concurrency)\n");
+	fprintf(stderr, "              --timed-runs n         Sets the amount of timed runs per benchmark (default: 5)\n");
+	fprintf(stderr, "              --memory_limit=n       Sets the memory limit to use during execution (default: 0.8 "
+	                "* system memory)\n");
 	fprintf(stderr, "              --out=[file]           Move benchmark output to file\n");
 	fprintf(stderr, "              --log=[file]           Move log output to file\n");
 	fprintf(stderr, "              --info                 Prints info about the benchmark\n");
@@ -282,6 +285,10 @@ void parse_arguments(const int arg_counter, char const *const *arg_values) {
 			// write info of benchmark
 			auto splits = StringUtil::Split(arg, '=');
 			instance.threads = Value(splits[1]).DefaultCastAs(LogicalType::UINTEGER).GetValue<uint32_t>();
+		} else if (StringUtil::StartsWith(arg, "--memory_limit=")) {
+			// write info of benchmark
+			auto splits = StringUtil::Split(arg, '=');
+			instance.memory_limit = splits[1];
 		} else if (arg == "--root-dir") {
 			// We've already handled this, skip it
 			arg_index++;
@@ -323,6 +330,24 @@ void parse_arguments(const int arg_counter, char const *const *arg_values) {
 			}
 			instance.configuration.name_pattern = arg;
 		}
+	}
+	auto timed_runs_entry = instance.custom_arguments.find("timed-runs");
+	if (timed_runs_entry != instance.custom_arguments.end()) {
+		uint32_t timed_runs;
+		try {
+			timed_runs = Value(timed_runs_entry->second).DefaultCastAs(LogicalType::UINTEGER).GetValue<uint32_t>();
+		} catch (std::exception &) {
+			fprintf(stderr, "Invalid value for benchmark argument timed-runs: %s\n", timed_runs_entry->second.c_str());
+			print_help();
+			exit(1);
+		}
+		if (timed_runs == 0) {
+			fprintf(stderr, "Benchmark argument timed-runs must be greater than 0\n");
+			print_help();
+			exit(1);
+		}
+		instance.timed_runs = timed_runs;
+		instance.custom_arguments.erase(timed_runs_entry);
 	}
 }
 

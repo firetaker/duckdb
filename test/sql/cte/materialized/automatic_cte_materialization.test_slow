@@ -2,13 +2,16 @@
 # description: Test that CTEs are automatically materialized
 # group: [materialized]
 
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
 require tpch
 
 statement ok
-PRAGMA enable_verification
+PRAGMA explain_output='OPTIMIZED_ONLY'
 
 statement ok
-PRAGMA explain_output='OPTIMIZED_ONLY'
+SET disabled_optimizers TO 'common_subplan'
 
 statement ok
 CALL dbgen(sf=0.01);

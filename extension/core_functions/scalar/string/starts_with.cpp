@@ -2,6 +2,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/function/scalar/string_common.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
 namespace duckdb {
@@ -17,7 +18,6 @@ static bool StartsWith(const unsigned char *haystack, idx_t haystack_size, const
 }
 
 static bool StartsWith(const string_t &haystack_s, const string_t &needle_s) {
-
 	auto haystack = const_uchar_ptr_cast(haystack_s.GetData());
 	auto haystack_size = haystack_s.GetSize();
 	auto needle = const_uchar_ptr_cast(needle_s.GetData());
@@ -37,9 +37,13 @@ struct StartsWithOperator {
 };
 
 ScalarFunction StartsWithOperatorFun::GetFunction() {
-	ScalarFunction starts_with({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+	ScalarFunction starts_with({}, LogicalType::BOOLEAN,
 	                           ScalarFunction::BinaryFunction<string_t, string_t, bool, StartsWithOperator>);
-	starts_with.collation_handling = FunctionCollationHandling::PUSH_COMBINABLE_COLLATIONS;
+	starts_with.GetSignature()
+	    .AddParameter("string", LogicalType::VARCHAR)
+	    .AddParameter("search_string", LogicalType::VARCHAR);
+	starts_with.SetCollationHandling(FunctionCollationHandling::PUSH_COMBINABLE_COLLATIONS);
+	starts_with.SetFilterPruneCallback(PrefixFilterPrune);
 	return starts_with;
 }
 

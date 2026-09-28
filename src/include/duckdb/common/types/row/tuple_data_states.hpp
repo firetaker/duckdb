@@ -10,8 +10,9 @@
 
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/types.hpp"
-#include "duckdb/common/types/vector_cache.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/types/vector_cache.hpp"
+#include "duckdb/common/sorting/sort_key.hpp"
 
 namespace duckdb {
 
@@ -73,6 +74,13 @@ public:
 		handles.clear();
 	}
 
+	void acquire_handles(vector<BufferHandle> &pins) {
+		for (auto &handle : handles) {
+			pins.emplace_back(std::move(handle.second));
+		}
+		handles.clear();
+	}
+
 private:
 	unsafe_vector<pair<uint32_t, BufferHandle>> handles;
 };
@@ -81,6 +89,12 @@ struct TupleDataPinState {
 	buffer_handle_map_t row_handles;
 	buffer_handle_map_t heap_handles;
 	TupleDataPinProperties properties = TupleDataPinProperties::INVALID;
+
+	void Reset() {
+		row_handles.clear();
+		heap_handles.clear();
+		properties = TupleDataPinProperties::INVALID;
+	}
 };
 
 struct CombinedListData {
@@ -112,11 +126,30 @@ struct TupleDataChunkState {
 	Vector heap_locations = Vector(LogicalType::POINTER);
 	Vector heap_sizes = Vector(LogicalType::UBIGINT);
 
+	optional_ptr<mutex> chunk_lock;
+
+	SelectionVector utility = SelectionVector(STANDARD_VECTOR_SIZE);
+
 	vector<unique_ptr<Vector>> cached_cast_vectors;
 	vector<unique_ptr<VectorCache>> cached_cast_vector_cache;
 
-	//! Cached vector (for InitializeChunkState)
-	unsafe_vector<reference<TupleDataChunkPart>> parts;
+	//! Re-usable arrays used while building buffer space
+	unsafe_vector<reference<TupleDataChunkPart>> chunk_parts;
+	unsafe_vector<pair<idx_t, idx_t>> chunk_part_indices;
+
+	void ResetForScan() {
+		column_ids.clear();
+		chunk_lock = nullptr;
+		cached_cast_vectors.clear();
+		cached_cast_vector_cache.clear();
+		chunk_parts.clear();
+		chunk_part_indices.clear();
+	}
+};
+
+struct SortKeyPayloadState {
+	TupleDataChunkState &sort_key_chunk_state;
+	SortKeyType sort_key_type;
 };
 
 struct TupleDataAppendState {
@@ -129,6 +162,13 @@ struct TupleDataScanState {
 	TupleDataChunkState chunk_state;
 	idx_t segment_index = DConstants::INVALID_INDEX;
 	idx_t chunk_index = DConstants::INVALID_INDEX;
+
+	void Reset() {
+		pin_state.Reset();
+		chunk_state.ResetForScan();
+		segment_index = DConstants::INVALID_INDEX;
+		chunk_index = DConstants::INVALID_INDEX;
+	}
 };
 
 struct TupleDataParallelScanState {

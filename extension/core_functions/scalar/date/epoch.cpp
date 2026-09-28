@@ -6,6 +6,8 @@
 
 namespace duckdb {
 
+namespace {
+
 struct EpochSecOperator {
 	template <class INPUT_TYPE, class RESULT_TYPE>
 	static RESULT_TYPE Operation(INPUT_TYPE sec) {
@@ -17,15 +19,10 @@ struct EpochSecOperator {
 	}
 };
 
-static void EpochSecFunction(DataChunk &input, ExpressionState &state, Vector &result) {
+void EpochSecFunction(DataChunk &input, ExpressionState &state, Vector &result) {
 	D_ASSERT(input.ColumnCount() == 1);
 
-	UnaryExecutor::Execute<double, timestamp_t, EpochSecOperator>(input.data[0], result, input.size());
-}
-
-ScalarFunction ToTimestampFun::GetFunction() {
-	// to_timestamp is an alias from Postgres that converts the time in seconds to a timestamp
-	return ScalarFunction({LogicalType::DOUBLE}, LogicalType::TIMESTAMP_TZ, EpochSecFunction);
+	UnaryExecutor::Execute<double, timestamp_t, EpochSecOperator>(input.data[0], result);
 }
 
 struct NormalizedIntervalOperator {
@@ -35,14 +32,10 @@ struct NormalizedIntervalOperator {
 	}
 };
 
-static void NormalizedIntervalFunction(DataChunk &input, ExpressionState &state, Vector &result) {
+void NormalizedIntervalFunction(DataChunk &input, ExpressionState &state, Vector &result) {
 	D_ASSERT(input.ColumnCount() == 1);
 
-	UnaryExecutor::Execute<interval_t, interval_t, NormalizedIntervalOperator>(input.data[0], result, input.size());
-}
-
-ScalarFunction NormalizedIntervalFun::GetFunction() {
-	return ScalarFunction({LogicalType::INTERVAL}, LogicalType::INTERVAL, NormalizedIntervalFunction);
+	UnaryExecutor::Execute<interval_t, interval_t, NormalizedIntervalOperator>(input.data[0], result);
 }
 
 struct TimeTZSortKeyOperator {
@@ -52,13 +45,34 @@ struct TimeTZSortKeyOperator {
 	}
 };
 
-static void TimeTZSortKeyFunction(DataChunk &input, ExpressionState &state, Vector &result) {
+void TimeTZSortKeyFunction(DataChunk &input, ExpressionState &state, Vector &result) {
 	D_ASSERT(input.ColumnCount() == 1);
 
-	UnaryExecutor::Execute<dtime_tz_t, uint64_t, TimeTZSortKeyOperator>(input.data[0], result, input.size());
+	UnaryExecutor::Execute<dtime_tz_t, uint64_t, TimeTZSortKeyOperator>(input.data[0], result);
+}
+
+} // namespace
+
+ScalarFunction ToTimestampFun::GetFunction() {
+	// to_timestamp is an alias from Postgres that converts the time in seconds to a timestamp
+	ScalarFunction func({}, LogicalType::TIMESTAMP_TZ, EpochSecFunction);
+	func.GetSignature().AddParameter("sec", LogicalType::DOUBLE);
+	// throws if the epoch seconds are out of range for a timestamp
+	func.SetFallible();
+	func.SetUnaryArgProperties(ArgProperties().NonDecreasing());
+	return func;
+}
+
+ScalarFunction NormalizedIntervalFun::GetFunction() {
+	ScalarFunction function({}, LogicalType::INTERVAL, NormalizedIntervalFunction);
+	function.GetSignature().AddParameter("interval", LogicalType::INTERVAL);
+	function.SetUnaryArgProperties(ArgProperties().NonDecreasing());
+	return function;
 }
 
 ScalarFunction TimeTZSortKeyFun::GetFunction() {
-	return ScalarFunction({LogicalType::TIME_TZ}, LogicalType::UBIGINT, TimeTZSortKeyFunction);
+	ScalarFunction func({}, LogicalType::UBIGINT, TimeTZSortKeyFunction);
+	func.GetSignature().AddParameter("time_tz", LogicalType::TIME_TZ);
+	return func;
 }
 } // namespace duckdb

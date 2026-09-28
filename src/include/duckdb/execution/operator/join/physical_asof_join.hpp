@@ -19,7 +19,8 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::ASOF_JOIN;
 
 public:
-	PhysicalAsOfJoin(LogicalComparisonJoin &op, PhysicalOperator &left, PhysicalOperator &right);
+	PhysicalAsOfJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, PhysicalOperator &left,
+	                 PhysicalOperator &right, vector<column_t> lhs_partition_cols, vector<column_t> rhs_partition_cols);
 
 	vector<LogicalType> join_key_types;
 	vector<column_t> null_sensitive;
@@ -34,19 +35,12 @@ public:
 	vector<BoundOrderByNode> rhs_orders;
 
 	// Projection mappings
-	vector<column_t> right_projection_map;
+	vector<idx_t> right_projection_map;
 
-	// Predicate (join conditions that don't reference both sides)
-	unique_ptr<Expression> predicate;
-
-public:
-	// Operator Interface
-	unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const override;
-	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
-
-	bool ParallelOperator() const override {
-		return true;
-	}
+	//! The partitions over which the children are grouped (if any)
+	vector<OperatorPartitionInfo> partition_infos;
+	//! RequiredPartitionInfo doesn't get passed the global sink state...
+	mutable size_t child = 1;
 
 protected:
 	// CachingOperator Interface
@@ -58,7 +52,8 @@ public:
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	                                                 GlobalSourceState &gstate) const override;
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override;
 
 	bool IsSource() const override {
 		return true;
@@ -66,11 +61,18 @@ public:
 	bool ParallelSource() const override {
 		return true;
 	}
+	bool HasSourceTasks() const override {
+		return true;
+	}
+
+	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate_p) const override;
 
 public:
 	// Sink Interface
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
+	OperatorPartitionInfo RequiredPartitionInfo() const override;
+	SinkNextBatchType NextBatch(ExecutionContext &context, OperatorSinkNextBatchInput &input) const override;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
@@ -82,6 +84,9 @@ public:
 	bool ParallelSink() const override {
 		return true;
 	}
+
+public:
+	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
 };
 
 } // namespace duckdb

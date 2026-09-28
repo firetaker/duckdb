@@ -8,8 +8,6 @@
 
 #pragma once
 
-#include "duckdb/function/function_set.hpp"
-#include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
 
 namespace duckdb {
@@ -21,7 +19,7 @@ struct CreateScalarFunctionInfo;
 enum class AlterScalarFunctionType : uint8_t { INVALID = 0, ADD_FUNCTION_OVERLOADS = 1 };
 
 struct AlterScalarFunctionInfo : public AlterInfo {
-	AlterScalarFunctionInfo(AlterScalarFunctionType type, AlterEntryData data);
+	AlterScalarFunctionInfo(AlterScalarFunctionType type, const AlterEntryData &data);
 	~AlterScalarFunctionInfo() override;
 
 	AlterScalarFunctionType alter_scalar_function_type;
@@ -34,7 +32,7 @@ public:
 // AddScalarFunctionOverloadInfo
 //===--------------------------------------------------------------------===//
 struct AddScalarFunctionOverloadInfo : public AlterScalarFunctionInfo {
-	AddScalarFunctionOverloadInfo(AlterEntryData data, unique_ptr<CreateScalarFunctionInfo> new_overloads);
+	AddScalarFunctionOverloadInfo(const AlterEntryData &data, unique_ptr<CreateScalarFunctionInfo> new_overloads);
 	~AddScalarFunctionOverloadInfo() override;
 
 	unique_ptr<CreateScalarFunctionInfo> new_overloads;

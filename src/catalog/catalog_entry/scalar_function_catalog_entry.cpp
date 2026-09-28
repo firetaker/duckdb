@@ -1,17 +1,27 @@
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
+
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/vector.hpp"
-#include "duckdb/parser/parsed_data/alter_scalar_function_info.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/parser/parsed_data/alter_scalar_function_info.hpp"
+#include "duckdb/catalog/catalog.hpp"
 
 namespace duckdb {
+
+constexpr const char *ScalarFunctionCatalogEntry::Name;
 
 ScalarFunctionCatalogEntry::ScalarFunctionCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schema,
                                                        CreateScalarFunctionInfo &info)
     : FunctionEntry(CatalogType::SCALAR_FUNCTION_ENTRY, catalog, schema, info), functions(info.functions) {
 	for (auto &function : functions.functions) {
-		function.catalog_name = catalog.GetAttached().GetName();
-		function.schema_name = schema.name;
+		function = FinalizeFunction(*function);
 	}
+}
+
+shared_ptr<const ScalarFunction> ScalarFunctionCatalogEntry::FinalizeFunction(ScalarFunction function) const {
+	auto result = make_shared_ptr<ScalarFunction>(std::move(function));
+	result->SetQualifiedName(schema.GetQualifiedName(name));
+	return result;
 }
 
 unique_ptr<CatalogEntry> ScalarFunctionCatalogEntry::AlterEntry(CatalogTransaction transaction, AlterInfo &info) {

@@ -8,9 +8,8 @@
 
 #pragma once
 
-#include "duckdb/parser/parsed_expression.hpp"
 #include "duckdb/parser/sql_statement.hpp"
-#include "duckdb/common/enums/explain_format.hpp"
+#include "duckdb/main/profiler/profiler_print_format.hpp"
 
 namespace duckdb {
 
@@ -22,11 +21,11 @@ public:
 
 public:
 	explicit ExplainStatement(unique_ptr<SQLStatement> stmt, ExplainType explain_type = ExplainType::EXPLAIN_STANDARD,
-	                          ExplainFormat explain_format = ExplainFormat::DEFAULT);
+	                          const ProfilerPrintFormat &format = ProfilerPrintFormat::Default());
 
 	unique_ptr<SQLStatement> stmt;
 	ExplainType explain_type;
-	ExplainFormat explain_format = ExplainFormat::DEFAULT;
+	ProfilerPrintFormat format = ProfilerPrintFormat::Default();
 
 protected:
 	ExplainStatement(const ExplainStatement &other);

@@ -4,7 +4,6 @@
 #include "duckdb/common/types/bit.hpp"
 
 namespace duckdb {
-
 template <class OP>
 static scalar_function_t GetScalarIntegerUnaryFunction(const LogicalType &type) {
 	scalar_function_t function;
@@ -88,6 +87,8 @@ static scalar_function_t GetScalarIntegerBinaryFunction(const LogicalType &type)
 //===--------------------------------------------------------------------===//
 // & [bitwise_and]
 //===--------------------------------------------------------------------===//
+namespace {
+
 struct BitwiseANDOperator {
 	template <class TA, class TB, class TR>
 	static inline TR Operation(TA left, TB right) {
@@ -95,32 +96,38 @@ struct BitwiseANDOperator {
 	}
 };
 
-static void BitwiseANDOperation(DataChunk &args, ExpressionState &state, Vector &result) {
-	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t rhs, string_t lhs) {
-		    string_t target = StringVector::EmptyString(result, rhs.GetSize());
+void BitwiseANDOperation(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &heap = StringVector::GetStringHeap(result);
+	BinaryExecutor::Execute<string_t, string_t, string_t>(args.data[0], args.data[1], result,
+	                                                      [&](string_t rhs, string_t lhs) {
+		                                                      string_t target = heap.EmptyString(rhs.GetSize());
 
-		    Bit::BitwiseAnd(rhs, lhs, target);
-		    return target;
-	    });
+		                                                      Bit::BitwiseAnd(rhs, lhs, target);
+		                                                      return target;
+	                                                      });
 }
+
+} // namespace
 
 ScalarFunctionSet BitwiseAndFun::GetFunctions() {
 	ScalarFunctionSet functions;
 	for (auto &type : LogicalType::Integral()) {
-		functions.AddFunction(
-		    ScalarFunction({type, type}, type, GetScalarIntegerBinaryFunction<BitwiseANDOperator>(type)));
+		ScalarFunction fun({}, type, GetScalarIntegerBinaryFunction<BitwiseANDOperator>(type));
+		fun.GetSignature().AddParameter("left", type).AddParameter("right", type);
+		functions.AddFunction(fun);
 	}
-	functions.AddFunction(ScalarFunction({LogicalType::BIT, LogicalType::BIT}, LogicalType::BIT, BitwiseANDOperation));
-	for (auto &function : functions.functions) {
-		BaseScalarFunction::SetReturnsError(function);
-	}
+	ScalarFunction bit_fun({}, LogicalType::BIT, BitwiseANDOperation);
+	bit_fun.GetSignature().AddParameter("left", LogicalType::BIT).AddParameter("right", LogicalType::BIT);
+	functions.AddFunction(bit_fun);
+	functions.SetFallible();
 	return functions;
 }
 
 //===--------------------------------------------------------------------===//
 // | [bitwise_or]
 //===--------------------------------------------------------------------===//
+namespace {
+
 struct BitwiseOROperator {
 	template <class TA, class TB, class TR>
 	static inline TR Operation(TA left, TB right) {
@@ -128,32 +135,38 @@ struct BitwiseOROperator {
 	}
 };
 
-static void BitwiseOROperation(DataChunk &args, ExpressionState &state, Vector &result) {
-	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t rhs, string_t lhs) {
-		    string_t target = StringVector::EmptyString(result, rhs.GetSize());
+void BitwiseOROperation(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &heap = StringVector::GetStringHeap(result);
+	BinaryExecutor::Execute<string_t, string_t, string_t>(args.data[0], args.data[1], result,
+	                                                      [&](string_t rhs, string_t lhs) {
+		                                                      string_t target = heap.EmptyString(rhs.GetSize());
 
-		    Bit::BitwiseOr(rhs, lhs, target);
-		    return target;
-	    });
+		                                                      Bit::BitwiseOr(rhs, lhs, target);
+		                                                      return target;
+	                                                      });
 }
+
+} // namespace
 
 ScalarFunctionSet BitwiseOrFun::GetFunctions() {
 	ScalarFunctionSet functions;
 	for (auto &type : LogicalType::Integral()) {
-		functions.AddFunction(
-		    ScalarFunction({type, type}, type, GetScalarIntegerBinaryFunction<BitwiseOROperator>(type)));
+		ScalarFunction fun({}, type, GetScalarIntegerBinaryFunction<BitwiseOROperator>(type));
+		fun.GetSignature().AddParameter("left", type).AddParameter("right", type);
+		functions.AddFunction(fun);
 	}
-	functions.AddFunction(ScalarFunction({LogicalType::BIT, LogicalType::BIT}, LogicalType::BIT, BitwiseOROperation));
-	for (auto &function : functions.functions) {
-		BaseScalarFunction::SetReturnsError(function);
-	}
+	ScalarFunction bit_fun({}, LogicalType::BIT, BitwiseOROperation);
+	bit_fun.GetSignature().AddParameter("left", LogicalType::BIT).AddParameter("right", LogicalType::BIT);
+	functions.AddFunction(bit_fun);
+	functions.SetFallible();
 	return functions;
 }
 
 //===--------------------------------------------------------------------===//
 // # [bitwise_xor]
 //===--------------------------------------------------------------------===//
+namespace {
+
 struct BitwiseXOROperator {
 	template <class TA, class TB, class TR>
 	static inline TR Operation(TA left, TB right) {
@@ -161,32 +174,38 @@ struct BitwiseXOROperator {
 	}
 };
 
-static void BitwiseXOROperation(DataChunk &args, ExpressionState &state, Vector &result) {
-	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t rhs, string_t lhs) {
-		    string_t target = StringVector::EmptyString(result, rhs.GetSize());
+void BitwiseXOROperation(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &heap = StringVector::GetStringHeap(result);
+	BinaryExecutor::Execute<string_t, string_t, string_t>(args.data[0], args.data[1], result,
+	                                                      [&](string_t rhs, string_t lhs) {
+		                                                      string_t target = heap.EmptyString(rhs.GetSize());
 
-		    Bit::BitwiseXor(rhs, lhs, target);
-		    return target;
-	    });
+		                                                      Bit::BitwiseXor(rhs, lhs, target);
+		                                                      return target;
+	                                                      });
 }
+
+} // namespace
 
 ScalarFunctionSet BitwiseXorFun::GetFunctions() {
 	ScalarFunctionSet functions;
 	for (auto &type : LogicalType::Integral()) {
-		functions.AddFunction(
-		    ScalarFunction({type, type}, type, GetScalarIntegerBinaryFunction<BitwiseXOROperator>(type)));
+		ScalarFunction fun({}, type, GetScalarIntegerBinaryFunction<BitwiseXOROperator>(type));
+		fun.GetSignature().AddParameter("left", type).AddParameter("right", type);
+		functions.AddFunction(fun);
 	}
-	functions.AddFunction(ScalarFunction({LogicalType::BIT, LogicalType::BIT}, LogicalType::BIT, BitwiseXOROperation));
-	for (auto &function : functions.functions) {
-		BaseScalarFunction::SetReturnsError(function);
-	}
+	ScalarFunction bit_fun({}, LogicalType::BIT, BitwiseXOROperation);
+	bit_fun.GetSignature().AddParameter("left", LogicalType::BIT).AddParameter("right", LogicalType::BIT);
+	functions.AddFunction(bit_fun);
+	functions.SetFallible();
 	return functions;
 }
 
 //===--------------------------------------------------------------------===//
 // ~ [bitwise_not]
 //===--------------------------------------------------------------------===//
+namespace {
+
 struct BitwiseNotOperator {
 	template <class TA, class TR>
 	static inline TR Operation(TA input) {
@@ -194,30 +213,37 @@ struct BitwiseNotOperator {
 	}
 };
 
-static void BitwiseNOTOperation(DataChunk &args, ExpressionState &state, Vector &result) {
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t input) {
-		string_t target = StringVector::EmptyString(result, input.GetSize());
+void BitwiseNOTOperation(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &heap = StringVector::GetStringHeap(result);
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, [&](string_t input) {
+		string_t target = heap.EmptyString(input.GetSize());
 
 		Bit::BitwiseNot(input, target);
 		return target;
 	});
 }
 
+} // namespace
+
 ScalarFunctionSet BitwiseNotFun::GetFunctions() {
 	ScalarFunctionSet functions;
 	for (auto &type : LogicalType::Integral()) {
-		functions.AddFunction(ScalarFunction({type}, type, GetScalarIntegerUnaryFunction<BitwiseNotOperator>(type)));
+		ScalarFunction fun({}, type, GetScalarIntegerUnaryFunction<BitwiseNotOperator>(type));
+		fun.GetSignature().AddParameter("input", type);
+		functions.AddFunction(fun);
 	}
-	functions.AddFunction(ScalarFunction({LogicalType::BIT}, LogicalType::BIT, BitwiseNOTOperation));
-	for (auto &function : functions.functions) {
-		BaseScalarFunction::SetReturnsError(function);
-	}
+	ScalarFunction bit_fun({}, LogicalType::BIT, BitwiseNOTOperation);
+	bit_fun.GetSignature().AddParameter("input", LogicalType::BIT);
+	functions.AddFunction(bit_fun);
+	functions.SetFallible();
 	return functions;
 }
 
 //===--------------------------------------------------------------------===//
 // << [bitwise_left_shift]
 //===--------------------------------------------------------------------===//
+namespace {
+
 struct BitwiseShiftLeftOperator {
 	template <class TA, class TB, class TR>
 	static inline TR Operation(TA input, TB shift) {
@@ -237,6 +263,9 @@ struct BitwiseShiftLeftOperator {
 		if (shift == 0) {
 			return input;
 		}
+		if (input == 0) {
+			return 0;
+		}
 		TA max_value = UnsafeNumericCast<TA>((TA(1) << (max_shift - shift - 1)));
 		if (input >= max_value) {
 			throw OutOfRangeException("Overflow in left shift (%s << %s)", NumericHelper::ToString(input),
@@ -246,9 +275,9 @@ struct BitwiseShiftLeftOperator {
 	}
 };
 
-static void BitwiseShiftLeftOperation(DataChunk &args, ExpressionState &state, Vector &result) {
+void BitwiseShiftLeftOperation(DataChunk &args, ExpressionState &state, Vector &result) {
 	BinaryExecutor::Execute<string_t, int32_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t input, int32_t shift) {
+	    args.data[0], args.data[1], result, [&](string_t input, int32_t shift) {
 		    auto max_shift = UnsafeNumericCast<int32_t>(Bit::BitLength(input));
 		    if (shift == 0) {
 			    return input;
@@ -266,24 +295,27 @@ static void BitwiseShiftLeftOperation(DataChunk &args, ExpressionState &state, V
 		    return target;
 	    });
 }
+} // namespace
 
 ScalarFunctionSet LeftShiftFun::GetFunctions() {
 	ScalarFunctionSet functions;
 	for (auto &type : LogicalType::Integral()) {
-		functions.AddFunction(
-		    ScalarFunction({type, type}, type, GetScalarIntegerBinaryFunction<BitwiseShiftLeftOperator>(type)));
+		ScalarFunction fun({}, type, GetScalarIntegerBinaryFunction<BitwiseShiftLeftOperator>(type));
+		fun.GetSignature().AddParameter("input", type).AddParameter("shift", type);
+		functions.AddFunction(fun);
 	}
-	functions.AddFunction(
-	    ScalarFunction({LogicalType::BIT, LogicalType::INTEGER}, LogicalType::BIT, BitwiseShiftLeftOperation));
-	for (auto &function : functions.functions) {
-		BaseScalarFunction::SetReturnsError(function);
-	}
+	ScalarFunction bit_fun({}, LogicalType::BIT, BitwiseShiftLeftOperation);
+	bit_fun.GetSignature().AddParameter("input", LogicalType::BIT).AddParameter("shift", LogicalType::INTEGER);
+	functions.AddFunction(bit_fun);
+	functions.SetFallible();
 	return functions;
 }
 
 //===--------------------------------------------------------------------===//
 // >> [bitwise_right_shift]
 //===--------------------------------------------------------------------===//
+namespace {
+
 template <class T>
 bool RightShiftInRange(T shift) {
 	return shift >= 0 && shift < T(sizeof(T) * 8);
@@ -296,9 +328,9 @@ struct BitwiseShiftRightOperator {
 	}
 };
 
-static void BitwiseShiftRightOperation(DataChunk &args, ExpressionState &state, Vector &result) {
+void BitwiseShiftRightOperation(DataChunk &args, ExpressionState &state, Vector &result) {
 	BinaryExecutor::Execute<string_t, int32_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t input, int32_t shift) {
+	    args.data[0], args.data[1], result, [&](string_t input, int32_t shift) {
 		    auto max_shift = UnsafeNumericCast<int32_t>(Bit::BitLength(input));
 		    if (shift == 0) {
 			    return input;
@@ -313,17 +345,19 @@ static void BitwiseShiftRightOperation(DataChunk &args, ExpressionState &state, 
 	    });
 }
 
+} // namespace
+
 ScalarFunctionSet RightShiftFun::GetFunctions() {
 	ScalarFunctionSet functions;
 	for (auto &type : LogicalType::Integral()) {
-		functions.AddFunction(
-		    ScalarFunction({type, type}, type, GetScalarIntegerBinaryFunction<BitwiseShiftRightOperator>(type)));
+		ScalarFunction fun({}, type, GetScalarIntegerBinaryFunction<BitwiseShiftRightOperator>(type));
+		fun.GetSignature().AddParameter("input", type).AddParameter("shift", type);
+		functions.AddFunction(fun);
 	}
-	functions.AddFunction(
-	    ScalarFunction({LogicalType::BIT, LogicalType::INTEGER}, LogicalType::BIT, BitwiseShiftRightOperation));
-	for (auto &function : functions.functions) {
-		BaseScalarFunction::SetReturnsError(function);
-	}
+	ScalarFunction bit_fun({}, LogicalType::BIT, BitwiseShiftRightOperation);
+	bit_fun.GetSignature().AddParameter("input", LogicalType::BIT).AddParameter("shift", LogicalType::INTEGER);
+	functions.AddFunction(bit_fun);
+	functions.SetFallible();
 	return functions;
 }
 

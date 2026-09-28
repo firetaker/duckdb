@@ -4,14 +4,16 @@
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/vector_operations/ternary_executor.hpp"
-#include "duckdb/common/vector_operations/senary_executor.hpp"
+#include "duckdb/common/vector_operations/variadic_executor.hpp"
 #include "duckdb/common/exception/conversion_exception.hpp"
 
 #include <cmath>
 
 namespace duckdb {
 
-static void MakeDateFromEpoch(DataChunk &input, ExpressionState &state, Vector &result) {
+namespace {
+
+void MakeDateFromEpoch(DataChunk &input, ExpressionState &state, Vector &result) {
 	D_ASSERT(input.ColumnCount() == 1);
 	result.Reinterpret(input.data[0]);
 }
@@ -25,18 +27,17 @@ struct MakeDateOperator {
 };
 
 template <typename T>
-static void ExecuteMakeDate(DataChunk &input, ExpressionState &state, Vector &result) {
+void ExecuteMakeDate(DataChunk &input, ExpressionState &state, Vector &result) {
 	D_ASSERT(input.ColumnCount() == 3);
-	auto &yyyy = input.data[0];
-	auto &mm = input.data[1];
-	auto &dd = input.data[2];
+	const auto &yyyy = input.data[0];
+	const auto &mm = input.data[1];
+	const auto &dd = input.data[2];
 
-	TernaryExecutor::Execute<T, T, T, date_t>(yyyy, mm, dd, result, input.size(),
-	                                          MakeDateOperator::Operation<T, T, T, date_t>);
+	TernaryExecutor::Execute<T, T, T, date_t>(yyyy, mm, dd, result, MakeDateOperator::Operation<T, T, T, date_t>);
 }
 
 template <typename T>
-static date_t FromDateCast(T year, T month, T day) {
+date_t FromDateCast(T year, T month, T day) {
 	date_t result;
 	if (!Date::TryFromDate(Cast::Operation<T, int32_t>(year), Cast::Operation<T, int32_t>(month),
 	                       Cast::Operation<T, int32_t>(day), result)) {
@@ -46,24 +47,29 @@ static date_t FromDateCast(T year, T month, T day) {
 }
 
 template <typename T>
-static void ExecuteStructMakeDate(DataChunk &input, ExpressionState &state, Vector &result) {
+void ExecuteStructMakeDate(DataChunk &input, ExpressionState &state, Vector &result) {
 	// this should be guaranteed by the binder
 	D_ASSERT(input.ColumnCount() == 1);
-	auto &vec = input.data[0];
+	const auto &vec = input.data[0];
+	const auto count = input.size();
 
-	auto &children = StructVector::GetEntries(vec);
-	D_ASSERT(children.size() == 3);
-	auto &yyyy = *children[0];
-	auto &mm = *children[1];
-	auto &dd = *children[2];
-
-	TernaryExecutor::Execute<T, T, T, date_t>(yyyy, mm, dd, result, input.size(), FromDateCast<T>);
+	auto iter = vec.Values<VectorStructType<T, T, T>>();
+	auto writer = FlatVector::Writer<date_t>(result, count);
+	for (const auto entry : iter) {
+		const auto y = entry.template GetChildValue<0>();
+		const auto m = entry.template GetChildValue<1>();
+		const auto d = entry.template GetChildValue<2>();
+		if (!entry.IsValid() || !y.IsValid() || !m.IsValid() || !d.IsValid()) {
+			writer.WriteNull();
+			continue;
+		}
+		writer.WriteValue(FromDateCast<T>(y.GetValueUnsafe(), m.GetValueUnsafe(), d.GetValueUnsafe()));
+	}
 }
 
 struct MakeTimeOperator {
 	template <typename HH, typename MM, typename SS, typename RESULT_TYPE>
 	static RESULT_TYPE Operation(HH hh, MM mm, SS ss) {
-
 		auto hh_32 = Cast::Operation<HH, int32_t>(hh);
 		auto mm_32 = Cast::Operation<MM, int32_t>(mm);
 		// Have to check this separately because safe casting of DOUBLE => INT32 can round.
@@ -83,13 +89,13 @@ struct MakeTimeOperator {
 };
 
 template <typename T>
-static void ExecuteMakeTime(DataChunk &input, ExpressionState &state, Vector &result) {
+void ExecuteMakeTime(DataChunk &input, ExpressionState &state, Vector &result) {
 	D_ASSERT(input.ColumnCount() == 3);
-	auto &yyyy = input.data[0];
-	auto &mm = input.data[1];
-	auto &dd = input.data[2];
+	const auto &yyyy = input.data[0];
+	const auto &mm = input.data[1];
+	const auto &dd = input.data[2];
 
-	TernaryExecutor::Execute<T, T, double, dtime_t>(yyyy, mm, dd, result, input.size(),
+	TernaryExecutor::Execute<T, T, double, dtime_t>(yyyy, mm, dd, result,
 	                                                MakeTimeOperator::Operation<T, T, double, dtime_t>);
 }
 
@@ -104,7 +110,7 @@ struct MakeTimestampOperator {
 	template <typename T, typename RESULT_TYPE>
 	static RESULT_TYPE Operation(T value) {
 		const auto result = RESULT_TYPE(value);
-		if (!Timestamp::IsFinite(result)) {
+		if (!result.IsFinite()) {
 			throw ConversionException("Timestamp microseconds out of range: %ld", value);
 		}
 		return RESULT_TYPE(value);
@@ -112,69 +118,94 @@ struct MakeTimestampOperator {
 };
 
 template <typename T>
-static void ExecuteMakeTimestamp(DataChunk &input, ExpressionState &state, Vector &result) {
+void ExecuteMakeTimestamp(DataChunk &input, ExpressionState &state, Vector &result) {
 	if (input.ColumnCount() == 1) {
 		auto func = MakeTimestampOperator::Operation<T, timestamp_t>;
-		UnaryExecutor::Execute<T, timestamp_t>(input.data[0], result, input.size(), func);
+		UnaryExecutor::Execute<T, timestamp_t>(input.data[0], result, func);
 		return;
 	}
 
 	D_ASSERT(input.ColumnCount() == 6);
 
 	auto func = MakeTimestampOperator::Operation<T, T, T, T, T, double, timestamp_t>;
-	SenaryExecutor::Execute<T, T, T, T, T, double, timestamp_t>(input, result, func);
+	VariadicExecutor::Execute<timestamp_t, T, T, T, T, T, double>(input, result, func);
 }
 
 template <typename T>
-static void ExecuteMakeTimestampNs(DataChunk &input, ExpressionState &state, Vector &result) {
+void ExecuteMakeTimestampNs(DataChunk &input, ExpressionState &state, Vector &result) {
 	D_ASSERT(input.ColumnCount() == 1);
 
 	auto func = MakeTimestampOperator::Operation<T, timestamp_ns_t>;
-	UnaryExecutor::Execute<T, timestamp_ns_t>(input.data[0], result, input.size(), func);
+	UnaryExecutor::Execute<T, timestamp_ns_t>(input.data[0], result, func);
 	return;
 }
 
+} // namespace
+
 ScalarFunctionSet MakeDateFun::GetFunctions() {
 	ScalarFunctionSet make_date("make_date");
-	make_date.AddFunction(ScalarFunction({LogicalType::INTEGER}, LogicalType::DATE, MakeDateFromEpoch));
-	make_date.AddFunction(ScalarFunction({LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	                                     LogicalType::DATE, ExecuteMakeDate<int64_t>));
+	ScalarFunction epoch_fun({}, LogicalType::DATE, MakeDateFromEpoch);
+	epoch_fun.GetSignature().AddParameter("days", LogicalType::INTEGER);
+	make_date.AddFunction(epoch_fun);
+	ScalarFunction ymd_fun({}, LogicalType::DATE, ExecuteMakeDate<int64_t>);
+	ymd_fun.GetSignature()
+	    .AddParameter("year", LogicalType::BIGINT)
+	    .AddParameter("month", LogicalType::BIGINT)
+	    .AddParameter("day", LogicalType::BIGINT);
+	make_date.AddFunction(ymd_fun);
 
 	child_list_t<LogicalType> make_date_children {
 	    {"year", LogicalType::BIGINT}, {"month", LogicalType::BIGINT}, {"day", LogicalType::BIGINT}};
-	make_date.AddFunction(
-	    ScalarFunction({LogicalType::STRUCT(make_date_children)}, LogicalType::DATE, ExecuteStructMakeDate<int64_t>));
-	for (auto &func : make_date.functions) {
-		BaseScalarFunction::SetReturnsError(func);
-	}
+	ScalarFunction struct_fun({}, LogicalType::DATE, ExecuteStructMakeDate<int64_t>);
+	struct_fun.GetSignature().AddParameter("date-struct", LogicalType::STRUCT(make_date_children));
+	make_date.AddFunction(struct_fun);
+	make_date.ApplyToFunctions([](ScalarFunction &func) {
+		func.SetFallible();
+		func.SetUnaryArgProperties(ArgProperties().StrictlyIncreasing());
+	});
 	return make_date;
 }
 
 ScalarFunction MakeTimeFun::GetFunction() {
-	ScalarFunction function({LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::DOUBLE}, LogicalType::TIME,
-	                        ExecuteMakeTime<int64_t>);
-	BaseScalarFunction::SetReturnsError(function);
+	ScalarFunction function({}, LogicalType::TIME, ExecuteMakeTime<int64_t>);
+	function.GetSignature()
+	    .AddParameter("hour", LogicalType::BIGINT)
+	    .AddParameter("minute", LogicalType::BIGINT)
+	    .AddParameter("seconds", LogicalType::DOUBLE);
+	function.SetFallible();
 	return function;
 }
 
 ScalarFunctionSet MakeTimestampFun::GetFunctions() {
 	ScalarFunctionSet operator_set("make_timestamp");
-	operator_set.AddFunction(ScalarFunction({LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
-	                                         LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::DOUBLE},
-	                                        LogicalType::TIMESTAMP, ExecuteMakeTimestamp<int64_t>));
-	operator_set.AddFunction(
-	    ScalarFunction({LogicalType::BIGINT}, LogicalType::TIMESTAMP, ExecuteMakeTimestamp<int64_t>));
+	ScalarFunction full_fun({}, LogicalType::TIMESTAMP, ExecuteMakeTimestamp<int64_t>);
+	full_fun.GetSignature()
+	    .AddParameter("year", LogicalType::BIGINT)
+	    .AddParameter("month", LogicalType::BIGINT)
+	    .AddParameter("day", LogicalType::BIGINT)
+	    .AddParameter("hour", LogicalType::BIGINT)
+	    .AddParameter("minute", LogicalType::BIGINT)
+	    .AddParameter("seconds", LogicalType::DOUBLE);
+	operator_set.AddFunction(full_fun);
+	ScalarFunction micros_fun({}, LogicalType::TIMESTAMP, ExecuteMakeTimestamp<int64_t>);
+	micros_fun.GetSignature().AddParameter("micros", LogicalType::BIGINT);
+	operator_set.AddFunction(micros_fun);
 
-	for (auto &func : operator_set.functions) {
-		BaseScalarFunction::SetReturnsError(func);
-	}
+	operator_set.ApplyToFunctions([](ScalarFunction &func) {
+		func.SetFallible();
+		func.SetUnaryArgProperties(ArgProperties().StrictlyIncreasing());
+	});
 	return operator_set;
 }
 
 ScalarFunctionSet MakeTimestampNsFun::GetFunctions() {
 	ScalarFunctionSet operator_set("make_timestamp_ns");
-	operator_set.AddFunction(
-	    ScalarFunction({LogicalType::BIGINT}, LogicalType::TIMESTAMP_NS, ExecuteMakeTimestampNs<int64_t>));
+	ScalarFunction nanos_fun({}, LogicalType::TIMESTAMP_NS, ExecuteMakeTimestampNs<int64_t>);
+	nanos_fun.GetSignature().AddParameter("nanos", LogicalType::BIGINT);
+	operator_set.AddFunction(nanos_fun);
+	// throws if the microseconds are out of range for a timestamp
+	operator_set.SetFallible();
+	operator_set.SetUnaryArgProperties(ArgProperties().StrictlyIncreasing());
 	return operator_set;
 }
 

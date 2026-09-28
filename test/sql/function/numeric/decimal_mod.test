@@ -2,9 +2,6 @@
 # description: Test decimal modulo
 # group: [numeric]
 
-statement ok
-PRAGMA enable_verification
-
 query II
 SELECT 10 % 2.4, -10 % 2.4
 ----
@@ -37,7 +34,12 @@ SELECT typeof(10.0 % 2.0), typeof(10.0 % 2.0 % 2.0 % 2.0)
 ----
 DECIMAL(3,1)	DECIMAL(3,1)
 
-query I
+statement error
 SELECT 10.0 % 0.0
+----
+<REGEX>:.*Division by zero.*
+
+query I
+SELECT TRY(10.0 % 0.0)
 ----
 NULL

@@ -2,8 +2,6 @@
 # description: Test temporary catalog entry creation
 # group: [catalog]
 
-require noforcestorage
-
 # basic temp table creation works
 statement ok
 CREATE TEMPORARY TABLE integers(i INTEGER) ON COMMIT PRESERVE ROWS
@@ -13,8 +11,10 @@ statement ok
 CREATE TEMPORARY TABLE integersx(i INTEGER)
 
 # we don't support temporary schemas (yet?)
-#statement error
-#CREATE TEMPORARY SCHEMA asdf
+statement error
+CREATE TEMPORARY SCHEMA asdf
+----
+<REGEX>:.*Temporary schemas are not supported.*
 
 # we can prefix temp tables with a schema that is not "temp"
 statement ok
@@ -36,7 +36,7 @@ SELECT * FROM s1
 statement error
 CREATE TABLE temp.integersy(i INTEGER)
 ----
-Only TEMPORARY table names can use the "temp" catalog
+<REGEX>:.*Parser Error.*Only TEMPORARY.*
 
 statement ok
 CREATE SCHEMA temp
@@ -44,7 +44,7 @@ CREATE SCHEMA temp
 statement error
 CREATE TABLE temp.integersy(i INTEGER)
 ----
-Ambiguous
+<REGEX>:.*Binder Error.*Ambiguous reference.*
 
 statement ok
 CREATE TABLE memory.temp.integersy(i INTEGER)
@@ -55,6 +55,7 @@ DROP SCHEMA temp CASCADE
 statement error
 DROP TABLE memory.main.integersx
 ----
+<REGEX>:.*Catalog Error.*does not exist.*
 
 statement ok
 DROP TABLE integersx
@@ -69,11 +70,13 @@ DROP TABLE temp.integersx
 statement error
 CREATE TEMPORARY TABLE integers2(i INTEGER) ON COMMIT DELETE ROWS
 ----
+<REGEX>:.*Not implemented Error: Only ON COMMIT.*
 
 # temp table already exists
 statement error
 CREATE TEMPORARY TABLE integers(i INTEGER)
 ----
+<REGEX>:.*Catalog Error.*already exists.*
 
 statement ok
 INSERT INTO integers VALUES (42)
@@ -153,9 +156,10 @@ ROLLBACK
 statement error
 SELECT i from integers3
 ----
+<REGEX>:.*Catalog Error.*does not exist.*
 
 # table is not visible to other cons
 statement error con2
 INSERT INTO integers VALUES (42)
 ----
-
+<REGEX>:.*Catalog Error.*does not exist.*

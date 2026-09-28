@@ -89,7 +89,7 @@ struct DamerauLevenshteinFun {
 
 struct FormatFun {
 	static constexpr const char *Name = "format";
-	static constexpr const char *Parameters = "format,parameters...";
+	static constexpr const char *Parameters = "format,...";
 	static constexpr const char *Description = "Formats a string using the fmt syntax.";
 	static constexpr const char *Example = "format('Benchmark \"{}\" took {} seconds', 'CSV', 42)";
 	static constexpr const char *Categories = "string";
@@ -111,6 +111,16 @@ struct FormatreadablesizeFun {
 	using ALIAS = FormatBytesFun;
 
 	static constexpr const char *Name = "formatReadableSize";
+};
+
+struct ParseFormattedBytesFun {
+	static constexpr const char *Name = "parse_formatted_bytes";
+	static constexpr const char *Parameters = "string";
+	static constexpr const char *Description = "Parses a human-readable representation of a size in bytes into an integer.";
+	static constexpr const char *Example = "parse_formatted_bytes('16 KiB')";
+	static constexpr const char *Categories = "string,numeric";
+
+	static ScalarFunction GetFunction();
 };
 
 struct FormatreadabledecimalsizeFun {
@@ -305,7 +315,7 @@ struct ParsePathFun {
 
 struct PrintfFun {
 	static constexpr const char *Name = "printf";
-	static constexpr const char *Parameters = "format,parameters...";
+	static constexpr const char *Parameters = "format,...";
 	static constexpr const char *Description = "Formats a `string` using printf syntax.";
 	static constexpr const char *Example = "printf('Benchmark \"%s\" took %d seconds', 'CSV', 42)";
 	static constexpr const char *Categories = "string";

@@ -22,11 +22,23 @@
 //  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 //  IN THE SOFTWARE.
 
+#if compiler(>=6.0)
+internal import Cduckdb
+#else
 @_implementationOnly import Cduckdb
+#endif
 import Foundation
 
 /// DuckDB index type
 public typealias DBInt = UInt64
+
+/// Registers the extensions built into the package, once, before the first database is opened.
+///
+/// The generated loader ships with a static initializer that does this, but its object is dropped whenever the
+/// package's objects are archived before they are linked, so the package calls the loader itself instead.
+private let registeredStaticExtensions: Void = {
+  _ = duckdb_register_static_extensions()
+}()
 
 /// An object representing a DuckDB database
 ///
@@ -92,6 +104,8 @@ public final class Database: Sendable {
   }
   
   private init(path: String?, config: Configuration?) throws {
+    // a registration that failed is reported by the open below
+    _ = registeredStaticExtensions
     let outError = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: 1)
     defer { outError.deallocate() }
     let status = path.withOptionalCString { strPtr in

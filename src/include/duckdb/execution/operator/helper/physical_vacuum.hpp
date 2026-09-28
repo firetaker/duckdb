@@ -11,6 +11,7 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/parser/parsed_data/vacuum_info.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 
 namespace duckdb {
 
@@ -20,7 +21,7 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::VACUUM;
 
 public:
-	PhysicalVacuum(unique_ptr<VacuumInfo> info, optional_ptr<TableCatalogEntry> table,
+	PhysicalVacuum(PhysicalPlan &physical_plan, unique_ptr<VacuumInfo> info, optional_ptr<TableCatalogEntry> table,
 	               unordered_map<idx_t, idx_t> column_id_map, idx_t estimated_cardinality);
 
 	unique_ptr<VacuumInfo> info;
@@ -29,7 +30,8 @@ public:
 
 public:
 	// Source interface
-	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override;
 
 	bool IsSource() const override {
 		return true;

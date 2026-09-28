@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.5...3.29)
 
 project(ParquetExtension)
 
+# Before any subdirectory or target, which would otherwise inherit the
+# directory-wide definition
+set_extension_version_sources(parquet parquet_extension.cpp)
+
 include_directories(
   include ../../third_party/lz4 ../../third_party/parquet
   ../../third_party/thrift ../../third_party/snappy
@@ -20,13 +24,17 @@ set(PARQUET_EXTENSION_FILES
     parquet_float16.cpp
     parquet_multi_file_info.cpp
     parquet_metadata.cpp
+    parquet_prefetch_cost_model.cpp
     parquet_reader.cpp
+    parquet_field_id.cpp
     parquet_statistics.cpp
     parquet_timestamp.cpp
     parquet_writer.cpp
+    parquet_shredding.cpp
+    parquet_column_schema.cpp
+    parquet_geometry.cpp
     serialize_parquet.cpp
-    zstd_file_system.cpp
-    geo_parquet.cpp)
+    zstd_file_system.cpp)
 
 if(NOT CLANG_TIDY)
   # parquet/thrift/snappy
@@ -77,9 +85,7 @@ if(NOT CLANG_TIDY)
       ../../third_party/brotli/dec/bit_reader.cpp)
 endif()
 
-build_static_extension(parquet ${PARQUET_EXTENSION_FILES})
-set(PARAMETERS "-warnings")
-build_loadable_extension(parquet ${PARAMETERS} ${PARQUET_EXTENSION_FILES})
+build_extension_library(parquet ${PARQUET_EXTENSION_FILES})
 target_link_libraries(parquet_loadable_extension duckdb_mbedtls duckdb_zstd)
 
 install(

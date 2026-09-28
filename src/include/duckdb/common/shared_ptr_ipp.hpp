@@ -1,3 +1,7 @@
+#pragma once
+
+#include "duckdb/common/compatible_with_ipp.hpp"
+
 namespace duckdb {
 
 template <typename T, bool SAFE = true>
@@ -19,7 +23,7 @@ private:
 		return;
 #else
 		if (DUCKDB_UNLIKELY(null)) {
-			throw duckdb::InternalException("Attempted to dereference shared_ptr that is NULL!");
+			ThrowNullSharedPtrDereference();
 		}
 #endif
 	}
@@ -51,7 +55,7 @@ public:
 	}
 	// From raw pointer of type T with custom DELETER
 	template <typename DELETER>
-	shared_ptr(T *ptr, DELETER deleter) : internal(ptr, deleter) {
+	shared_ptr(T *ptr, DELETER deleter) : internal(ptr, std::move(deleter)) {
 		__enable_weak_this(internal.get(), internal.get());
 	}
 	// Aliasing constructor: shares ownership information with ref but contains ptr instead
@@ -79,15 +83,16 @@ public:
 	shared_ptr(shared_ptr<U> &&ref) noexcept // NOLINT: not marked as explicit
 	    : internal(std::move(ref.internal)) {
 	}
+	// move constructor
 #ifdef DUCKDB_CLANG_TIDY
 	[[clang::reinitializes]]
 #endif
-	shared_ptr(shared_ptr<T> &&other) // NOLINT: not marked as explicit
+	shared_ptr(shared_ptr<T, SAFE> &&other) noexcept
 	    : internal(std::move(other.internal)) {
 	}
 
 	// Construct from std::shared_ptr
-	explicit shared_ptr(std::shared_ptr<T> other) : internal(other) {
+	explicit shared_ptr(std::shared_ptr<T> other) : internal(std::move(other)) {
 		// FIXME: should we __enable_weak_this here?
 		// *our* enable_shared_from_this hasn't initialized yet, so I think so?
 		__enable_weak_this(internal.get(), internal.get());
@@ -95,7 +100,7 @@ public:
 
 	// Construct from weak_ptr
 	template <class U>
-	explicit shared_ptr(weak_ptr<U> other) : internal(other.internal) {
+	explicit shared_ptr(const weak_ptr<U> &other) : internal(other.internal) {
 	}
 
 	// Construct from unique_ptr, takes over ownership of the unique_ptr
@@ -115,7 +120,7 @@ public:
 	~shared_ptr() = default;
 
 	// Assign from shared_ptr copy
-	shared_ptr<T> &operator=(const shared_ptr &other) noexcept {
+	shared_ptr<T, SAFE> &operator=(const shared_ptr<T, SAFE> &other) noexcept {
 		if (this == &other) {
 			return *this;
 		}
@@ -130,13 +135,13 @@ public:
 	}
 
 	// Assign from moved shared_ptr
-	shared_ptr<T> &operator=(shared_ptr &&other) noexcept {
+	shared_ptr<T, SAFE> &operator=(shared_ptr &&other) noexcept {
 		// Create a new shared_ptr using the move constructor, then swap out the ownership to *this
 		shared_ptr(std::move(other)).swap(*this);
 		return *this;
 	}
 	template <class U, typename std::enable_if<compatible_with_t<U, T>::value, int>::type = 0>
-	shared_ptr<T> &operator=(shared_ptr<U> &&other) {
+	shared_ptr<T, SAFE> &operator=(shared_ptr<U> &&other) {
 		shared_ptr(std::move(other)).swap(*this);
 		return *this;
 	}
@@ -146,7 +151,7 @@ public:
 	          typename std::enable_if<compatible_with_t<U, T>::value &&
 	                                      std::is_convertible<typename unique_ptr<U, DELETER>::pointer, T *>::value,
 	                                  int>::type = 0>
-	shared_ptr<T> &operator=(unique_ptr<U, DELETER, SAFE_P> &&ref) {
+	shared_ptr<T, SAFE> &operator=(unique_ptr<U, DELETER, SAFE_P> &&ref) {
 		shared_ptr(std::move(ref)).swap(*this);
 		return *this;
 	}
@@ -245,6 +250,18 @@ public:
 		return internal >= other.internal;
 	}
 
+	shared_ptr<T, SAFE> atomic_load() const {
+		return shared_ptr<T, SAFE>(std::atomic_load(&internal));
+	}
+
+	shared_ptr<T, SAFE> atomic_load(std::memory_order order) const {
+		return shared_ptr<T, SAFE>(std::atomic_load_explicit(&internal, order));
+	}
+
+	void atomic_store(const shared_ptr<T, SAFE> &new_ptr) {
+		std::atomic_store(&internal, new_ptr.internal);
+	}
+
 private:
 	// This overload is used when the class inherits from 'enable_shared_from_this<U>'
 	template <class U, class V,
@@ -264,5 +281,8 @@ private:
 	void __enable_weak_this(...) noexcept { // NOLINT: invalid case style
 	}
 };
+
+template <typename T>
+using unsafe_shared_ptr = shared_ptr<T, false>;
 
 } // namespace duckdb

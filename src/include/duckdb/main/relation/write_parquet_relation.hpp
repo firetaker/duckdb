@@ -14,16 +14,17 @@ namespace duckdb {
 
 class WriteParquetRelation : public Relation {
 public:
-	WriteParquetRelation(shared_ptr<Relation> child, string parquet_file,
-	                     case_insensitive_map_t<vector<Value>> options);
+	WriteParquetRelation(shared_ptr<Relation> child, string parquet_file, identifier_map_t<vector<Value>> options);
 
 	shared_ptr<Relation> child;
 	string parquet_file;
 	vector<ColumnDefinition> columns;
-	case_insensitive_map_t<vector<Value>> options;
+	identifier_map_t<vector<Value>> options;
 
 public:
 	BoundStatement Bind(Binder &binder) override;
+	unique_ptr<QueryNode> GetQueryNode() override;
+	string GetQuery() override;
 	const vector<ColumnDefinition> &Columns() override;
 	string ToString(idx_t depth) override;
 	bool IsReadOnly() override {

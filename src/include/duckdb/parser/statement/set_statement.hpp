@@ -11,7 +11,6 @@
 #include "duckdb/common/enums/set_scope.hpp"
 #include "duckdb/common/enums/set_type.hpp"
 #include "duckdb/parser/sql_statement.hpp"
-#include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/parsed_expression.hpp"
 
 namespace duckdb {
@@ -21,18 +20,18 @@ public:
 	static constexpr const StatementType TYPE = StatementType::SET_STATEMENT;
 
 protected:
-	SetStatement(string name_p, SetScope scope_p, SetType type_p);
+	SetStatement(Identifier name_p, SetScope scope_p, SetType type_p);
 	SetStatement(const SetStatement &other) = default;
 
 public:
-	string name;
+	Identifier name;
 	SetScope scope;
 	SetType set_type;
 };
 
 class SetVariableStatement : public SetStatement {
 public:
-	SetVariableStatement(string name_p, unique_ptr<ParsedExpression> value_p, SetScope scope_p);
+	SetVariableStatement(Identifier name_p, unique_ptr<ParsedExpression> value_p, SetScope scope_p);
 
 protected:
 	SetVariableStatement(const SetVariableStatement &other);
@@ -47,7 +46,7 @@ public:
 
 class ResetVariableStatement : public SetStatement {
 public:
-	ResetVariableStatement(std::string name_p, SetScope scope_p);
+	ResetVariableStatement(Identifier name_p, SetScope scope_p);
 
 protected:
 	ResetVariableStatement(const ResetVariableStatement &other) = default;

@@ -35,7 +35,7 @@ struct InterruptDoneSignalState {
 	void Await();
 
 protected:
-	mutex lock;
+	annotated_mutex lock;
 	std::condition_variable cv;
 	bool done = false;
 };
@@ -53,6 +53,11 @@ public:
 	//! Perform the callback to indicate the Interrupt is over
 	DUCKDB_API void Callback() const;
 
+	//! Whether Callback() can be invoked, i.e. a task or signal state was registered
+	bool CanCallback() const {
+		return mode != InterruptMode::NO_INTERRUPTS;
+	}
+
 protected:
 	//! Current interrupt mode
 	InterruptMode mode;
@@ -64,18 +69,17 @@ protected:
 
 class StateWithBlockableTasks {
 public:
-	unique_lock<mutex> Lock() {
-		return unique_lock<mutex>(lock);
-	}
-
-	void PreventBlocking(const unique_lock<mutex> &guard) {
-		D_ASSERT(guard.mutex() && RefersToSameObject(*guard.mutex(), lock));
+	void PreventBlocking() DUCKDB_REQUIRES(lock) {
 		can_block = false;
 	}
 
+	void ResetBlocking() DUCKDB_REQUIRES(lock) {
+		can_block = true;
+		blocked_tasks.clear();
+	}
+
 	//! Add a task to 'blocked_tasks' before returning SourceResultType::BLOCKED (must hold the lock)
-	bool BlockTask(const unique_lock<mutex> &guard, const InterruptState &interrupt_state) {
-		D_ASSERT(guard.mutex() && RefersToSameObject(*guard.mutex(), lock));
+	bool BlockTask(const InterruptState &interrupt_state) DUCKDB_REQUIRES(lock) {
 		if (can_block) {
 			blocked_tasks.push_back(interrupt_state);
 			return true;
@@ -83,9 +87,12 @@ public:
 		return false;
 	}
 
+	bool CanBlock() const DUCKDB_REQUIRES(lock) {
+		return can_block;
+	}
+
 	//! Unblock all tasks (must hold the lock)
-	bool UnblockTasks(const unique_lock<mutex> &guard) {
-		D_ASSERT(guard.mutex() && RefersToSameObject(*guard.mutex(), lock));
+	bool UnblockTasks() DUCKDB_REQUIRES(lock) {
 		if (blocked_tasks.empty()) {
 			return false;
 		}
@@ -96,21 +103,23 @@ public:
 		return true;
 	}
 
-	SinkResultType BlockSink(const unique_lock<mutex> &guard, const InterruptState &interrupt_state) {
-		return BlockTask(guard, interrupt_state) ? SinkResultType::BLOCKED : SinkResultType::FINISHED;
+	SinkResultType BlockSink(const InterruptState &interrupt_state) DUCKDB_REQUIRES(lock) {
+		return BlockTask(interrupt_state) ? SinkResultType::BLOCKED : SinkResultType::FINISHED;
 	}
 
-	SourceResultType BlockSource(const unique_lock<mutex> &guard, const InterruptState &interrupt_state) {
-		return BlockTask(guard, interrupt_state) ? SourceResultType::BLOCKED : SourceResultType::FINISHED;
+	SourceResultType BlockSource(const InterruptState &interrupt_state) DUCKDB_REQUIRES(lock) {
+		return BlockTask(interrupt_state) ? SourceResultType::BLOCKED : SourceResultType::FINISHED;
 	}
+
+public:
+	//! Global lock
+	mutable annotated_mutex lock;
 
 private:
 	//! Whether we can block tasks
-	atomic<bool> can_block {true};
-	//! Global lock, acquired by calling Lock()
-	mutable mutex lock;
+	bool can_block DUCKDB_GUARDED_BY(lock) = true;
 	//! Tasks that are currently blocked
-	mutable vector<InterruptState> blocked_tasks;
+	mutable vector<InterruptState> blocked_tasks DUCKDB_GUARDED_BY(lock);
 };
 
 } // namespace duckdb

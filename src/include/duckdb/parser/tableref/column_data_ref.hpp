@@ -20,19 +20,14 @@ public:
 	static constexpr const TableReferenceType TYPE = TableReferenceType::COLUMN_DATA;
 
 public:
-	explicit ColumnDataRef(shared_ptr<ColumnDataCollection> collection)
-	    : TableRef(TableReferenceType::COLUMN_DATA), collection(std::move(collection)) {
-	}
-	ColumnDataRef(shared_ptr<ColumnDataCollection> collection, vector<string> expected_names)
-	    : TableRef(TableReferenceType::COLUMN_DATA), expected_names(std::move(expected_names)),
-	      collection(std::move(collection)) {
-	}
+	explicit ColumnDataRef(optionally_owned_ptr<ColumnDataCollection> collection_p,
+	                       vector<Identifier> expected_names = vector<Identifier>());
 
 public:
 	//! The set of expected names
-	vector<string> expected_names;
-	//! The collection to scan
-	shared_ptr<ColumnDataCollection> collection;
+	vector<Identifier> expected_names;
+	//! (Optionally) the owned collection
+	optionally_owned_ptr<ColumnDataCollection> collection;
 
 public:
 	string ToString() const override;

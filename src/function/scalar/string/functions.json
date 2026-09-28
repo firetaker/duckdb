@@ -30,16 +30,19 @@
     {
         "name": "concat",
         "parameters": "value,...",
-        "description": "Concatenates multiple strings, lists, or blobs. `NULL` inputs are skipped. See also operator `||`.",
-        "example": "concat('Hello', ' ', 'World')",
-        "categories": ["string", "list", "blob"],
+        "description": "Concatenates multiple strings or lists. `NULL` inputs are skipped. See also operator `||`.",
+        "examples": [
+            "concat('Hello', ' ', 'World')",
+            "concat([1, 2, 3], NULL, [4, 5, 6])"
+        ],
+        "categories": ["string", "list"],
         "type": "scalar_function"
     },
     {
         "name": "list_concat",
-        "parameters": "list1,list2",
-        "description": "Concatenates two lists.",
-        "example": "list_concat([2, 3], [4, 5, 6])",
+        "parameters": "list,...",
+        "description": "Concatenates lists. `NULL` inputs are skipped. See also operator `||`.",
+        "example": "list_concat([2, 3], [4, 5, 6], [7])",
         "categories": ["list"],
         "type": "scalar_function",
         "aliases": ["list_cat","array_concat","array_cat"]
@@ -47,7 +50,7 @@
     {
         "name": "||",
         "parameters": "arg1,arg2",
-        "description": "Concatenates two strings, lists, or blobs. Any `NULL` input results in `NULL`. See also `concat(arg1, arg2, ...)` and `list_concat(list1, list2)`.",
+        "description": "Concatenates two strings, lists, or blobs. Any `NULL` input results in `NULL`. See also `concat(arg1, arg2, ...)` and `list_concat(list1, list2, ...)`.",
         "examples": [
             "'Duck' || 'DB'",
             "[1, 2, 3] || [4, 5, 6]",
@@ -229,6 +232,17 @@
         "type": "scalar_function_set"
     },
     {
+        "name": "overlay",
+        "parameters": "string,replacement,start,count",
+        "description": "Replaces a substring of `string` starting at character `start` with `replacement`. If `count` is not specified, it defaults to the length of `replacement`. Note that a `start` value of `1` refers to the first character of the `string`.",
+        "examples": [
+            "overlay('hello' placing 'xyz' from 2 for 3)",
+            "overlay('hello' placing 'xyz' from 2)"
+        ],
+        "categories": ["string"],
+        "type": "scalar_function_set"
+    },
+    {
         "name": "substring",
         "parameters": "string,start,length",
         "description": "Extracts substring starting from character `start` up to the end of the string. If optional argument `length` is set, extracts a substring of `length` characters instead. Note that a `start` value of `1` refers to the first character of the `string`.",
@@ -271,7 +285,7 @@
     },
     {
         "name": "regexp_full_match",
-        "parameters": "string,regex",
+        "parameters": "string,regex,options",
         "description": "Returns `true` if the entire `string` matches the `regex`. A set of optional regex `options` can be set.",
         "example": "regexp_full_match('anabanana', '(an)*')",
         "categories": ["regex"],
@@ -314,6 +328,16 @@
                 ],
                 "description": "If `string` contains the `regex` pattern, returns the capturing group specified by optional parameter `group`; otherwise, returns the empty string. The `group` must be a constant value. If no `group` is given, it defaults to 0. A set of optional regex `options` can be set.",
                 "example": "regexp_extract('abc', '([a-z])(b)', 1)",
+                "categories": ["regex"]
+            },
+            {
+                "parameters": [
+                    {"name": "string", "type": "VARCHAR"},
+                    {"name": "regex", "type": "VARCHAR"},
+                    {"name": "options", "type": "VARCHAR"}
+                ],
+                "description": "If `string` contains the `regex` pattern, returns the capturing group specified by optional parameter `group`; otherwise, returns the empty string. The `group` must be a constant value. If no `group` is given, it defaults to 0. A set of optional regex `options` can be set.",
+                "example": "regexp_extract('aaaBBBCC', '[A-Z][A-Z]', 'i')",
                 "categories": ["regex"]
             },
             {
@@ -369,8 +393,26 @@
         "struct": "RegexpEscapeFun"
     },
     {
+        "name": "path_join",
+        "parameters": "path,...",
+        "description": "Joins path components using the platform separator, normalizing duplicate separators and dot segments. Absolute RHS components must be compatible (same scheme/parent) or raise an error.",
+        "example": "path_join('dir', 'subdir', 'file')",
+        "categories": ["string"],
+        "type": "scalar_function",
+        "struct": "PathJoinFun"
+    },
+    {
+        "name": "hive_partition_component",
+        "parameters": "name,value",
+        "description": "Returns the hive partition directory for a partition column and its value, e.g. name=value. The name and the value are escaped like url_encode does, a NULL value becomes __HIVE_DEFAULT_PARTITION__.",
+        "example": "hive_partition_component('year', 2024)",
+        "categories": ["string"],
+        "type": "scalar_function",
+        "struct": "HivePartitionComponentFun"
+    },
+    {
         "name": "~~",
-        "parameters": "",
+        "parameters": "string,pattern",
         "description": "",
         "example": "",
         "type": "scalar_function",
@@ -378,7 +420,7 @@
     },
     {
         "name": "!~~",
-        "parameters": "",
+        "parameters": "string,pattern",
         "description": "",
         "example": "",
         "type": "scalar_function",
@@ -386,7 +428,7 @@
     },
     {
         "name": "~~~",
-        "parameters": "",
+        "parameters": "string,pattern",
         "description": "",
         "example": "",
         "type": "scalar_function",
@@ -394,7 +436,7 @@
     },
     {
         "name": "~~*",
-        "parameters": "",
+        "parameters": "string,pattern",
         "description": "",
         "example": "",
         "type": "scalar_function",
@@ -402,7 +444,7 @@
     },
     {
         "name": "!~~*",
-        "parameters": "",
+        "parameters": "string,pattern",
         "description": "",
         "example": "",
         "type": "scalar_function",

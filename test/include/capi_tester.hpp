@@ -211,6 +211,8 @@ duckdb_date CAPIResult::Fetch(idx_t col, idx_t row);
 template <>
 duckdb_time CAPIResult::Fetch(idx_t col, idx_t row);
 template <>
+duckdb_time_ns CAPIResult::Fetch(idx_t col, idx_t row);
+template <>
 duckdb_timestamp CAPIResult::Fetch(idx_t col, idx_t row);
 template <>
 duckdb_timestamp_s CAPIResult::Fetch(idx_t col, idx_t row);
@@ -325,6 +327,11 @@ struct CAPIPending {
 	duckdb_pending_state ExecuteTask() {
 		REQUIRE(pending);
 		return duckdb_pending_execute_task(pending);
+	}
+
+	duckdb_pending_state CheckState() {
+		REQUIRE(pending);
+		return duckdb_pending_execute_check_state(pending);
 	}
 
 	unique_ptr<CAPIResult> Execute() {

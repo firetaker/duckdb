@@ -7,6 +7,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/function/scalar_macro_function.hpp"
+#include "duckdb/planner/table_binding.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/planner/expression_binder.hpp"
 
 #include "duckdb/function/macro_function.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -29,17 +32,14 @@ unique_ptr<MacroFunction> ScalarMacroFunction::Copy() const {
 	return std::move(result);
 }
 
-void RemoveQualificationRecursive(unique_ptr<ParsedExpression> &expr) {
-	if (expr->GetExpressionType() == ExpressionType::COLUMN_REF) {
-		auto &col_ref = expr->Cast<ColumnRefExpression>();
-		auto &col_names = col_ref.column_names;
-		if (col_names.size() == 2 && col_names[0].find(DummyBinding::DUMMY_NAME) != string::npos) {
-			col_names.erase(col_names.begin());
-		}
-	} else {
-		ParsedExpressionIterator::EnumerateChildren(
-		    *expr, [](unique_ptr<ParsedExpression> &child) { RemoveQualificationRecursive(child); });
-	}
+void RemoveQualificationRecursive(unique_ptr<ParsedExpression> &root_expr) {
+	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(
+	    *root_expr, [&](ColumnRefExpression &col_ref) {
+		    auto &col_names = col_ref.ColumnNamesMutable();
+		    if (col_names.size() == 2 && col_names[0].StartsWith(DummyBinding::DUMMY_NAME)) {
+			    col_names.erase(col_names.begin());
+		    }
+	    });
 }
 
 string ScalarMacroFunction::ToSQL() const {

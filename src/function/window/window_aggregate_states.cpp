@@ -2,8 +2,9 @@
 
 namespace duckdb {
 
-WindowAggregateStates::WindowAggregateStates(const AggregateObject &aggr)
-    : aggr(aggr), state_size(aggr.function.state_size(aggr.function)), allocator(Allocator::DefaultAllocator()) {
+WindowAggregateStates::WindowAggregateStates(ClientContext &client, const AggregateObject &aggr)
+    : client(client), aggr(aggr), state_size(aggr.function.GetStateSize(aggr.GetFunctionData())),
+      allocator(Allocator::Get(client)) {
 }
 
 void WindowAggregateStates::Initialize(idx_t count) {
@@ -14,25 +15,25 @@ void WindowAggregateStates::Initialize(idx_t count) {
 	auto state_ptr = states.data();
 
 	statef = make_uniq<Vector>(LogicalType::POINTER, count);
-	auto state_f_data = FlatVector::GetData<data_ptr_t>(*statef);
-
+	auto state_f_data = FlatVector::Writer<data_ptr_t>(*statef, count);
+	AggregateStateInput state_input(aggr.function, aggr.GetFunctionData());
 	for (idx_t i = 0; i < count; ++i, state_ptr += state_size) {
-		state_f_data[i] = state_ptr;
-		aggr.function.initialize(aggr.function, state_ptr);
+		state_f_data.WriteValue(state_ptr);
+		aggr.function.GetStateInitCallback()(state_input, &state_ptr, 1);
 	}
 
 	// Prevent conversion of results to constants
 	statef->SetVectorType(VectorType::FLAT_VECTOR);
 }
 
-void WindowAggregateStates::Combine(WindowAggregateStates &target, AggregateCombineType combine_type) {
-	AggregateInputData aggr_input_data(aggr.GetFunctionData(), allocator, AggregateCombineType::ALLOW_DESTRUCTIVE);
-	aggr.function.combine(*statef, *target.statef, aggr_input_data, GetCount());
+void WindowAggregateStates::Combine(WindowAggregateStates &target) {
+	AggregateInputData aggr_input_data(aggr, allocator, AggregateCombineType::ALLOW_DESTRUCTIVE);
+	aggr.function.GetStateCombineCallback()(*statef, *target.statef, aggr_input_data, GetCount());
 }
 
 void WindowAggregateStates::Finalize(Vector &result) {
-	AggregateInputData aggr_input_data(aggr.GetFunctionData(), allocator);
-	aggr.function.finalize(*statef, aggr_input_data, result, GetCount(), 0);
+	AggregateFinalizeInputData aggr_input_data(aggr, allocator);
+	aggr.function.GetStateFinalizeCallback()(*statef, aggr_input_data, result, GetCount(), 0);
 }
 
 void WindowAggregateStates::Destroy() {
@@ -40,9 +41,9 @@ void WindowAggregateStates::Destroy() {
 		return;
 	}
 
-	AggregateInputData aggr_input_data(aggr.GetFunctionData(), allocator);
-	if (aggr.function.destructor) {
-		aggr.function.destructor(*statef, aggr_input_data, GetCount());
+	AggregateInputData aggr_input_data(aggr, allocator);
+	if (aggr.function.HasStateDestructorCallback()) {
+		aggr.function.GetStateDestructorCallback()(*statef, aggr_input_data, GetCount());
 	}
 
 	states.clear();

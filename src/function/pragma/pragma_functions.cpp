@@ -11,6 +11,9 @@
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/common/encryption_functions.hpp"
+#include "duckdb/logging/log_manager.hpp"
 
 #include <cctype>
 
@@ -19,12 +22,11 @@ namespace duckdb {
 static void PragmaEnableProfilingStatement(ClientContext &context, const FunctionParameters &parameters) {
 	auto &config = ClientConfig::GetConfig(context);
 	config.enable_profiler = true;
-	config.emit_profiler_output = true;
 }
 
 void RegisterEnableProfiling(BuiltinFunctions &set) {
 	PragmaFunctionSet functions("");
-	functions.AddFunction(PragmaFunction::PragmaStatement(string(), PragmaEnableProfilingStatement));
+	functions.AddFunction(PragmaFunction::PragmaStatement(Identifier(), PragmaEnableProfilingStatement));
 
 	set.AddFunction("enable_profile", functions);
 	set.AddFunction("enable_profiling", functions);
@@ -51,38 +53,21 @@ static void PragmaDisablePrintProgressBar(ClientContext &context, const Function
 	ClientConfig::GetConfig(context).print_progress_bar = false;
 }
 
+//! Warn that a pragma that no longer does anything is on its way out
+static void WarnDeprecatedPragma(ClientContext &context, const char *name) {
+	DUCKDB_LOG_WARNING(
+	    context,
+	    StringUtil::Format("The '%s' pragma no longer has any effect; it is deprecated and will be removed in a "
+	                       "future release.",
+	                       name));
+}
+
 static void PragmaEnableVerification(ClientContext &context, const FunctionParameters &parameters) {
-	ClientConfig::GetConfig(context).query_verification_enabled = true;
-	ClientConfig::GetConfig(context).verify_serializer = true;
+	WarnDeprecatedPragma(context, "enable_verification");
 }
 
 static void PragmaDisableVerification(ClientContext &context, const FunctionParameters &parameters) {
-	ClientConfig::GetConfig(context).query_verification_enabled = false;
-	ClientConfig::GetConfig(context).verify_serializer = false;
-}
-
-static void PragmaVerifySerializer(ClientContext &context, const FunctionParameters &parameters) {
-	ClientConfig::GetConfig(context).verify_serializer = true;
-}
-
-static void PragmaDisableVerifySerializer(ClientContext &context, const FunctionParameters &parameters) {
-	ClientConfig::GetConfig(context).verify_serializer = false;
-}
-
-static void PragmaEnableExternalVerification(ClientContext &context, const FunctionParameters &parameters) {
-	ClientConfig::GetConfig(context).verify_external = true;
-}
-
-static void PragmaDisableExternalVerification(ClientContext &context, const FunctionParameters &parameters) {
-	ClientConfig::GetConfig(context).verify_external = false;
-}
-
-static void PragmaEnableFetchRowVerification(ClientContext &context, const FunctionParameters &parameters) {
-	ClientConfig::GetConfig(context).verify_fetch_row = true;
-}
-
-static void PragmaDisableFetchRowVerification(ClientContext &context, const FunctionParameters &parameters) {
-	ClientConfig::GetConfig(context).verify_fetch_row = false;
+	WarnDeprecatedPragma(context, "disable_verification");
 }
 
 static void PragmaEnableForceParallelism(ClientContext &context, const FunctionParameters &parameters) {
@@ -93,18 +78,16 @@ static void PragmaForceCheckpoint(ClientContext &context, const FunctionParamete
 	DBConfig::GetConfig(context).options.force_checkpoint = true;
 }
 
-static void PragmaTruncateDuckDBLogs(ClientContext &context, const FunctionParameters &parameters) {
-	context.db->GetLogManager().TruncateLogStorage();
-}
-
 static void PragmaDisableForceParallelism(ClientContext &context, const FunctionParameters &parameters) {
 	ClientConfig::GetConfig(context).verify_parallelism = false;
 }
 
 static void PragmaEnableObjectCache(ClientContext &context, const FunctionParameters &parameters) {
+	WarnDeprecatedPragma(context, "enable_object_cache");
 }
 
 static void PragmaDisableObjectCache(ClientContext &context, const FunctionParameters &parameters) {
+	WarnDeprecatedPragma(context, "disable_object_cache");
 }
 
 static void PragmaEnableCheckpointOnShutdown(ClientContext &context, const FunctionParameters &parameters) {
@@ -115,45 +98,20 @@ static void PragmaDisableCheckpointOnShutdown(ClientContext &context, const Func
 	DBConfig::GetConfig(context).options.checkpoint_on_shutdown = false;
 }
 
-static void PragmaEnableLogging(ClientContext &context, const FunctionParameters &parameters) {
-	if (parameters.values.empty()) {
-		context.db->GetLogManager().SetEnableLogging(true);
-		return;
-	}
-
-	if (parameters.values.size() != 1) {
-		throw InvalidInputException("PragmaEnableLogging: expected 0 or 1 parameter");
-	}
-
-	vector<string> types;
-
-	if (parameters.values[0].type() == LogicalType::VARCHAR) {
-		types.push_back(parameters.values[0].GetValue<string>());
-	} else if (parameters.values[0].type() == LogicalType::LIST(LogicalType::VARCHAR)) {
-		for (const auto &child : ListValue::GetChildren(parameters.values[0])) {
-			types.push_back(child.GetValue<string>());
-		}
-	} else {
-		throw InvalidInputException("Unexpected type for PragmaEnableLogging");
-	}
-
-	context.db->GetLogManager().SetEnableStructuredLoggers(types);
-}
-
-static void PragmaDisableLogging(ClientContext &context, const FunctionParameters &parameters) {
-	context.db->GetLogManager().SetEnableLogging(false);
-}
-
 static void PragmaEnableOptimizer(ClientContext &context, const FunctionParameters &parameters) {
-	ClientConfig::GetConfig(context).enable_optimizer = true;
+	Settings::Set<EnableOptimizerSetting>(context, SetScope::SESSION, Value::BOOLEAN(true));
 }
 
 static void PragmaDisableOptimizer(ClientContext &context, const FunctionParameters &parameters) {
-	ClientConfig::GetConfig(context).enable_optimizer = false;
+	Settings::Set<EnableOptimizerSetting>(context, SetScope::SESSION, Value::BOOLEAN(false));
 }
 
 void PragmaFunctions::RegisterFunction(BuiltinFunctions &set) {
 	RegisterEnableProfiling(set);
+
+	// NOTE: use of Pragma functions is discouraged. Instead, opt for adding a regular table function to be invoked with
+	// CALL.
+	//       see for example the "enable_logging" function
 
 	set.AddFunction(PragmaFunction::PragmaStatement("disable_profile", PragmaDisableProfiling));
 	set.AddFunction(PragmaFunction::PragmaStatement("disable_profiling", PragmaDisableProfiling));
@@ -161,30 +119,16 @@ void PragmaFunctions::RegisterFunction(BuiltinFunctions &set) {
 	set.AddFunction(PragmaFunction::PragmaStatement("enable_verification", PragmaEnableVerification));
 	set.AddFunction(PragmaFunction::PragmaStatement("disable_verification", PragmaDisableVerification));
 
-	set.AddFunction(PragmaFunction::PragmaStatement("verify_external", PragmaEnableExternalVerification));
-	set.AddFunction(PragmaFunction::PragmaStatement("disable_verify_external", PragmaDisableExternalVerification));
-
-	set.AddFunction(PragmaFunction::PragmaStatement("verify_fetch_row", PragmaEnableFetchRowVerification));
-	set.AddFunction(PragmaFunction::PragmaStatement("disable_verify_fetch_row", PragmaDisableFetchRowVerification));
-
-	set.AddFunction(PragmaFunction::PragmaStatement("verify_serializer", PragmaVerifySerializer));
-	set.AddFunction(PragmaFunction::PragmaStatement("disable_verify_serializer", PragmaDisableVerifySerializer));
-
 	set.AddFunction(PragmaFunction::PragmaStatement("verify_parallelism", PragmaEnableForceParallelism));
 	set.AddFunction(PragmaFunction::PragmaStatement("disable_verify_parallelism", PragmaDisableForceParallelism));
 
 	set.AddFunction(PragmaFunction::PragmaStatement("enable_object_cache", PragmaEnableObjectCache));
 	set.AddFunction(PragmaFunction::PragmaStatement("disable_object_cache", PragmaDisableObjectCache));
 
-	set.AddFunction(PragmaFunction::PragmaCall("enable_logging", PragmaEnableLogging, {}, LogicalType::VARCHAR));
-	set.AddFunction(PragmaFunction::PragmaStatement("disable_logging", PragmaDisableLogging));
-
 	set.AddFunction(PragmaFunction::PragmaStatement("enable_optimizer", PragmaEnableOptimizer));
 	set.AddFunction(PragmaFunction::PragmaStatement("disable_optimizer", PragmaDisableOptimizer));
 
 	set.AddFunction(PragmaFunction::PragmaStatement("force_checkpoint", PragmaForceCheckpoint));
-
-	set.AddFunction(PragmaFunction::PragmaStatement("truncate_duckdb_logs", PragmaTruncateDuckDBLogs));
 
 	set.AddFunction(PragmaFunction::PragmaStatement("enable_progress_bar", PragmaEnableProgressBar));
 	set.AddFunction(PragmaFunction::PragmaStatement("disable_progress_bar", PragmaDisableProgressBar));

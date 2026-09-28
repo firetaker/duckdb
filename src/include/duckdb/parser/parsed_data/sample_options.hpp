@@ -8,10 +8,8 @@
 
 #pragma once
 
-#include "duckdb/common/common.hpp"
-#include "duckdb/parser/parsed_expression.hpp"
-#include "duckdb/common/vector.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/optional_idx.hpp"
 
 namespace duckdb {
 
@@ -23,6 +21,9 @@ enum class SampleMethod : uint8_t { SYSTEM_SAMPLE = 0, BERNOULLI_SAMPLE = 1, RES
 string SampleMethodToString(SampleMethod method);
 
 class SampleOptions {
+public:
+	// 1 billion rows should be enough.
+	static constexpr idx_t MAX_SAMPLE_ROWS = 1000000000;
 
 public:
 	explicit SampleOptions(int64_t seed_ = -1);
@@ -32,6 +33,7 @@ public:
 	SampleMethod method;
 	optional_idx seed = optional_idx::Invalid();
 	bool repeatable;
+	double sample_rate = -1.0;
 
 	unique_ptr<SampleOptions> Copy();
 	void SetSeed(idx_t new_seed);

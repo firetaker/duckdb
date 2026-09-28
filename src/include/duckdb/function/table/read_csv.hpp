@@ -9,15 +9,14 @@
 #pragma once
 
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
-#include "duckdb/execution/operator/csv_scanner/csv_buffer.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_buffer_manager.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_file_handle.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_reader_options.hpp"
-#include "duckdb/execution/operator/csv_scanner/csv_state_machine_cache.hpp"
 #include "duckdb/function/built_in_functions.hpp"
 #include "duckdb/function/scalar/strftime_format.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_file_scanner.hpp"
+#include "duckdb/common/csv_writer.hpp"
 
 namespace duckdb {
 class BaseScanner;
@@ -40,25 +39,14 @@ struct BaseCSVData : public TableFunctionData {
 };
 
 struct WriteCSVData : public BaseCSVData {
-	WriteCSVData(string file_path, vector<LogicalType> sql_types, vector<string> names)
-	    : sql_types(std::move(sql_types)) {
-		files.push_back(std::move(file_path));
-		options.name_list = std::move(names);
+	explicit WriteCSVData(const vector<Identifier> &names) {
+		options.name_list = names;
 		if (options.dialect_options.state_machine_options.escape == '\0') {
 			options.dialect_options.state_machine_options.escape = options.dialect_options.state_machine_options.quote;
 		}
 	}
-
-	//! The file path of the CSV file to read or write
-	vector<string> files;
-	//! The SQL types to write
-	vector<LogicalType> sql_types;
-	//! The newline string to write
-	string newline = "\n";
 	//! The size of the CSV file (in bytes) that we buffer before we flush it to disk
 	idx_t flush_size = 4096ULL * 8ULL;
-	//! For each byte whether the CSV file requires quotes when containing the byte
-	unsafe_unique_array<bool> requires_quotes;
 	//! Expressions used to convert the input into strings
 	vector<unique_ptr<Expression>> cast_expressions;
 };
@@ -84,8 +72,6 @@ struct ReadCSVData : public BaseCSVData {
 	//! The buffer manager (if any): this is used when automatic detection is used during binding.
 	//! In this case, some CSV buffers have already been read and can be reused.
 	shared_ptr<CSVBufferManager> buffer_manager;
-	//! Column info (used for union reader serialization)
-	vector<ColumnInfo> column_info;
 	//! The CSV schema, in case there is a unified schema that all files must read
 	CSVSchema csv_schema;
 
@@ -126,6 +112,10 @@ struct CSVCopyFunction {
 struct ReadCSVTableFunction {
 	static TableFunction GetFunction();
 	static TableFunction GetAutoFunction();
+	//! The CSV reader that reads a single file - this is what the multi-file CSV reader wraps
+	static TableFunction GetSingleFileFunction();
+	//! The single-file CSV reader wrapped into a multi-file function
+	static TableFunction GetMultiFileFunction(Identifier name);
 	static void ReadCSVAddNamedParameters(TableFunction &table_function);
 	static void RegisterFunction(BuiltinFunctions &set);
 };

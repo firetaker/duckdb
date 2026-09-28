@@ -25,7 +25,6 @@ struct HugeIntPacker {
 };
 
 class BitpackingPrimitives {
-
 public:
 	static constexpr const idx_t BITPACKING_ALGORITHM_GROUP_SIZE = 32;
 	static constexpr const idx_t BITPACKING_HEADER_SIZE = sizeof(uint64_t);
@@ -59,9 +58,8 @@ public:
 	// Unpacks a block of BITPACKING_ALGORITHM_GROUP_SIZE values
 	// Assumes both src and dst to be of the correct size
 	template <class T>
-	inline static void UnPackBuffer(data_ptr_t dst, data_ptr_t src, idx_t count, bitpacking_width_t width,
+	inline static void UnPackBuffer(data_ptr_t dst, const_data_ptr_t src, idx_t count, bitpacking_width_t width,
 	                                bool skip_sign_extension = false) {
-
 		for (idx_t i = 0; i < count; i += BITPACKING_ALGORITHM_GROUP_SIZE) {
 			UnPackGroup<T>(dst + i * sizeof(T), src + (i * width) / 8, width, skip_sign_extension);
 		}
@@ -75,7 +73,7 @@ public:
 
 	// Unpacks a block of BITPACKING_ALGORITHM_GROUP_SIZE values
 	template <class T>
-	inline static void UnPackBlock(data_ptr_t dst, data_ptr_t src, bitpacking_width_t width,
+	inline static void UnPackBlock(data_ptr_t dst, const_data_ptr_t src, bitpacking_width_t width,
 	                               bool skip_sign_extension = false) {
 		return UnPackGroup<T>(dst, src, width, skip_sign_extension);
 	}
@@ -230,7 +228,7 @@ private:
 	}
 
 	template <class T>
-	static inline void UnPackGroup(data_ptr_t dst, data_ptr_t src, bitpacking_width_t width,
+	static inline void UnPackGroup(data_ptr_t dst, const_data_ptr_t src, bitpacking_width_t width,
 	                               bool skip_sign_extension = false) {
 		if (std::is_same<T, int8_t>::value || std::is_same<T, uint8_t>::value) {
 			duckdb_fastpforlib::fastunpack(reinterpret_cast<const uint8_t *>(src), reinterpret_cast<uint8_t *>(dst),

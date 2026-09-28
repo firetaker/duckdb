@@ -1,6 +1,8 @@
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 namespace duckdb {
@@ -17,11 +19,15 @@ public:
 	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override {
 		context.thread.profiler.Flush(op);
 	}
+
+	bool SupportsReuse() const override {
+		return true;
+	}
 };
 
-PhysicalProjection::PhysicalProjection(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list,
-                                       idx_t estimated_cardinality)
-    : PhysicalOperator(PhysicalOperatorType::PROJECTION, std::move(types), estimated_cardinality),
+PhysicalProjection::PhysicalProjection(PhysicalPlan &physical_plan, vector<LogicalType> types,
+                                       vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::PROJECTION, std::move(types), estimated_cardinality),
       select_list(std::move(select_list)) {
 }
 
@@ -36,37 +42,19 @@ unique_ptr<OperatorState> PhysicalProjection::GetOperatorState(ExecutionContext 
 	return make_uniq<ProjectionState>(context, select_list);
 }
 
-unique_ptr<PhysicalOperator>
-PhysicalProjection::CreateJoinProjection(vector<LogicalType> proj_types, const vector<LogicalType> &lhs_types,
-                                         const vector<LogicalType> &rhs_types, const vector<idx_t> &left_projection_map,
-                                         const vector<idx_t> &right_projection_map, const idx_t estimated_cardinality) {
-
-	vector<unique_ptr<Expression>> proj_selects;
-	proj_selects.reserve(proj_types.size());
-
-	if (left_projection_map.empty()) {
-		for (storage_t i = 0; i < lhs_types.size(); ++i) {
-			proj_selects.emplace_back(make_uniq<BoundReferenceExpression>(lhs_types[i], i));
-		}
-	} else {
-		for (auto i : left_projection_map) {
-			proj_selects.emplace_back(make_uniq<BoundReferenceExpression>(lhs_types[i], i));
+bool PhysicalProjection::ParallelOperator() const {
+	for (auto &expression : select_list) {
+		bool requires_ordered_execution = false;
+		ExpressionIterator::VisitExpression<BoundFunctionExpression>(*expression, [&](const auto &function) {
+			if (function.RequiresOrderedExecution()) {
+				requires_ordered_execution = true;
+			}
+		});
+		if (requires_ordered_execution) {
+			return false;
 		}
 	}
-	const auto left_cols = lhs_types.size();
-
-	if (right_projection_map.empty()) {
-		for (storage_t i = 0; i < rhs_types.size(); ++i) {
-			proj_selects.emplace_back(make_uniq<BoundReferenceExpression>(rhs_types[i], left_cols + i));
-		}
-
-	} else {
-		for (auto i : right_projection_map) {
-			proj_selects.emplace_back(make_uniq<BoundReferenceExpression>(rhs_types[i], left_cols + i));
-		}
-	}
-
-	return make_uniq<PhysicalProjection>(std::move(proj_types), std::move(proj_selects), estimated_cardinality);
+	return true;
 }
 
 InsertionOrderPreservingMap<string> PhysicalProjection::ParamsToString() const {

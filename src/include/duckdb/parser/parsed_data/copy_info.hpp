@@ -8,7 +8,9 @@
 
 #pragma once
 
+#include "duckdb/common/identifier.hpp"
 #include "duckdb/parser/parsed_data/parse_info.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -24,41 +26,62 @@ public:
 	static constexpr const ParseInfoType TYPE = ParseInfoType::COPY_INFO;
 
 public:
-	CopyInfo() : ParseInfo(TYPE), catalog(INVALID_CATALOG), schema(DEFAULT_SCHEMA), is_format_auto_detected(true) {
-	}
+	CopyInfo();
 
-	//! The catalog name to copy to/from
-	string catalog;
-	//! The schema name to copy to/from
-	string schema;
-	//! The table name to copy to/from
-	string table;
 	//! List of columns to copy to/from
-	vector<string> select_list;
+	vector<Identifier> select_list;
 	//! Whether or not this is a copy to file (false) or copy from a file (true)
 	bool is_from;
 	//! The file format of the external file
 	string format;
 	//! If the format is manually set (i.e., via the format parameter) or was discovered by inspecting the file path
 	bool is_format_auto_detected;
+	//! Expression to determine the file path (if any)
+	unique_ptr<ParsedExpression> file_path_expression;
 	//! The file path to copy to/from
 	string file_path;
 	//! Set of (key, value) options
-	case_insensitive_map_t<vector<Value>> options;
+	identifier_map_t<unique_ptr<ParsedExpression>> parsed_options;
+	//! Set of (key, value) options
+	identifier_map_t<vector<Value>> options;
 	//! The SQL statement used instead of a table when copying data out to a file
 	unique_ptr<QueryNode> select_statement;
 
 public:
-	static string CopyOptionsToString(const string &format, bool is_format_auto_detected,
-	                                  const case_insensitive_map_t<vector<Value>> &options);
+	const QualifiedName &GetQualifiedName() const {
+		return qualified_name;
+	}
+	QualifiedName &GetQualifiedNameMutable() {
+		return qualified_name;
+	}
+	void SetQualifiedName(QualifiedName name) {
+		qualified_name = std::move(name);
+	}
+	void SetQualifiedName(Identifier catalog, Identifier schema, Identifier name) {
+		qualified_name = QualifiedName(std::move(catalog), std::move(schema), std::move(name));
+	}
+	const Identifier &Table() const {
+		return qualified_name.Name();
+	}
+	void SetTable(Identifier table) {
+		qualified_name = qualified_name.WithName(std::move(table));
+	}
+
+public:
+	string CopyOptionsToString() const;
 
 public:
 	unique_ptr<CopyInfo> Copy() const;
+	bool Equals(const CopyInfo &other) const;
 	string ToString() const;
 	string TablePartToString() const;
 
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<ParseInfo> Deserialize(Deserializer &deserializer);
+
+private:
+	//! Qualified name of the table to copy to/from (catalog.schema.table)
+	QualifiedName qualified_name;
 };
 
 } // namespace duckdb

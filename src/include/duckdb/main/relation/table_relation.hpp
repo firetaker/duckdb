@@ -25,10 +25,12 @@ public:
 
 	const vector<ColumnDefinition> &Columns() override;
 	string ToString(idx_t depth) override;
-	string GetAlias() override;
+	Identifier GetAlias() override;
 
 	unique_ptr<TableRef> GetTableRef() override;
 
+	void Insert(const vector<vector<Value>> &values) override;
+	void Insert(vector<vector<unique_ptr<ParsedExpression>>> &&expressions) override;
 	void Update(const string &update, const string &condition = string()) override;
 	void Update(vector<string> column_names, vector<unique_ptr<ParsedExpression>> &&update,
 	            unique_ptr<ParsedExpression> condition = nullptr) override;

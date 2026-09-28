@@ -1,4 +1,5 @@
 #include "duckdb/function/scalar/generic_functions.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -6,6 +7,7 @@
 
 namespace duckdb {
 
+namespace {
 struct GetVariableBindData : FunctionData {
 	explicit GetVariableBindData(Value value_p) : value(std::move(value_p)) {
 	}
@@ -22,20 +24,20 @@ struct GetVariableBindData : FunctionData {
 	}
 };
 
-static unique_ptr<FunctionData> GetVariableBind(ClientContext &context, ScalarFunction &function,
-                                                vector<unique_ptr<Expression>> &arguments) {
-	if (arguments[0]->HasParameter() || arguments[0]->return_type.id() == LogicalTypeId::UNKNOWN) {
+unique_ptr<FunctionData> GetVariableBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
+	auto &function = input.GetBoundFunction();
+
+	if (arguments[0]->GetReturnType().id() == LogicalTypeId::UNKNOWN) {
 		throw ParameterNotResolvedException();
 	}
-	if (!arguments[0]->IsFoldable()) {
-		throw NotImplementedException("getvariable requires a constant input");
-	}
+	auto variable_name = input.GetConstant(0);
 	Value value;
-	auto variable_name = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
 	if (!variable_name.IsNull()) {
 		ClientConfig::GetConfig(context).GetUserVariable(variable_name.ToString(), value);
 	}
-	function.return_type = value.type();
+	function.SetReturnType(value.type());
 	return make_uniq<GetVariableBindData>(std::move(value));
 }
 
@@ -49,9 +51,12 @@ unique_ptr<Expression> BindGetVariableExpression(FunctionBindExpressionInput &in
 	return make_uniq<BoundConstantExpression>(bind_data.value);
 }
 
+} // namespace
+
 ScalarFunction GetVariableFun::GetFunction() {
-	ScalarFunction getvar("getvariable", {LogicalType::VARCHAR}, LogicalType::ANY, nullptr, GetVariableBind, nullptr);
-	getvar.bind_expression = BindGetVariableExpression;
+	ScalarFunction getvar("getvariable", {}, LogicalType::ANY, nullptr, GetVariableBind, nullptr);
+	getvar.GetSignature().AddParameter("variable_name", LogicalType::VARCHAR);
+	getvar.SetBindExpressionCallback(BindGetVariableExpression);
 	return getvar;
 }
 

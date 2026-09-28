@@ -4,12 +4,14 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 
 namespace duckdb {
 
-PhysicalLimitPercent::PhysicalLimitPercent(vector<LogicalType> types, BoundLimitNode limit_val_p,
-                                           BoundLimitNode offset_val_p, idx_t estimated_cardinality)
-    : PhysicalOperator(PhysicalOperatorType::LIMIT_PERCENT, std::move(types), estimated_cardinality),
+PhysicalLimitPercent::PhysicalLimitPercent(PhysicalPlan &physical_plan, vector<LogicalType> types,
+                                           BoundLimitNode limit_val_p, BoundLimitNode offset_val_p,
+                                           idx_t estimated_cardinality)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::LIMIT_PERCENT, std::move(types), estimated_cardinality),
       limit_val(std::move(limit_val_p)), offset_val(std::move(offset_val_p)) {
 	D_ASSERT(limit_val.Type() == LimitNodeType::CONSTANT_PERCENTAGE ||
 	         limit_val.Type() == LimitNodeType::EXPRESSION_PERCENTAGE);
@@ -102,7 +104,7 @@ SinkResultType PhysicalLimitPercent::Sink(ExecutionContext &context, DataChunk &
 //===--------------------------------------------------------------------===//
 class LimitPercentOperatorState : public GlobalSourceState {
 public:
-	explicit LimitPercentOperatorState(const PhysicalLimitPercent &op) : current_offset(0) {
+	explicit LimitPercentOperatorState(const PhysicalLimitPercent &op) : current_offset(0), limit_validated(false) {
 		D_ASSERT(op.sink_state);
 		auto &gstate = op.sink_state->Cast<LimitPercentGlobalState>();
 		gstate.data.InitializeScan(scan_state);
@@ -111,14 +113,39 @@ public:
 	ColumnDataScanState scan_state;
 	optional_idx limit;
 	idx_t current_offset;
+	atomic<bool> limit_validated;
+	//! The number of rows that will be emitted, the rows scanned so far and whether the source finished
+	atomic<idx_t> total_rows {0};
+	atomic<idx_t> scanned_rows {0};
+	atomic<bool> finished {false};
 };
 
 unique_ptr<GlobalSourceState> PhysicalLimitPercent::GetGlobalSourceState(ClientContext &context) const {
 	return make_uniq<LimitPercentOperatorState>(*this);
 }
 
-SourceResultType PhysicalLimitPercent::GetData(ExecutionContext &context, DataChunk &chunk,
-                                               OperatorSourceInput &input) const {
+ProgressData PhysicalLimitPercent::GetProgress(ClientContext &context, GlobalSourceState &gstate) const {
+	auto &state = gstate.Cast<LimitPercentOperatorState>();
+	if (state.finished.load(std::memory_order_relaxed)) {
+		return ProgressData {1.0, 1.0, false};
+	}
+	auto total_rows = state.total_rows.load(std::memory_order_relaxed);
+	if (total_rows == 0) {
+		return ProgressData {0.0, 1.0, false};
+	}
+	auto scanned_rows = MinValue<idx_t>(state.scanned_rows.load(std::memory_order_relaxed), total_rows);
+	return ProgressData {double(scanned_rows), double(total_rows), false};
+}
+
+void PhysicalLimitPercent::SourceFinished(ClientContext &context, GlobalSourceState &gstate) const {
+	auto &state = gstate.Cast<LimitPercentOperatorState>();
+	if (state.limit_validated.load(std::memory_order_relaxed)) {
+		state.finished.store(true, std::memory_order_relaxed);
+	}
+}
+
+SourceResultType PhysicalLimitPercent::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                       OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<LimitPercentGlobalState>();
 	auto &state = input.global_state.Cast<LimitPercentOperatorState>();
 	auto &percent_limit = gstate.limit_percent;
@@ -131,6 +158,7 @@ SourceResultType PhysicalLimitPercent::GetData(ExecutionContext &context, DataCh
 			// no limit value and we have not set limit_percent
 			// we are running LIMIT % with a subquery over an empty table
 			D_ASSERT(gstate.data.Count() == 0);
+			state.limit_validated.store(true, std::memory_order_relaxed);
 			return SourceResultType::FINISHED;
 		}
 		idx_t count = gstate.data.Count();
@@ -146,6 +174,8 @@ SourceResultType PhysicalLimitPercent::GetData(ExecutionContext &context, DataCh
 		} else {
 			limit = idx_t(limit_percentage);
 		}
+		state.total_rows.store(MinValue<idx_t>(limit.GetIndex(), gstate.data.Count()), std::memory_order_relaxed);
+		state.limit_validated.store(true, std::memory_order_relaxed);
 		if (limit == 0) {
 			return SourceResultType::FINISHED;
 		}
@@ -159,8 +189,24 @@ SourceResultType PhysicalLimitPercent::GetData(ExecutionContext &context, DataCh
 	}
 
 	PhysicalLimit::HandleOffset(chunk, current_offset, 0, limit.GetIndex());
+	state.scanned_rows.store(current_offset, std::memory_order_relaxed);
 
 	return SourceResultType::HAVE_MORE_OUTPUT;
+}
+
+InsertionOrderPreservingMap<string> PhysicalLimitPercent::ParamsToString() const {
+	InsertionOrderPreservingMap<string> result;
+	if (limit_val.Type() == LimitNodeType::CONSTANT_PERCENTAGE) {
+		result["Limit"] = to_string(limit_val.GetConstantPercentage()) + "%";
+	}
+	if (offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
+		auto offset = offset_val.GetConstantValue();
+		if (offset > 0) {
+			result["Offset"] = to_string(offset);
+		}
+	}
+	SetEstimatedCardinality(result, estimated_cardinality);
+	return result;
 }
 
 } // namespace duckdb

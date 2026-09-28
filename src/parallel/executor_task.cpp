@@ -21,6 +21,8 @@ ExecutorTask::~ExecutorTask() {
 	if (thread_context) {
 		executor.Flush(*thread_context);
 	}
+	thread_context.reset();
+	event.reset();
 	executor.UnregisterTask();
 }
 
@@ -55,7 +57,7 @@ TaskExecutionResult ExecutorTask::Execute(TaskExecutionMode mode) {
 	} catch (std::exception &ex) {
 		executor.PushError(ErrorData(ex));
 	} catch (...) { // LCOV_EXCL_START
-		executor.PushError(ErrorData("Unknown exception in Finalize!"));
+		executor.PushError(ErrorData("Unknown exception in ExecutorTask::Execute"));
 	} // LCOV_EXCL_STOP
 	return TaskExecutionResult::TASK_ERROR;
 }

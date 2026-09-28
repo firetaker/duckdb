@@ -4,12 +4,14 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/statistics/distinct_statistics.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/type_catalog_entry.hpp"
 
 namespace duckdb {
 
-PhysicalVacuum::PhysicalVacuum(unique_ptr<VacuumInfo> info_p, optional_ptr<TableCatalogEntry> table,
-                               unordered_map<idx_t, idx_t> column_id_map, idx_t estimated_cardinality)
-    : PhysicalOperator(PhysicalOperatorType::VACUUM, {LogicalType::BOOLEAN}, estimated_cardinality),
+PhysicalVacuum::PhysicalVacuum(PhysicalPlan &physical_plan, unique_ptr<VacuumInfo> info_p,
+                               optional_ptr<TableCatalogEntry> table, unordered_map<idx_t, idx_t> column_id_map,
+                               idx_t estimated_cardinality)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::VACUUM, {LogicalType::BOOLEAN}, estimated_cardinality),
       info(std::move(info_p)), table(table), column_id_map(std::move(column_id_map)) {
 }
 
@@ -89,6 +91,9 @@ SinkCombineResultType PhysicalVacuum::Combine(ExecutionContext &context, Operato
 SinkFinalizeType PhysicalVacuum::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                           OperatorSinkFinalizeInput &input) const {
 	auto &sink = input.global_state.Cast<VacuumGlobalSinkState>();
+	if (!table->IsDuckTable()) {
+		throw NotImplementedException("Vacuum is only implemented for DuckDB tables");
+	}
 
 	auto tbl = table;
 	for (idx_t col_idx = 0; col_idx < sink.column_distinct_stats.size(); col_idx++) {
@@ -101,8 +106,8 @@ SinkFinalizeType PhysicalVacuum::Finalize(Pipeline &pipeline, Event &event, Clie
 	return SinkFinalizeType::READY;
 }
 
-SourceResultType PhysicalVacuum::GetData(ExecutionContext &context, DataChunk &chunk,
-                                         OperatorSourceInput &input) const {
+SourceResultType PhysicalVacuum::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                 OperatorSourceInput &input) const {
 	// NOP
 	return SourceResultType::FINISHED;
 }

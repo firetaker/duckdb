@@ -115,6 +115,16 @@ struct Atan2Fun {
 	static ScalarFunction GetFunction();
 };
 
+struct BinomFun {
+	static constexpr const char *Name = "binom";
+	static constexpr const char *Parameters = "n,k";
+	static constexpr const char *Description = "Returns binom(n,k)";
+	static constexpr const char *Example = "binom(5,2)";
+	static constexpr const char *Categories = "";
+
+	static ScalarFunction GetFunction();
+};
+
 struct BitCountFun {
 	static constexpr const char *Name = "bit_count";
 	static constexpr const char *Parameters = "x";
@@ -325,7 +335,7 @@ struct Log10Fun {
 
 struct LogFun {
 	static constexpr const char *Name = "log";
-	static constexpr const char *Parameters = "b, x";
+	static constexpr const char *Parameters = "b,x";
 	static constexpr const char *Description = "Computes the logarithm of x to base b. b may be omitted, in which case the default 10";
 	static constexpr const char *Example = "log(2, 64)";
 	static constexpr const char *Categories = "";
@@ -335,7 +345,7 @@ struct LogFun {
 
 struct NextAfterFun {
 	static constexpr const char *Name = "nextafter";
-	static constexpr const char *Parameters = "x, y";
+	static constexpr const char *Parameters = "x,y";
 	static constexpr const char *Description = "Returns the next floating point value after x in the direction of y";
 	static constexpr const char *Example = "nextafter(1::float, 2::float)";
 	static constexpr const char *Categories = "";
@@ -371,6 +381,22 @@ struct RoundFun {
 	static constexpr const char *Categories = "";
 
 	static ScalarFunctionSet GetFunctions();
+};
+
+struct RoundEvenFun {
+	static constexpr const char *Name = "round_even";
+	static constexpr const char *Parameters = "x,precision";
+	static constexpr const char *Description = "Rounds x to s decimal places, rounding halfway cases to the nearest even digit";
+	static constexpr const char *Example = "round_even(24.5, 0)";
+	static constexpr const char *Categories = "";
+
+	static ScalarFunctionSet GetFunctions();
+};
+
+struct RoundbankersFun {
+	using ALIAS = RoundEvenFun;
+
+	static constexpr const char *Name = "roundbankers";
 };
 
 struct SignFun {
@@ -425,7 +451,7 @@ struct TanFun {
 
 struct TruncFun {
 	static constexpr const char *Name = "trunc";
-	static constexpr const char *Parameters = "x";
+	static constexpr const char *Parameters = "x,precision";
 	static constexpr const char *Description = "Truncates the number";
 	static constexpr const char *Example = "trunc(17.4)";
 	static constexpr const char *Categories = "";

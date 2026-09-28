@@ -1,5 +1,7 @@
 #include "interpreted_benchmark.hpp"
 
+#include "duckdb/common/types/column/column_data_collection.hpp"
+
 #include "benchmark_runner.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -11,11 +13,17 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/common/arrow/physical_arrow_collector.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
+#include "debug_fs_extension.hpp"
 
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 
 namespace duckdb {
+
+static constexpr const char *BENCHMARK_EXTENSION_DIRECTORY_ENV = "DUCKDB_BENCHMARK_EXTENSION_DIRECTORY";
 
 static string ParseGroupFromPath(string file) {
 	string extension = "";
@@ -41,22 +49,33 @@ struct InterpretedBenchmarkState : public BenchmarkState {
 	duckdb::unique_ptr<DBConfig> benchmark_config;
 	DuckDB db;
 	Connection con;
-	duckdb::unique_ptr<MaterializedQueryResult> result;
+	duckdb::unique_ptr<QueryResult> result;
 
 	explicit InterpretedBenchmarkState(string path, const string &version)
 	    : benchmark_config(GetBenchmarkConfig(version)),
 	      db(path.empty() ? nullptr : path.c_str(), benchmark_config.get()), con(db) {
+		//! Statically load the debug_fs extension so benchmarks can inject artificial I/O latency
+		//! (e.g. SET GLOBAL debug_fs_delay_mean_ms=...), mirroring how the unittest runner loads it.
+		db.LoadStaticExtension<DebugFsExtension>();
 		auto &instance = BenchmarkRunner::GetInstance();
 		auto res = con.Query("PRAGMA threads=" + to_string(instance.threads));
 		D_ASSERT(!res->HasError());
+		if (!instance.memory_limit.empty()) {
+			res = con.Query("PRAGMA memory_limit='" + instance.memory_limit + "'");
+			D_ASSERT(!res->HasError());
+		}
 	}
 
 	duckdb::unique_ptr<DBConfig> GetBenchmarkConfig(const string &version = "") {
 		auto result = make_uniq<DBConfig>();
 		if (!version.empty()) {
-			result->options.serialization_compatibility = SerializationCompatibility::FromString(version);
+			result->options.storage_compatibility = StorageCompatibility::FromString(version);
 		}
 		result->options.load_extensions = false;
+		auto extension_directory = std::getenv(BENCHMARK_EXTENSION_DIRECTORY_ENV);
+		if (extension_directory && extension_directory[0]) {
+			result->SetOptionByName("allow_unsigned_extensions", true);
+		}
 		return result;
 	}
 };
@@ -137,7 +156,7 @@ BenchmarkQuery InterpretedBenchmark::ReadQueryFromReader(BenchmarkFileReader &re
 			break;
 		}
 		auto result_splits = StringUtil::Split(line, "\t");
-		if ((int64_t)result_splits.size() != query.column_count) {
+		if (result_splits.size() != query.column_count) {
 			throw std::runtime_error(reader.FormatException("expected " + std::to_string(result_splits.size()) +
 			                                                " values but got " + std::to_string(query.column_count)));
 		}
@@ -151,6 +170,15 @@ static void ThrowResultModeError(BenchmarkFileReader &reader) {
 	auto error = StringUtil::Format("Invalid argument for resultmode, valid options are: %s",
 	                                StringUtil::Join(valid_options, ", "));
 	throw std::runtime_error(reader.FormatException(error));
+}
+
+void InterpretedBenchmark::AddExtension(const string &extension, bool load_only) {
+	auto &map = load_only ? load_extensions_map : extensions_map;
+	auto it = map.find(extension);
+	if (it != map.end()) {
+		return;
+	}
+	map.insert(extension, map.size());
 }
 
 void InterpretedBenchmark::ProcessFile(const string &path) {
@@ -207,20 +235,25 @@ void InterpretedBenchmark::ProcessFile(const string &path) {
 					throw std::runtime_error(
 					    reader.FormatException("require only supports load_only as a second parameter"));
 				}
-				load_extensions.insert(splits[1]);
+				AddExtension(splits[1], true);
 			} else {
-				extensions.insert(splits[1]);
+				AddExtension(splits[1], false);
 			}
 		} else if (splits[0] == "resultmode") {
 			if (splits.size() < 2) {
 				ThrowResultModeError(reader);
 			}
 			if (splits[1] == "streaming") {
-				if (splits.size() != 2) {
+				if (splits.size() > 3) {
 					throw std::runtime_error(
-					    reader.FormatException("resultmode 'streaming' does not accept a parameter"));
+					    reader.FormatException("resultmode 'streaming' accepts one optional drain mode"));
 				}
-				result_type = QueryResultType::STREAM_RESULT;
+				if (splits.size() == 3 && splits[2] != "drop" && splits[2] != "materialize") {
+					throw std::runtime_error(
+					    reader.FormatException("resultmode 'streaming' drain mode must be 'materialize' or 'drop'"));
+				}
+				discard_stream_result = splits.size() == 3 && splits[2] == "drop";
+				result_mode = BenchmarkResultMode::STREAMING;
 			} else if (splits[1] == "arrow") {
 				arrow_batch_size = STANDARD_VECTOR_SIZE;
 				if (splits.size() == 3) {
@@ -231,13 +264,13 @@ void InterpretedBenchmark::ProcessFile(const string &path) {
 					throw std::runtime_error(reader.FormatException(
 					    "resultmode 'arrow' only takes 1 optional extra parameter (batch_size)"));
 				}
-				result_type = QueryResultType::ARROW_RESULT;
+				result_mode = BenchmarkResultMode::ARROW;
 			} else if (splits[1] == "materialized") {
 				if (splits.size() != 2) {
 					throw std::runtime_error(
 					    reader.FormatException("resultmode 'materialized' does not accept a parameter"));
 				}
-				result_type = QueryResultType::MATERIALIZED_RESULT;
+				result_mode = BenchmarkResultMode::RETAINED;
 			} else {
 				ThrowResultModeError(reader);
 			}
@@ -470,15 +503,36 @@ void InterpretedBenchmark::LoadBenchmark() {
 		throw InvalidInputException("Invalid benchmark file: no \"run\" query specified");
 	}
 	run_query = queries["run"];
+	if (discard_stream_result && !result_queries.empty()) {
+		throw InvalidInputException(
+		    "Invalid benchmark file: resultmode 'streaming drop' discards the result and cannot verify it");
+	}
 	is_loaded = true;
 }
 
-void LoadExtensions(InterpretedBenchmarkState &state, const std::unordered_set<string> &extensions_to_load) {
-	for (auto &extension : extensions_to_load) {
+void InterpretedBenchmark::LoadExtensions(InterpretedBenchmarkState &state, bool is_load_set) {
+	auto &map = is_load_set ? load_extensions_map : extensions_map;
+	for (auto &it : map) {
+		auto &extension = it.first;
 		auto result = ExtensionHelper::LoadExtension(state.db, extension);
 		if (result == ExtensionLoadResult::EXTENSION_UNKNOWN) {
 			throw InvalidInputException("Unknown extension " + extension);
 		} else if (result == ExtensionLoadResult::NOT_LOADED) {
+			auto extension_directory = std::getenv(BENCHMARK_EXTENSION_DIRECTORY_ENV);
+			if (extension_directory && extension_directory[0]) {
+				auto fs = FileSystem::CreateLocal();
+				auto extension_path = fs->JoinPath(extension_directory, extension + ".duckdb_extension");
+				if (!fs->FileExists(extension_path)) {
+					throw InvalidInputException("Extension %s is not linked and was not found at %s", extension,
+					                            extension_path);
+				}
+				auto load_result = state.con.Query("LOAD " + SQLString(extension_path));
+				if (load_result->HasError()) {
+					throw InvalidInputException("Failed to load benchmark extension %s from %s: %s", extension,
+					                            extension_path, load_result->GetError());
+				}
+				continue;
+			}
 			throw InvalidInputException("Extension " + extension +
 			                            " is not available/was not compiled. Cannot run this benchmark.");
 		}
@@ -486,7 +540,7 @@ void LoadExtensions(InterpretedBenchmarkState &state, const std::unordered_set<s
 }
 
 unique_ptr<QueryResult> InterpretedBenchmark::RunLoadQuery(InterpretedBenchmarkState &state, const string &load_query) {
-	LoadExtensions(state, load_extensions);
+	LoadExtensions(state, true);
 	auto result = state.con.Query(load_query);
 	for (idx_t i = 0; i < retry_load; i++) {
 		if (!result->HasError()) {
@@ -494,7 +548,7 @@ unique_ptr<QueryResult> InterpretedBenchmark::RunLoadQuery(InterpretedBenchmarkS
 		}
 		result = state.con.Query(load_query);
 	}
-	return unique_ptr_cast<MaterializedQueryResult, QueryResult>(std::move(result));
+	return result;
 }
 
 unique_ptr<BenchmarkState> InterpretedBenchmark::Initialize(BenchmarkConfiguration &config) {
@@ -510,10 +564,10 @@ unique_ptr<BenchmarkState> InterpretedBenchmark::Initialize(BenchmarkConfigurati
 		DeleteDatabase(full_db_path);
 		state = make_uniq<InterpretedBenchmarkState>(full_db_path, storage_version);
 	}
-	extensions.insert("core_functions");
-	extensions.insert("parquet");
+	AddExtension("core_functions", false);
+	AddExtension("parquet", false);
 
-	LoadExtensions(*state, extensions);
+	LoadExtensions(*state, false);
 	if (queries.find("init") != queries.end()) {
 		string init_query = queries["init"];
 		result = state->con.Query(init_query);
@@ -602,16 +656,16 @@ string InterpretedBenchmark::GetQuery() {
 }
 
 ScopedConfigSetting PrepareResultCollector(ClientConfig &config, InterpretedBenchmark &benchmark) {
-	auto result_type = benchmark.ResultMode();
-	if (result_type == QueryResultType::ARROW_RESULT) {
+	if (benchmark.ResultMode() == BenchmarkResultMode::ARROW) {
 		return ScopedConfigSetting(
 		    config,
 		    [&benchmark](ClientConfig &config) {
-			    config.result_collector = [&benchmark](ClientContext &context, PreparedStatementData &data) {
+			    config.get_result_collector =
+			        [&benchmark](ClientContext &context, PreparedStatementData &data) -> unique_ptr<PhysicalOperator> {
 				    return PhysicalArrowCollector::Create(context, data, benchmark.ArrowBatchSize());
 			    };
 		    },
-		    [](ClientConfig &config) { config.result_collector = nullptr; });
+		    [](ClientConfig &config) { config.get_result_collector = nullptr; });
 	}
 	return ScopedConfigSetting(config);
 }
@@ -638,21 +692,52 @@ void InterpretedBenchmark::Run(BenchmarkState *state_p) {
 
 	auto &config = ClientConfig::GetConfig(*context);
 	auto result_collector_setting = PrepareResultCollector(config, *this);
-	const bool use_streaming = result_type == QueryResultType::STREAM_RESULT;
-	auto temp_result = context->Query(run_query, use_streaming);
-	if (temp_result->type != result_type) {
-		throw InternalException("Query did not produce the right result type, expected %s but got %s",
-		                        EnumUtil::ToString(result_type), EnumUtil::ToString(temp_result->type));
+	if (result_mode == BenchmarkResultMode::STREAMING) {
+		auto handle = context->Submit(run_query, QueryParameters());
+		if (handle->HasError()) {
+			state.result = std::move(handle);
+			return;
+		}
+		auto statement_type = handle->GetStatementType();
+		auto properties = handle->GetStatementProperties();
+		auto names = handle->GetNames();
+		auto client_properties = handle->client_properties;
+		QueryResultStream stream(std::move(handle));
+		unique_ptr<ColumnDataCollection> collection;
+		ColumnDataAppendState append_state;
+		if (!discard_stream_result) {
+			collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), stream.GetTypes());
+			collection->InitializeAppend(append_state);
+		}
+		while (auto chunk = stream.Fetch()) {
+			if (chunk->size() == 0) {
+				break;
+			}
+			if (collection) {
+				collection->Append(append_state, *chunk);
+			}
+		}
+		if (stream.HasError()) {
+			state.result = make_uniq<QueryResult>(stream.GetErrorObject());
+		} else if (collection) {
+			state.result =
+			    make_uniq<QueryResult>(statement_type, properties, names, std::move(collection), client_properties);
+		} else {
+			state.result = nullptr;
+		}
+		return;
 	}
-	if (temp_result->type == QueryResultType::STREAM_RESULT) {
-		auto &stream_query = temp_result->Cast<StreamQueryResult>();
-		state.result = stream_query.Materialize();
-	} else if (temp_result->type == QueryResultType::ARROW_RESULT) {
+	auto temp_result = context->Query(run_query, QueryParameters());
+	if (result_mode == BenchmarkResultMode::ARROW) {
+		if (temp_result->GetResultType() != QueryResultType::ARROW_RESULT) {
+			throw InternalException("Query did not produce an Arrow result, but %s",
+			                        EnumUtil::ToString(temp_result->GetResultType()));
+		}
 		/* no-op, this is only used to test the overhead of the result collector */
 		state.result = nullptr;
-	} else {
-		state.result = unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(std::move(temp_result));
+		return;
 	}
+	state.result = std::move(temp_result);
 }
 
 void InterpretedBenchmark::Cleanup(BenchmarkState *state_p) {
@@ -683,13 +768,12 @@ string InterpretedBenchmark::GetDatabasePath() {
 	return db_path;
 }
 
-string InterpretedBenchmark::VerifyInternal(BenchmarkState *state_p, const BenchmarkQuery &query,
-                                            MaterializedQueryResult &result) {
+string InterpretedBenchmark::VerifyInternal(BenchmarkState *state_p, const BenchmarkQuery &query, QueryResult &result) {
 	auto &state = (InterpretedBenchmarkState &)*state_p;
 
 	auto &result_values = query.expected_result;
 	D_ASSERT(query.column_count >= 1);
-	if (query.column_count != (int64_t)result.ColumnCount()) {
+	if (query.column_count != result.ColumnCount()) {
 		return StringUtil::Format("Error in result: expected %lld columns but got %lld\nObtained result: %s",
 		                          (int64_t)query.column_count, (int64_t)result.ColumnCount(), result.ToString());
 	}
@@ -700,8 +784,8 @@ string InterpretedBenchmark::VerifyInternal(BenchmarkState *state_p, const Bench
 		                          (int64_t)result_values.size(), (int64_t)result.RowCount(), result.ToString());
 	}
 	// compare values
-	for (int64_t r = 0; r < (int64_t)result_values.size(); r++) {
-		for (int64_t c = 0; c < query.column_count; c++) {
+	for (idx_t r = 0; r < result_values.size(); r++) {
+		for (idx_t c = 0; c < query.column_count; c++) {
 			auto value = result.GetValue(c, r);
 			if (result_values[r][c] == "NULL" && value.IsNull()) {
 				continue;
@@ -732,7 +816,7 @@ string InterpretedBenchmark::VerifyInternal(BenchmarkState *state_p, const Bench
 string InterpretedBenchmark::Verify(BenchmarkState *state_p) {
 	auto &state = (InterpretedBenchmarkState &)*state_p;
 	if (!state.result) {
-		D_ASSERT(result_type != QueryResultType::MATERIALIZED_RESULT);
+		D_ASSERT(result_mode != BenchmarkResultMode::RETAINED);
 		return string();
 	}
 
@@ -753,15 +837,20 @@ string InterpretedBenchmark::Verify(BenchmarkState *state_p) {
 	// we are running a result query
 	// store the current result in a table called "__answer"
 	auto &collection = state.result->Collection();
-	auto &names = state.result->names;
-	auto &types = state.result->types;
+	auto &names = state.result->GetNames();
+	auto &types = state.result->GetTypes();
+	identifier_set_t name_set;
 	// first create the (empty) table
 	string create_tbl = "CREATE OR REPLACE TEMP TABLE __answer(";
 	for (idx_t i = 0; i < names.size(); i++) {
+		if (!name_set.insert(names[i]).second) {
+			auto err_str = StringUtil::Format("Duplicate column name \"%s\" in benchmark query", names[i]);
+			throw std::runtime_error(err_str);
+		}
 		if (i > 0) {
 			create_tbl += ", ";
 		}
-		create_tbl += KeywordHelper::WriteOptionallyQuoted(names[i]);
+		create_tbl += SQLIdentifier(names[i]);
 		create_tbl += " ";
 		create_tbl += types[i].ToString();
 	}

@@ -148,6 +148,36 @@ results in:
 ...
 ```
 
+# Reporting an extension version
+
+An extension can report its version through the `EXT_VERSION_<NAME_UPPERCASE>` macro, which DuckDB defines to
+the extension version configured at build time:
+```cpp
+std::string ParquetExtension::Version() const {
+#ifdef EXT_VERSION_PARQUET
+	return EXT_VERSION_PARQUET;
+#else
+	return "";
+#endif
+}
+```
+By default the macro is defined for every source file of the extension, including any third party code it
+vendors. Since the version defaults to a git commit hash - DuckDB's for in-tree extensions, the extension's own
+otherwise - that puts a value which changes on every commit on all of their compiler command lines, forcing a
+recompile of the whole extension for a string that a single file reads.
+
+An extension avoids that by declaring which of its sources actually read the macro, in its own `CMakeLists.txt`:
+```cmake
+project(ParquetExtension)
+
+# Before any subdirectory or target, which would otherwise inherit the directory-wide definition
+set_extension_version_sources(parquet parquet_extension.cpp)
+```
+Only the listed sources then get `EXT_VERSION_<NAME>`, and a version change recompiles those rather than
+everything. It has to be called before the extension declares any targets or adds any subdirectories, because
+those inherit the directory-wide definition at the point they are created. Out-of-tree extensions can use it
+too; their version is their own commit hash, so it changes on every commit in their repository.
+
 # VCPKG dependency management
 DuckDB extensions can use [VCPKG](https://vcpkg.io/en/) to manage their dependencies. Check out the [Extension Template](https://github.com/duckdb/extension-template) for an example
 on how to set up vcpkg in extensions. 
@@ -183,3 +213,28 @@ USE_MERGED_VCPKG_MANIFEST=1 VCPKG_TOOLCHAIN_PATH="/path/to/your/vcpkg/installati
 ```
 which will use the merged manifest to install all required dependencies, build `extension_1` and `extension_2`, build DuckDB, 
 and finally link both extensions into DuckDB.
+
+# Linking the static archives by hand
+Outside of CMake, a program links one archive per extension it wants, compiles a generated static extension loader,
+and puts the engine archive last:
+```shell
+LINK_EXTENSIONS="parquet;json" make static_extension_loader     # writes build/release/static_extension_loader.c
+cc -I src/include main.c build/release/static_extension_loader.c libparquet_extension.a libjson_extension.a libduckdb_static.a -lstdc++
+```
+Each extension archive carries a describe function, `duckdb_extension_<name>_describe`, that fills in a
+`duckdb_extension_descriptor` (see `duckdb_static_extension.h`). The loader is plain C: it defines
+`duckdb_register_static_extensions()`, which passes every describe function to `duckdb_register_static_extension`, and that also
+pulls the extensions out of their archives. Call it before opening a database, from any language that can call C. A
+C++ program that wants this to happen before main compiles `extension/loader/static_extension_autoregister.cpp` next to
+the loader, into the program itself rather than into an archive, or the linker drops it. Without `LINK_EXTENSIONS`
+the loader registers every extension archive in the build. A program can also skip the loader and call
+`duckdb_register_static_extension` on the describe functions it declares itself. An archive whose describe function is
+not registered contributes nothing, and a registered one whose archive is missing fails the link. CMake targets get all of this from
+`link_extension_libraries`.
+
+A loadable extension is the same archive linked as a shared library with its entry point exported, next to the
+engine archive when it is built to carry its own copy of DuckDB:
+```shell
+c++ -shared -o parquet.duckdb_extension libparquet_extension.a libduckdb_static.a -Wl,-exported_symbol,_parquet_duckdb_cpp_init
+```
+The describe function is never taken there, since nothing registers it.

@@ -1,3 +1,5 @@
+#include "duckdb/common/vector/map_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/function/scalar/system_functions.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_data.hpp"
@@ -12,6 +14,8 @@
 
 namespace duckdb {
 
+namespace {
+
 struct ParseLogMessageData : FunctionData {
 	explicit ParseLogMessageData(const LogType &log_type_p) : log_type(log_type_p) {
 	}
@@ -25,22 +29,22 @@ struct ParseLogMessageData : FunctionData {
 	}
 };
 
-unique_ptr<FunctionData> ParseLogMessageBind(ClientContext &context, ScalarFunction &bound_function,
-                                             vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> ParseLogMessageBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 
 	if (arguments.size() != 2) {
-		throw BinderException("structured_log_schema: expects 1 argument", arguments[0]->alias);
+		throw BinderException("structured_log_schema: expects 1 argument", arguments[0]->GetAlias());
 	}
 
-	if (!arguments[0]->IsFoldable()) {
-		throw BinderException("structured_log_schema: argument '%s' must be constant", arguments[0]->alias);
-	}
+	auto type_val = input.GetConstant(0);
 
-	if (arguments[0]->return_type.id() != LogicalTypeId::VARCHAR) {
+	if (arguments[0]->GetReturnType().id() != LogicalTypeId::VARCHAR) {
 		throw BinderException("structured_log_schema: 'log_type' argument must be a string");
 	}
 
-	auto type = StringValue::Get(ExpressionExecutor::EvaluateScalar(context, *arguments[0]));
+	auto type = StringValue::Get(type_val);
 
 	auto lookup = LogManager::Get(context).LookupLogType(type);
 
@@ -51,30 +55,36 @@ unique_ptr<FunctionData> ParseLogMessageBind(ClientContext &context, ScalarFunct
 	if (!lookup->is_structured) {
 		// Unstructured types we simply wrap in a struct with a single field called message
 		child_list_t<LogicalType> children = {{"message", LogicalType::VARCHAR}};
-		bound_function.return_type = LogicalType::STRUCT(children);
+		bound_function.SetReturnType(LogicalType::STRUCT(children));
 	} else {
-		bound_function.return_type = lookup->type;
+		D_ASSERT(lookup->type.IsNested());
+		bound_function.SetReturnType(lookup->type);
 	}
 
 	return make_uniq<ParseLogMessageData>(*lookup);
 }
 
-static void ParseLogMessageFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+void ParseLogMessageFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	const auto &info = func_expr.bind_info->Cast<ParseLogMessageData>();
+	const auto &info = func_expr.BindInfo()->Cast<ParseLogMessageData>();
 
 	if (info.log_type.is_structured) {
 		// TODO: allow more complex parsing operations than DefaultCast
 		VectorOperations::DefaultCast(args.data[1], result, args.size(), true);
 	} else {
 		auto &struct_entries = StructVector::GetEntries(result);
-		struct_entries[0]->Reference(args.data[1]);
+		struct_entries[0].Reference(args.data[1]);
 	}
 }
 
+} // namespace
+
 ScalarFunction ParseLogMessage::GetFunction() {
-	return ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::ANY, ParseLogMessageFunction,
-	                      ParseLogMessageBind, nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::INVALID));
+	auto fun = ScalarFunction({}, LogicalType::ANY, ParseLogMessageFunction, ParseLogMessageBind, nullptr, nullptr,
+	                          LogicalType(LogicalTypeId::INVALID));
+	fun.GetSignature().AddParameter("type", LogicalType::VARCHAR).AddParameter("message", LogicalType::VARCHAR);
+	fun.SetErrorMode(FunctionErrors::CAN_THROW_RUNTIME_ERROR);
+	return fun;
 }
 
 } // namespace duckdb

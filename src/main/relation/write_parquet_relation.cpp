@@ -7,7 +7,7 @@
 namespace duckdb {
 
 WriteParquetRelation::WriteParquetRelation(shared_ptr<Relation> child_p, string parquet_file_p,
-                                           case_insensitive_map_t<vector<Value>> options_p)
+                                           identifier_map_t<vector<Value>> options_p)
     : Relation(child_p->context, RelationType::WRITE_PARQUET_RELATION), child(std::move(child_p)),
       parquet_file(std::move(parquet_file_p)), options(std::move(options_p)) {
 	TryBindRelation(columns);
@@ -23,6 +23,14 @@ BoundStatement WriteParquetRelation::Bind(Binder &binder) {
 	info->options = options;
 	copy.info = std::move(info);
 	return binder.Bind(copy.Cast<SQLStatement>());
+}
+
+unique_ptr<QueryNode> WriteParquetRelation::GetQueryNode() {
+	throw InternalException("Cannot create a query node from a write parquet relation");
+}
+
+string WriteParquetRelation::GetQuery() {
+	return string();
 }
 
 const vector<ColumnDefinition> &WriteParquetRelation::Columns() {

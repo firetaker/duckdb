@@ -19,11 +19,12 @@ namespace duckdb {
 
 void ReorderTableEntries(catalog_entry_vector_t &tables);
 
-using std::stringstream;
+using duckdb::stringstream;
 
-PhysicalExport::PhysicalExport(vector<LogicalType> types, CopyFunction function, unique_ptr<CopyInfo> info,
-                               idx_t estimated_cardinality, unique_ptr<BoundExportData> exported_tables)
-    : PhysicalOperator(PhysicalOperatorType::EXPORT, std::move(types), estimated_cardinality),
+PhysicalExport::PhysicalExport(PhysicalPlan &physical_plan, vector<LogicalType> types, CopyFunction function,
+                               unique_ptr<CopyInfo> info, idx_t estimated_cardinality,
+                               unique_ptr<BoundExportData> exported_tables)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXPORT, std::move(types), estimated_cardinality),
       function(std::move(function)), info(std::move(info)), exported_tables(std::move(exported_tables)) {
 }
 
@@ -34,14 +35,14 @@ static void WriteCatalogEntries(stringstream &ss, catalog_entry_vector_t &entrie
 		}
 		auto create_info = entry.get().GetInfo();
 		try {
-			// Strip the catalog from the info
-			create_info->catalog.clear();
+			// the catalog is implied by the database the export is imported into - keep only the schema path
+			create_info->StripCatalogQualification();
 			auto to_string = create_info->ToString();
 			ss << to_string;
 		} catch (const NotImplementedException &) {
 			ss << entry.get().ToSQL();
 		}
-		ss << ";\n";
+		ss << '\n';
 	}
 	ss << '\n';
 }
@@ -54,40 +55,24 @@ static void WriteStringStreamToFile(FileSystem &fs, stringstream &ss, const stri
 	handle.reset();
 }
 
-static void WriteCopyStatement(FileSystem &fs, stringstream &ss, CopyInfo &info, ExportedTableData &exported_table,
-                               CopyFunction const &function) {
+static void WriteCopyStatement(FileSystem &fs, stringstream &ss, CopyInfo &info, ExportedTableData &exported_table) {
 	ss << "COPY ";
 
 	//! NOTE: The catalog is explicitly not set here
-	if (exported_table.schema_name != DEFAULT_SCHEMA && !exported_table.schema_name.empty()) {
-		ss << KeywordHelper::WriteOptionallyQuoted(exported_table.schema_name) << ".";
-	}
-
+	auto table_name = exported_table.qualified_name;
+	table_name.StripCatalog();
 	auto file_path = StringUtil::Replace(exported_table.file_path, "\\", "/");
-	ss << StringUtil::Format("%s FROM %s (", SQLIdentifier(exported_table.table_name), SQLString(file_path));
+	ss << StringUtil::Format("%s FROM %s (", table_name.ToString(QualifiedNameToStringMode::HIDE_DEFAULT_SCHEMA),
+	                         SQLString(file_path));
 	// write the copy options
 	ss << "FORMAT '" << info.format << "'";
 	if (info.format == "csv") {
-		// insert default csv options, if not specified
-		if (info.options.find("header") == info.options.end()) {
-			info.options["header"].push_back(Value::INTEGER(1));
-		}
-		if (info.options.find("delimiter") == info.options.end() && info.options.find("sep") == info.options.end() &&
-		    info.options.find("delim") == info.options.end()) {
-			info.options["delimiter"].push_back(Value(","));
-		}
-		if (info.options.find("quote") == info.options.end()) {
-			info.options["quote"].push_back(Value("\""));
-		}
 		info.options.erase("force_not_null");
 		for (auto &not_null_column : exported_table.not_null_columns) {
 			info.options["force_not_null"].push_back(not_null_column);
 		}
 	}
 	for (auto &copy_option : info.options) {
-		if (copy_option.first == "force_quote") {
-			continue;
-		}
 		if (copy_option.second.empty()) {
 			// empty options are interpreted as TRUE
 			copy_option.second.push_back(true);
@@ -219,8 +204,8 @@ catalog_entry_vector_t PhysicalExport::GetNaiveExportOrder(ClientContext &contex
 	return catalog_entries;
 }
 
-SourceResultType PhysicalExport::GetData(ExecutionContext &context, DataChunk &chunk,
-                                         OperatorSourceInput &input) const {
+SourceResultType PhysicalExport::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                 OperatorSourceInput &input) const {
 	auto &state = input.global_state.Cast<ExportSourceState>();
 	if (state.finished) {
 		return SourceResultType::FINISHED;
@@ -229,7 +214,7 @@ SourceResultType PhysicalExport::GetData(ExecutionContext &context, DataChunk &c
 	auto &ccontext = context.client;
 	auto &fs = FileSystem::GetFileSystem(ccontext);
 
-	auto &catalog = Catalog::GetCatalog(ccontext, info->catalog);
+	auto &catalog = Catalog::GetCatalog(ccontext, info->GetQualifiedName().Catalog());
 
 	catalog_entry_vector_t catalog_entries;
 	catalog_entries = GetNaiveExportOrder(context.client, catalog);
@@ -248,7 +233,7 @@ SourceResultType PhysicalExport::GetData(ExecutionContext &context, DataChunk &c
 	stringstream load_ss;
 	for (idx_t i = 0; i < exported_tables->data.size(); i++) {
 		auto exported_table_info = exported_tables->data[i].table_data;
-		WriteCopyStatement(fs, load_ss, *info, exported_table_info, function);
+		WriteCopyStatement(fs, load_ss, *info, exported_table_info);
 	}
 	WriteStringStreamToFile(fs, load_ss, fs.JoinPath(info->file_path, "load.sql"));
 	state.finished = true;

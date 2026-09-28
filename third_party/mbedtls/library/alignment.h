@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdlib.h>
 
+#if !defined(MBEDTLS_ALIGNMENT_DISABLE_EFFICENT_UNALIGNED_ACCESS)  //no-check-names
 /*
  * Define MBEDTLS_EFFICIENT_UNALIGNED_ACCESS for architectures where unaligned memory
  * accesses are known to be efficient.
@@ -35,7 +36,9 @@
  * device memory).
  */
 #define MBEDTLS_EFFICIENT_UNALIGNED_ACCESS
-#endif
+#endif /* __ARM_FEATURE_UNALIGNED || MBEDTLS_ARCH_IS_X86 || MBEDTLS_ARCH_IS_X64 ||
+        * MBEDTLS_PLATFORM_IS_WINDOWS_ON_ARM64 */
+#endif /* MBEDTLS_ALIGNMENT_DISABLE_EFFICENT_UNALIGNED_ACCESS */ //no-check-names
 
 #if defined(__IAR_SYSTEMS_ICC__) && \
     (defined(MBEDTLS_ARCH_IS_ARM64) || defined(MBEDTLS_ARCH_IS_ARM32) \
@@ -44,14 +47,31 @@
 #pragma language=extended
 #define MBEDTLS_POP_IAR_LANGUAGE_PRAGMA
 /* IAR recommend this technique for accessing unaligned data in
- * https://www.iar.com/knowledge/support/technical-notes/compiler/accessing-unaligned-data
+ * https://mypages.iar.com/s/article/Accessing-Unaligned-Data
  * This results in a single load / store instruction (if unaligned access is supported).
  * According to that document, this is only supported on certain architectures.
  */
-    #define UINT_UNALIGNED
+#define UINT_UNALIGNED
+
+/* Some products, like Zephyr, defines __packed as a macro for attribute(packed) and
+ * that does not work with typedefs, so if __packed is defined, undef it for the
+ * typedefs and restore it afterwards.
+ */
+#ifdef __packed
+#pragma push_macro("__packed")
+#undef __packed
+#define MBEDTLS_IAR_PACKED_MACRO_USED
+#endif
+
 typedef uint16_t __packed mbedtls_uint16_unaligned_t;
 typedef uint32_t __packed mbedtls_uint32_unaligned_t;
 typedef uint64_t __packed mbedtls_uint64_unaligned_t;
+
+#ifdef MBEDTLS_IAR_PACKED_MACRO_USED
+#undef MBEDTLS_IAR_PACKED_MACRO_USED
+#pragma pop_macro("__packed")
+#endif
+
 #elif defined(MBEDTLS_COMPILER_IS_GCC) && (MBEDTLS_GCC_VERSION >= 40504) && \
     ((MBEDTLS_GCC_VERSION < 60300) || (!defined(MBEDTLS_EFFICIENT_UNALIGNED_ACCESS)))
 /*
@@ -85,13 +105,13 @@ typedef uint64_t __packed mbedtls_uint64_unaligned_t;
  #define UINT_UNALIGNED_STRUCT
 typedef struct {
     uint16_t x;
-} __attribute__((packed)) mbedtls_uint16_unaligned_t;
+} __attribute__((packed, may_alias)) mbedtls_uint16_unaligned_t;
 typedef struct {
     uint32_t x;
-} __attribute__((packed)) mbedtls_uint32_unaligned_t;
+} __attribute__((packed, may_alias)) mbedtls_uint32_unaligned_t;
 typedef struct {
     uint64_t x;
-} __attribute__((packed)) mbedtls_uint64_unaligned_t;
+} __attribute__((packed, may_alias)) mbedtls_uint64_unaligned_t;
  #endif
 
 /*
@@ -112,7 +132,7 @@ typedef struct {
 #elif defined(__GNUC__)
 __attribute__((always_inline))
 #endif
-inline uint16_t mbedtls_get_unaligned_uint16(const void *p)
+static inline uint16_t mbedtls_get_unaligned_uint16(const void *p)
 {
     uint16_t r;
 #if defined(UINT_UNALIGNED)
@@ -139,7 +159,7 @@ inline uint16_t mbedtls_get_unaligned_uint16(const void *p)
 #elif defined(__GNUC__)
 __attribute__((always_inline))
 #endif
-inline void mbedtls_put_unaligned_uint16(void *p, uint16_t x)
+static inline void mbedtls_put_unaligned_uint16(void *p, uint16_t x)
 {
 #if defined(UINT_UNALIGNED)
     mbedtls_uint16_unaligned_t *p16 = (mbedtls_uint16_unaligned_t *) p;
@@ -164,7 +184,7 @@ inline void mbedtls_put_unaligned_uint16(void *p, uint16_t x)
 #elif defined(__GNUC__)
 __attribute__((always_inline))
 #endif
-inline uint32_t mbedtls_get_unaligned_uint32(const void *p)
+static inline uint32_t mbedtls_get_unaligned_uint32(const void *p)
 {
     uint32_t r;
 #if defined(UINT_UNALIGNED)
@@ -191,7 +211,7 @@ inline uint32_t mbedtls_get_unaligned_uint32(const void *p)
 #elif defined(__GNUC__)
 __attribute__((always_inline))
 #endif
-inline void mbedtls_put_unaligned_uint32(void *p, uint32_t x)
+static inline void mbedtls_put_unaligned_uint32(void *p, uint32_t x)
 {
 #if defined(UINT_UNALIGNED)
     mbedtls_uint32_unaligned_t *p32 = (mbedtls_uint32_unaligned_t *) p;
@@ -216,7 +236,7 @@ inline void mbedtls_put_unaligned_uint32(void *p, uint32_t x)
 #elif defined(__GNUC__)
 __attribute__((always_inline))
 #endif
-inline uint64_t mbedtls_get_unaligned_uint64(const void *p)
+static inline uint64_t mbedtls_get_unaligned_uint64(const void *p)
 {
     uint64_t r;
 #if defined(UINT_UNALIGNED)
@@ -243,7 +263,7 @@ inline uint64_t mbedtls_get_unaligned_uint64(const void *p)
 #elif defined(__GNUC__)
 __attribute__((always_inline))
 #endif
-inline void mbedtls_put_unaligned_uint64(void *p, uint64_t x)
+static inline void mbedtls_put_unaligned_uint64(void *p, uint64_t x)
 {
 #if defined(UINT_UNALIGNED)
     mbedtls_uint64_unaligned_t *p64 = (mbedtls_uint64_unaligned_t *) p;
@@ -277,15 +297,15 @@ inline void mbedtls_put_unaligned_uint64(void *p, uint64_t x)
 /*
  * Detect GCC built-in byteswap routines
  */
-#if defined(__GNUC__) && defined(__GNUC_PREREQ)
-#if __GNUC_PREREQ(4, 8)
+#if defined(__GNUC__)
+#if MBEDTLS_GCC_VERSION >= 40800
 #define MBEDTLS_BSWAP16 __builtin_bswap16
-#endif /* __GNUC_PREREQ(4,8) */
-#if __GNUC_PREREQ(4, 3)
+#endif
+#if MBEDTLS_GCC_VERSION >= 40300
 #define MBEDTLS_BSWAP32 __builtin_bswap32
 #define MBEDTLS_BSWAP64 __builtin_bswap64
-#endif /* __GNUC_PREREQ(4,3) */
-#endif /* defined(__GNUC__) && defined(__GNUC_PREREQ) */
+#endif
+#endif /* defined(__GNUC__) */
 
 /*
  * Detect Clang built-in byteswap routines
@@ -341,7 +361,7 @@ inline void mbedtls_put_unaligned_uint64(void *p, uint64_t x)
  * similar instruction.
  */
 #if !defined(MBEDTLS_BSWAP16)
-inline uint16_t mbedtls_bswap16(uint16_t x)
+static inline uint16_t mbedtls_bswap16(uint16_t x)
 {
     return
         (x & 0x00ff) << 8 |
@@ -351,7 +371,7 @@ inline uint16_t mbedtls_bswap16(uint16_t x)
 #endif /* !defined(MBEDTLS_BSWAP16) */
 
 #if !defined(MBEDTLS_BSWAP32)
-inline uint32_t mbedtls_bswap32(uint32_t x)
+static inline uint32_t mbedtls_bswap32(uint32_t x)
 {
     return
         (x & 0x000000ff) << 24 |
@@ -363,7 +383,7 @@ inline uint32_t mbedtls_bswap32(uint32_t x)
 #endif /* !defined(MBEDTLS_BSWAP32) */
 
 #if !defined(MBEDTLS_BSWAP64)
-inline uint64_t mbedtls_bswap64(uint64_t x)
+static inline uint64_t mbedtls_bswap64(uint64_t x)
 {
     return
         (x & 0x00000000000000ffULL) << 56 |

@@ -1,19 +1,13 @@
 #include "duckdb/function/scalar/string_functions.hpp"
-#include "duckdb/common/types/string_type.hpp"
-
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/string_type.hpp"
+#include "duckdb/function/scalar/string_common.hpp"
 
 namespace duckdb {
 
-static bool PrefixFunction(const string_t &str, const string_t &pattern);
+namespace {
 
-struct PrefixOperator {
-	template <class TA, class TB, class TR>
-	static inline TR Operation(TA left, TB right) {
-		return PrefixFunction(left, right);
-	}
-};
-static bool PrefixFunction(const string_t &str, const string_t &pattern) {
+bool PrefixFunction(const string_t &str, const string_t &pattern) {
 	auto str_length = str.GetSize();
 	auto patt_length = pattern.GetSize();
 	if (patt_length > str_length) {
@@ -58,11 +52,23 @@ static bool PrefixFunction(const string_t &str, const string_t &pattern) {
 	}
 }
 
+struct PrefixOperator {
+	template <class TA, class TB, class TR>
+	static inline TR Operation(TA left, TB right) {
+		return PrefixFunction(left, right);
+	}
+};
+
+} // namespace
+
 ScalarFunction PrefixFun::GetFunction() {
-	return ScalarFunction("prefix",                                     // name of the function
-	                      {LogicalType::VARCHAR, LogicalType::VARCHAR}, // argument list
-	                      LogicalType::BOOLEAN,                         // return type
-	                      ScalarFunction::BinaryFunction<string_t, string_t, bool, PrefixOperator>);
+	ScalarFunction function("prefix", {}, LogicalType::BOOLEAN,
+	                        ScalarFunction::BinaryFunction<string_t, string_t, bool, PrefixOperator>);
+	function.GetSignature()
+	    .AddParameter("string", LogicalType::VARCHAR)
+	    .AddParameter("search_string", LogicalType::VARCHAR);
+	function.SetFilterPruneCallback(PrefixFilterPrune);
+	return function;
 }
 
 } // namespace duckdb

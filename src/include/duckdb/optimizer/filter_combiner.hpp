@@ -12,14 +12,13 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/parser/expression_map.hpp"
 #include "duckdb/planner/expression.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
 
 #include "duckdb/storage/data_table.hpp"
 #include <functional>
 #include <map>
 
 namespace duckdb {
+class LogicalGet;
 class Optimizer;
 
 enum class ValueComparisonResult { PRUNE_LEFT, PRUNE_RIGHT, UNSATISFIABLE_CONDITION, PRUNE_NOTHING };
@@ -53,6 +52,8 @@ public:
 
 	void GenerateFilters(const std::function<void(unique_ptr<Expression> filter)> &callback);
 	bool HasFilters();
+	void GenerateEquivalentFilters(const Expression &filter,
+	                               const std::function<void(unique_ptr<Expression> filter)> &callback);
 	TableFilterSet GenerateTableScanFilters(const vector<ColumnIndex> &column_ids,
 	                                        vector<FilterPushdownResult> &pushdown_results);
 
@@ -61,8 +62,8 @@ public:
 private:
 	FilterResult AddFilter(Expression &expr);
 	FilterResult AddBoundComparisonFilter(Expression &expr);
-	FilterResult AddTransitiveFilters(BoundComparisonExpression &comparison, bool is_root = true);
-	unique_ptr<Expression> FindTransitiveFilter(Expression &expr);
+	FilterResult AddTransitiveFilters(BoundFunctionExpression &comparison, bool is_root = true);
+	unique_ptr<Expression> FindTransitiveFilter(const Expression &expr);
 	Expression &GetNode(Expression &expr);
 	idx_t GetEquivalenceSet(Expression &expr);
 	FilterResult AddConstantComparison(vector<ExpressionValueInformation> &info_list, ExpressionValueInformation info);
@@ -79,6 +80,11 @@ private:
 	                                         Expression &expr);
 	FilterPushdownResult TryPushdownOrClause(TableFilterSet &table_filters, const vector<ColumnIndex> &column_ids,
 	                                         Expression &expr);
+	FilterPushdownResult TryPushdownTemporalCastFilter(TableFilterSet &table_filters,
+	                                                   const vector<ColumnIndex> &column_ids, Expression &expr);
+	void TryPushdownRelaxedFilter(TableFilterSet &table_filters, const vector<ColumnIndex> &column_ids,
+	                              vector<FilterPushdownResult> &pushdown_results, column_t expr_id,
+	                              vector<ExpressionValueInformation> &info_list);
 
 private:
 	vector<unique_ptr<Expression>> remaining_filters;

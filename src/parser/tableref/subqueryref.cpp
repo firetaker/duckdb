@@ -1,8 +1,6 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 
 #include "duckdb/common/limits.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
-#include "duckdb/common/serializer/deserializer.hpp"
 
 namespace duckdb {
 
@@ -14,7 +12,7 @@ string SubqueryRef::ToString() const {
 SubqueryRef::SubqueryRef() : TableRef(TableReferenceType::SUBQUERY) {
 }
 
-SubqueryRef::SubqueryRef(unique_ptr<SelectStatement> subquery_p, string alias_p)
+SubqueryRef::SubqueryRef(unique_ptr<SelectStatement> subquery_p, Identifier alias_p)
     : TableRef(TableReferenceType::SUBQUERY), subquery(std::move(subquery_p)) {
 	this->alias = std::move(alias_p);
 }

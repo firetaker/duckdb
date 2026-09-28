@@ -1,4 +1,3 @@
-#include "duckdb/common/limits.hpp"
 #include "duckdb/function/compression/compression.hpp"
 #include "duckdb/function/compression_function.hpp"
 #include "duckdb/storage/compression/patas/patas_analyze.hpp"
@@ -7,6 +6,26 @@
 #include "duckdb/storage/compression/patas/patas_scan.hpp"
 
 namespace duckdb {
+
+void ThrowPatasInvalidBackwardReference() {
+	throw DataCorruptionException("Corrupted Patas segment: invalid backward reference");
+}
+
+void ThrowPatasInvalidPackedValueMetadata() {
+	throw DataCorruptionException("Corrupted Patas segment: invalid packed value metadata");
+}
+
+void ThrowPatasMetadataBeforeHeader() {
+	throw DataCorruptionException("Corrupted Patas segment: metadata ends before the segment header");
+}
+
+void ThrowPatasMetadataTableOutOfBounds() {
+	throw DataCorruptionException("Corrupted Patas segment: metadata table exceeds the segment");
+}
+
+void ThrowPatasGroupDataOutOfBounds() {
+	throw DataCorruptionException("Corrupted Patas segment: group data is outside the data region");
+}
 
 template <class T>
 CompressionFunction GetPatasFunction(PhysicalType data_type) {

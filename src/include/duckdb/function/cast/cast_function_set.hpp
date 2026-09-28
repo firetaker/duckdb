@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/function/cast/default_casts.hpp"
+#include "duckdb/function/combine_types_rule.hpp"
 
 namespace duckdb {
 struct MapCastInfo;
@@ -26,7 +27,7 @@ struct GetCastFunctionInput {
 	}
 
 	optional_ptr<ClientContext> context;
-	optional_idx query_location;
+	QueryLocation query_location;
 };
 
 struct BindCastFunction {
@@ -52,16 +53,36 @@ public:
 	                                         GetCastFunctionInput &input);
 	//! Returns the implicit cast cost of casting from source -> target
 	//! -1 means an implicit cast is not possible
-	DUCKDB_API int64_t ImplicitCastCost(const LogicalType &source, const LogicalType &target);
+	DUCKDB_API int64_t ImplicitCastCost(optional_ptr<ClientContext> context, const LogicalType &source,
+	                                    const LogicalType &target);
+	DUCKDB_API static int64_t ImplicitCastCost(ClientContext &context, const LogicalType &source,
+	                                           const LogicalType &target);
+	DUCKDB_API static int64_t ImplicitCastCost(DatabaseInstance &db, const LogicalType &source,
+	                                           const LogicalType &target);
 	//! Register a new cast function from source to target
 	DUCKDB_API void RegisterCastFunction(const LogicalType &source, const LogicalType &target, BoundCastInfo function,
 	                                     int64_t implicit_cast_cost = -1);
 	DUCKDB_API void RegisterCastFunction(const LogicalType &source, const LogicalType &target,
 	                                     bind_cast_function_t bind, int64_t implicit_cast_cost = -1);
 
+	//! Register a combine rule for LogicalType::TryGetMaxLogicalType, consulted before previously registered rules
+	//! and the built-in rules
+	DUCKDB_API void RegisterCombineTypesRule(CombineTypesRule rule);
+	//! Run `rules` against (left, right); the first matching rule wins and writes its outcome to `success`.
+	//! Returns false if no rule matched.
+	static bool TryCombineTypes(const vector<CombineTypesRule> &rules, LogicalTypeResolver &resolver,
+	                            const LogicalType &left, const LogicalType &right, LogicalType &result, bool &success);
+	//! Same, over this set's rules (registered + built-in)
+	bool TryCombineTypes(LogicalTypeResolver &resolver, const LogicalType &left, const LogicalType &right,
+	                     LogicalType &result, bool &success);
+
 private:
 	optional_ptr<DBConfig> config;
-	vector<BindCastFunction> bind_functions;
+	//! Built-in fallback used after all registered cast providers have declined the cast
+	BindCastFunction default_bind_function;
+	//! Registered cast providers, searched newest-first before the built-in fallback
+	vector<BindCastFunction> registered_bind_functions;
+	vector<CombineTypesRule> combine_rules;
 	//! If any custom cast functions have been defined using RegisterCastFunction, this holds the map
 	optional_ptr<MapCastInfo> map_info;
 

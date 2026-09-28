@@ -1,6 +1,7 @@
 add_subdirectory(buffer)
 add_subdirectory(checkpoint)
 add_subdirectory(compression)
+add_subdirectory(external_file_cache)
 add_subdirectory(metadata)
 add_subdirectory(serialization)
 add_subdirectory(statistics)
@@ -11,13 +12,14 @@ add_library_unity(
   OBJECT
   arena_allocator.cpp
   buffer_manager.cpp
-  caching_file_system.cpp
   checkpoint_manager.cpp
   temporary_memory_manager.cpp
   block.cpp
+  block_allocator.cpp
+  database_handle.cpp
   data_pointer.cpp
   data_table.cpp
-  external_file_cache.cpp
+  index_entry.cpp
   index.cpp
   local_storage.cpp
   magic_bytes.cpp
@@ -30,6 +32,7 @@ add_library_unity(
   optimistic_data_writer.cpp
   partial_block_manager.cpp
   single_file_block_manager.cpp
+  storage_index.cpp
   storage_info.cpp
   storage_lock.cpp
   wal_replay.cpp)

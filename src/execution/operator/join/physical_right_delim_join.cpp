@@ -1,4 +1,5 @@
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
@@ -10,12 +11,31 @@
 
 namespace duckdb {
 
-PhysicalRightDelimJoin::PhysicalRightDelimJoin(PhysicalPlanGenerator &planner, vector<LogicalType> types,
-                                               PhysicalOperator &original_join, PhysicalOperator &distinct,
+static void RightDelimResetSinkState(const PhysicalOperator &op, ClientContext &context,
+                                     unique_ptr<GlobalSinkState> &state) {
+	if (state && state->SupportsReuse()) {
+		state->Reset(context);
+		return;
+	}
+	state = op.GetGlobalSinkState(context);
+}
+
+static void RightDelimResetLocalSinkState(const PhysicalOperator &op, ExecutionContext &context,
+                                          GlobalSinkState &gstate, unique_ptr<LocalSinkState> &state) {
+	if (state && state->SupportsReuse()) {
+		state->Reset(context, gstate);
+		return;
+	}
+	state = op.GetLocalSinkState(context);
+}
+
+PhysicalRightDelimJoin::PhysicalRightDelimJoin(PhysicalPlan &physical_plan, PhysicalPlanGenerator &planner,
+                                               vector<LogicalType> types, PhysicalOperator &original_join,
+                                               PhysicalOperator &distinct,
                                                const vector<const_reference<PhysicalOperator>> &delim_scans,
                                                idx_t estimated_cardinality, optional_idx delim_idx)
-    : PhysicalDelimJoin(PhysicalOperatorType::RIGHT_DELIM_JOIN, std::move(types), original_join, distinct, delim_scans,
-                        estimated_cardinality, delim_idx) {
+    : PhysicalDelimJoin(physical_plan, PhysicalOperatorType::RIGHT_DELIM_JOIN, std::move(types), original_join,
+                        distinct, delim_scans, estimated_cardinality, delim_idx) {
 	D_ASSERT(join.children.size() == 2);
 	// now for the original join
 	// we take its right child, this is the side that we will duplicate eliminate
@@ -28,16 +48,48 @@ PhysicalRightDelimJoin::PhysicalRightDelimJoin(PhysicalPlanGenerator &planner, v
 //===--------------------------------------------------------------------===//
 // Sink
 //===--------------------------------------------------------------------===//
-class RightDelimJoinGlobalState : public GlobalSinkState {};
+class RightDelimJoinGlobalState : public GlobalSinkState {
+public:
+	explicit RightDelimJoinGlobalState(const PhysicalRightDelimJoin &op) : op(op) {
+	}
+
+	const PhysicalRightDelimJoin &op;
+
+	bool SupportsReuse() const override {
+		return true;
+	}
+
+	void Reset(ClientContext &context) override {
+		RightDelimResetSinkState(op.join, context, op.join.sink_state);
+		RightDelimResetSinkState(op.distinct, context, op.distinct.sink_state);
+		if (op.delim_scans.size() > 1) {
+			PhysicalHashAggregate::SetMultiScan(*op.distinct.sink_state);
+		}
+		GlobalSinkState::Reset(context);
+	}
+};
 
 class RightDelimJoinLocalState : public LocalSinkState {
 public:
+	explicit RightDelimJoinLocalState(const PhysicalRightDelimJoin &op) : op(op) {
+	}
+
+	const PhysicalRightDelimJoin &op;
 	unique_ptr<LocalSinkState> join_state;
 	unique_ptr<LocalSinkState> distinct_state;
+
+	bool SupportsReuse() const override {
+		return true;
+	}
+
+	void Reset(ExecutionContext &context, GlobalSinkState &gstate) override {
+		RightDelimResetLocalSinkState(op.join, context, *op.join.sink_state, join_state);
+		RightDelimResetLocalSinkState(op.distinct, context, *op.distinct.sink_state, distinct_state);
+	}
 };
 
 unique_ptr<GlobalSinkState> PhysicalRightDelimJoin::GetGlobalSinkState(ClientContext &context) const {
-	auto state = make_uniq<RightDelimJoinGlobalState>();
+	auto state = make_uniq<RightDelimJoinGlobalState>(*this);
 	join.sink_state = join.GetGlobalSinkState(context);
 	distinct.sink_state = distinct.GetGlobalSinkState(context);
 	if (delim_scans.size() > 1) {
@@ -47,7 +99,7 @@ unique_ptr<GlobalSinkState> PhysicalRightDelimJoin::GetGlobalSinkState(ClientCon
 }
 
 unique_ptr<LocalSinkState> PhysicalRightDelimJoin::GetLocalSinkState(ExecutionContext &context) const {
-	auto state = make_uniq<RightDelimJoinLocalState>();
+	auto state = make_uniq<RightDelimJoinLocalState>(*this);
 	state->join_state = join.GetLocalSinkState(context);
 	state->distinct_state = distinct.GetLocalSinkState(context);
 	return std::move(state);

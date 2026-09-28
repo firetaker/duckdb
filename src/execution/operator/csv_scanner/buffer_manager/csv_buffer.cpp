@@ -1,42 +1,46 @@
 #include "duckdb/execution/operator/csv_scanner/csv_buffer.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 
 CSVBuffer::CSVBuffer(ClientContext &context, idx_t buffer_size_p, CSVFileHandle &file_handle,
                      const idx_t &global_csv_current_position)
-    : context(context), requested_size(buffer_size_p), can_seek(file_handle.CanSeek()), is_pipe(file_handle.IsPipe()) {
-	AllocateBuffer(buffer_size_p);
-	auto buffer = Ptr();
-	actual_buffer_size = file_handle.Read(buffer, buffer_size_p);
-	while (actual_buffer_size < buffer_size_p && !file_handle.FinishedReading()) {
-		// We keep reading until this block is full
-		actual_buffer_size += file_handle.Read(&buffer[actual_buffer_size], buffer_size_p - actual_buffer_size);
-	}
+    : context(context), requested_size(buffer_size_p), is_pipe(file_handle.IsPipe()) {
 	global_csv_start = global_csv_current_position;
-	last_buffer = file_handle.FinishedReading();
+	Load(file_handle);
 }
 
 CSVBuffer::CSVBuffer(CSVFileHandle &file_handle, ClientContext &context, idx_t buffer_size,
                      idx_t global_csv_current_position, idx_t buffer_idx_p)
     : context(context), requested_size(buffer_size), global_csv_start(global_csv_current_position),
-      can_seek(file_handle.CanSeek()), is_pipe(file_handle.IsPipe()), buffer_idx(buffer_idx_p) {
-	AllocateBuffer(buffer_size);
-	auto buffer = handle.Ptr();
-	actual_buffer_size = file_handle.Read(handle.Ptr(), buffer_size);
-	while (actual_buffer_size < buffer_size && !file_handle.FinishedReading()) {
+      is_pipe(file_handle.IsPipe()), buffer_idx(buffer_idx_p) {
+	Load(file_handle);
+}
+
+CSVBuffer::CSVBuffer(ClientContext &context, idx_t requested_size_p, idx_t actual_size, idx_t global_csv_start_p,
+                     idx_t buffer_idx_p, bool last_buffer_p)
+    : last_buffer(last_buffer_p), context(context), actual_buffer_size(actual_size), requested_size(requested_size_p),
+      global_csv_start(global_csv_start_p), is_pipe(false), random_access(true), buffer_idx(buffer_idx_p) {
+}
+
+void CSVBuffer::Load(CSVFileHandle &file_handle) {
+	AllocateBuffer(requested_size);
+	auto buffer = char_ptr_cast(handle.GetDataMutable());
+	actual_buffer_size = file_handle.Read(buffer, requested_size);
+	while (actual_buffer_size < requested_size && !file_handle.FinishedReading()) {
 		// We keep reading until this block is full
-		actual_buffer_size += file_handle.Read(&buffer[actual_buffer_size], buffer_size - actual_buffer_size);
+		actual_buffer_size += file_handle.Read(&buffer[actual_buffer_size], requested_size - actual_buffer_size);
 	}
 	last_buffer = file_handle.FinishedReading();
 }
 
-shared_ptr<CSVBuffer> CSVBuffer::Next(CSVFileHandle &file_handle, idx_t buffer_size, bool &has_seaked) const {
-	if (has_seaked) {
+shared_ptr<CSVBuffer> CSVBuffer::Next(CSVFileHandle &file_handle, idx_t buffer_size, bool &has_seeked) const {
+	if (has_seeked) {
 		// This means that at some point a reload was done, and we are currently on the incorrect position in our file
 		// handle
 		file_handle.Seek(global_csv_start + actual_buffer_size);
-		has_seaked = false;
+		has_seeked = false;
 	}
 	auto next_csv_buffer = make_shared_ptr<CSVBuffer>(file_handle, context, buffer_size,
 	                                                  global_csv_start + actual_buffer_size, buffer_idx + 1);
@@ -63,19 +67,50 @@ void CSVBuffer::Reload(CSVFileHandle &file_handle) {
 	AllocateBuffer(actual_buffer_size);
 	// If we can seek, we seek and return the correct pointers
 	file_handle.Seek(global_csv_start);
-	file_handle.Read(handle.Ptr(), actual_buffer_size);
+	file_handle.Read(handle.GetDataMutable(), actual_buffer_size);
+}
+
+void CSVBuffer::LoadRandomAccess(CSVFileHandle &file_handle) {
+	D_ASSERT(random_access);
+	AllocateBuffer(actual_buffer_size);
+	if (actual_buffer_size > 0) {
+		file_handle.ReadAt(handle.GetDataMutable(), actual_buffer_size, global_csv_start);
+	}
 }
 
 shared_ptr<CSVBufferHandle> CSVBuffer::Pin(CSVFileHandle &file_handle, bool &has_seeked) {
-	auto &buffer_manager = BufferManager::GetBufferManager(context);
-	if (!is_pipe && block->IsUnloaded()) {
+	lock_guard<mutex> guard(load_lock);
+	if (!IsInMemory()) {
 		// We have to reload it from disk
 		block = nullptr;
-		Reload(file_handle);
-		has_seeked = true;
+		if (random_access) {
+			LoadRandomAccess(file_handle);
+		} else {
+			Reload(file_handle);
+			has_seeked = true;
+		}
 	}
-	return make_shared_ptr<CSVBufferHandle>(buffer_manager.Pin(block), actual_buffer_size, requested_size, last_buffer,
-	                                        buffer_idx);
+	return CreatePin();
+}
+
+bool CSVBuffer::TryPin(shared_ptr<CSVBufferHandle> &pinned) {
+	unique_lock<mutex> guard(load_lock);
+	if (!guard.owns_lock() || !IsInMemory()) {
+		return false;
+	}
+	pinned = CreatePin();
+	return true;
+}
+
+shared_ptr<CSVBufferHandle> CSVBuffer::CreatePin() {
+	auto &buffer_manager = BufferManager::GetBufferManager(context);
+	auto pinned = make_shared_ptr<CSVBufferHandle>(buffer_manager.Pin(block), actual_buffer_size, requested_size,
+	                                               last_buffer, buffer_idx);
+	if (random_access) {
+		// Random-access buffers can always be re-read
+		Unpin();
+	}
+	return pinned;
 }
 
 void CSVBuffer::Unpin() {

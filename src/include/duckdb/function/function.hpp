@@ -8,12 +8,16 @@
 
 #pragma once
 
+#include "duckdb/common/identifier.hpp"
 #include "duckdb/common/named_parameter_map.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/external_dependencies.hpp"
-#include "duckdb/parser/column_definition.hpp"
 #include "duckdb/common/enums/function_errors.hpp"
+#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/optional.hpp"
+#include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 
 namespace duckdb {
 class CatalogEntry;
@@ -33,6 +37,9 @@ class ScalarFunction;
 class TableFunctionSet;
 class TableFunction;
 class SimpleFunction;
+class WindowFunction;
+class WindowFunctionSet;
+class BoundSimpleFunction;
 
 struct PragmaInfo;
 
@@ -56,11 +63,13 @@ enum class FunctionCollationHandling : uint8_t {
 };
 
 struct FunctionData {
+public:
 	DUCKDB_API virtual ~FunctionData();
 
 	DUCKDB_API virtual unique_ptr<FunctionData> Copy() const = 0;
 	DUCKDB_API virtual bool Equals(const FunctionData &other) const = 0;
 	DUCKDB_API static bool Equals(const FunctionData *left, const FunctionData *right);
+	DUCKDB_API virtual bool SupportStatementCache() const;
 
 	template <class TARGET>
 	TARGET &Cast() {
@@ -89,111 +98,604 @@ struct TableFunctionData : public FunctionData {
 	DUCKDB_API bool Equals(const FunctionData &other) const override;
 };
 
+struct FunctionLocalState {
+	DUCKDB_API virtual ~FunctionLocalState();
+
+	template <class TARGET>
+	TARGET &Cast() {
+		DynamicCastCheck<TARGET>(this);
+		return reinterpret_cast<TARGET &>(*this);
+	}
+	template <class TARGET>
+	const TARGET &Cast() const {
+		DynamicCastCheck<TARGET>(this);
+		return reinterpret_cast<const TARGET &>(*this);
+	}
+};
+
 struct FunctionParameters {
 	vector<Value> values;
 	named_parameter_map_t named_parameters;
 };
 
+//! How a parameter receives its arguments, mirroring Python's parameter kinds
+//! STANDARD       -> can be passed by position or by name
+//! VAR_POSITIONAL -> "*args", receives all remaining positional arguments
+//! VAR_KEYWORD    -> "**kwargs", receives all named arguments that do not match another parameter
+//! KEYWORD_ONLY   -> declared after "*args", can only be passed by name
+enum class FunctionParameterKind : uint8_t { STANDARD = 0, VAR_POSITIONAL = 1, VAR_KEYWORD = 2, KEYWORD_ONLY = 3 };
+
+class FunctionParameter {
+public:
+	FunctionParameter(Identifier name, LogicalType type, FunctionParameterKind kind = FunctionParameterKind::STANDARD)
+	    : name(std::move(name)), type(std::move(type)), default_value(nullptr), kind(kind) {
+	}
+
+	FunctionParameter(Identifier name, LogicalType type, Value value,
+	                  FunctionParameterKind kind = FunctionParameterKind::STANDARD)
+	    : name(std::move(name)), type(std::move(type)), default_value(make_shared_ptr<Value>(std::move(value))),
+	      kind(kind) {
+	}
+
+	string ToString() const;
+
+	bool operator==(const FunctionParameter &other) const;
+	bool operator!=(const FunctionParameter &other) const;
+
+	auto GetName() const -> const Identifier & {
+		return name;
+	}
+	auto SetName(Identifier name_p) -> void {
+		name = std::move(name_p);
+	}
+
+	auto GetType() const -> const LogicalType & {
+		return type;
+	}
+	auto SetType(LogicalType type_p) -> void {
+		type = std::move(type_p);
+	}
+
+	auto GetDefaultValue() const -> optional_ptr<Value> {
+		return default_value.get();
+	}
+	auto SetDefaultValue(Value value) -> void {
+		default_value = make_shared_ptr<Value>(std::move(value));
+	}
+	auto HasDefaultValue() const -> bool {
+		return default_value != nullptr;
+	}
+
+	auto GetKind() const -> FunctionParameterKind {
+		return kind;
+	}
+	//! Whether this is a "*args" or "**kwargs" parameter
+	auto IsVariadic() const -> bool {
+		return kind == FunctionParameterKind::VAR_POSITIONAL || kind == FunctionParameterKind::VAR_KEYWORD;
+	}
+
+private:
+	Identifier name;
+	LogicalType type;
+	shared_ptr<Value> default_value;
+	FunctionParameterKind kind;
+};
+
+class FunctionSignature {
+public:
+	FunctionSignature() = default;
+
+	FunctionSignature(vector<LogicalType> arguments, LogicalType varargs, LogicalType return_type)
+	    : return_type(std::move(return_type)) {
+		for (auto &arg : arguments) {
+			AddParameter(std::move(arg));
+		}
+		if (varargs.id() != LogicalTypeId::INVALID) {
+			SetVarArgs(std::move(varargs));
+		}
+	}
+	FunctionSignature(vector<FunctionParameter> parameters, LogicalType return_type)
+	    : parameters(std::move(parameters)), return_type(std::move(return_type)) {
+	}
+	FunctionSignature(vector<FunctionParameter> parameters, LogicalType varargs, LogicalType return_type)
+	    : parameters(std::move(parameters)), return_type(std::move(return_type)) {
+		if (varargs.id() != LogicalTypeId::INVALID) {
+			SetVarArgs(std::move(varargs));
+		}
+	}
+	FunctionSignature(vector<LogicalType> arguments, LogicalType return_type)
+	    : FunctionSignature(std::move(arguments), LogicalType(LogicalTypeId::INVALID), std::move(return_type)) {
+	}
+
+	string ToString() const;
+
+	bool operator==(const FunctionSignature &other) const;
+	bool operator!=(const FunctionSignature &other) const;
+
+	bool Equal(const FunctionSignature &other) const;
+
+public:
+	auto GetParameter(idx_t index) const -> const FunctionParameter & {
+		return parameters[index];
+	}
+	auto GetParameter(idx_t index) -> FunctionParameter & {
+		return parameters[index];
+	}
+	auto GetParameters() const -> const vector<FunctionParameter> & {
+		return parameters;
+	}
+	auto GetParameterCount() const -> idx_t {
+		return parameters.size();
+	}
+
+	auto GetReturnType() const -> const LogicalType & {
+		return return_type;
+	}
+	auto SetReturnType(LogicalType return_type_p) -> void {
+		return_type = std::move(return_type_p);
+	}
+
+	//! Whether the signature has a "*args" parameter
+	auto HasVarArgs() const -> bool {
+		return GetArgsParameter() != nullptr;
+	}
+	//! The type of the "*args" parameter, or INVALID if there is none
+	DUCKDB_API auto GetVarArgs() const -> const LogicalType &;
+	//! Replaces the variadic parameters by an "*args" and "**kwargs" of the given type, so that any trailing argument
+	//! is accepted. Removes the variadic parameters if the type is INVALID.
+	DUCKDB_API auto SetVarArgs(LogicalType varargs_p) -> void;
+
+	auto GetArgsParameter() const -> optional_ptr<const FunctionParameter> {
+		return GetParameterByKind(FunctionParameterKind::VAR_POSITIONAL);
+	}
+	auto GetKwargsParameter() const -> optional_ptr<const FunctionParameter> {
+		return GetParameterByKind(FunctionParameterKind::VAR_KEYWORD);
+	}
+
+	//! A parameter added after "*args" is keyword-only
+	auto AddParameter(Identifier name, LogicalType type, Value default_value) -> FunctionSignature & {
+		parameters.emplace_back(std::move(name), std::move(type), std::move(default_value), GetNextKind());
+		return *this;
+	}
+
+	auto AddParameter(Identifier name, LogicalType type) -> FunctionSignature & {
+		parameters.emplace_back(std::move(name), std::move(type), GetNextKind());
+		return *this;
+	}
+
+	auto AddParameter(LogicalType type) -> FunctionSignature & {
+		auto name = StringUtil::Format("col%d", parameters.size());
+		return AddParameter(Identifier(name), std::move(type));
+	}
+
+	//! Adds a "*args" parameter, receiving all remaining positional arguments
+	auto AddArgsParameter(Identifier name, LogicalType type) -> FunctionSignature & {
+		parameters.emplace_back(std::move(name), std::move(type), FunctionParameterKind::VAR_POSITIONAL);
+		return *this;
+	}
+
+	//! Adds a "**kwargs" parameter, receiving all named arguments that do not match another parameter
+	auto AddKwargsParameter(Identifier name, LogicalType type) -> FunctionSignature & {
+		parameters.emplace_back(std::move(name), std::move(type), FunctionParameterKind::VAR_KEYWORD);
+		return *this;
+	}
+
+	//! Returns the index of the non-variadic parameter with the given name
+	auto GetParameterIndexByName(const Identifier &name) const -> optional_idx {
+		// Parameter names are matched case-insensitively, consistent with SQL identifier semantics.
+		for (idx_t i = 0; i < parameters.size(); i++) {
+			if (!parameters[i].IsVariadic() && parameters[i].GetName() == name) {
+				return i;
+			}
+		}
+		return optional_idx();
+	}
+
+	//! The number of leading parameters that can be passed by position
+	auto GetPositionalParameterCount() const -> idx_t {
+		idx_t result = 0;
+		while (result < parameters.size() && parameters[result].GetKind() == FunctionParameterKind::STANDARD) {
+			result++;
+		}
+		return result;
+	}
+
+	auto GetRequiredParameterCount() const -> idx_t {
+		idx_t result = 0;
+		for (const auto &param : parameters) {
+			if (!param.IsVariadic() && !param.HasDefaultValue()) {
+				result++;
+			}
+		}
+		return result;
+	}
+
+	DUCKDB_API void Verify() const;
+
+	hash_t Hash() const;
+
+private:
+	auto GetParameterByKind(FunctionParameterKind kind) const -> optional_ptr<const FunctionParameter> {
+		for (const auto &param : parameters) {
+			if (param.GetKind() == kind) {
+				return param;
+			}
+		}
+		return nullptr;
+	}
+	auto GetNextKind() const -> FunctionParameterKind {
+		for (const auto &param : parameters) {
+			if (param.GetKind() != FunctionParameterKind::STANDARD) {
+				return FunctionParameterKind::KEYWORD_ONLY;
+			}
+		}
+		return FunctionParameterKind::STANDARD;
+	}
+
+private:
+	vector<FunctionParameter> parameters;
+	LogicalType return_type;
+};
+
 //! Function is the base class used for any type of function (scalar, aggregate or simple function)
 class Function {
 public:
-	DUCKDB_API explicit Function(string name);
+	DUCKDB_API explicit Function(Identifier name);
 	DUCKDB_API virtual ~Function();
 
 	//! The name of the function
-	string name;
+	Identifier name;
 	//! Additional Information to specify function from it's name
 	string extra_info;
 
-	// Optional catalog name of the function
-	string catalog_name;
-
-	// Optional schema name of the function
-	string schema_name;
-
 public:
+	auto SetName(Identifier name_p) -> void {
+		name = std::move(name_p);
+	}
+	auto SetSchemaName(Identifier schema_name_p) -> void {
+		qualified_name = QualifiedName(GetCatalogName(), std::move(schema_name_p), name);
+	}
+	auto SetCatalogName(Identifier catalog_name_p) -> void {
+		auto path = qualified_name.Path();
+		if (path.size() < 3) {
+			qualified_name = QualifiedName(std::move(catalog_name_p), GetSchemaName(), name);
+		} else {
+			path.pop_back();
+			path[0] = std::move(catalog_name_p);
+			qualified_name = QualifiedName(std::move(path), name);
+		}
+	}
+	void SetQualifiedName(QualifiedName name_p) {
+		name = name_p.Name();
+		qualified_name = std::move(name_p);
+	}
+	QualifiedName GetQualifiedName() const {
+		return qualified_name.WithName(name);
+	}
+
+	const Identifier &GetName() const {
+		return name;
+	}
+	const Identifier &GetSchemaName() const {
+		return qualified_name.Schema();
+	}
+	const Identifier &GetCatalogName() const {
+		return qualified_name.Catalog();
+	}
+
 	//! Returns the formatted string name(arg1, arg2, ...)
-	DUCKDB_API static string CallToString(const string &catalog_name, const string &schema_name, const string &name,
-	                                      const vector<LogicalType> &arguments,
+	DUCKDB_API static string CallToString(const Identifier &catalog_name, const Identifier &schema_name,
+	                                      const Identifier &name, const vector<LogicalType> &arguments,
+	                                      const vector<pair<Identifier, LogicalType>> &named_arguments,
 	                                      const LogicalType &varargs = LogicalType::INVALID);
 	//! Returns the formatted string name(arg1, arg2..) -> return_type
-	DUCKDB_API static string CallToString(const string &catalog_name, const string &schema_name, const string &name,
-	                                      const vector<LogicalType> &arguments, const LogicalType &varargs,
-	                                      const LogicalType &return_type);
+	DUCKDB_API static string CallToString(const Identifier &catalog_name, const Identifier &schema_name,
+	                                      const Identifier &name, const vector<LogicalType> &arguments,
+	                                      const LogicalType &varargs, const LogicalType &return_type);
 	//! Returns the formatted string name(arg1, arg2.., np1=a, np2=b, ...)
-	DUCKDB_API static string CallToString(const string &catalog_name, const string &schema_name, const string &name,
-	                                      const vector<LogicalType> &arguments,
+	DUCKDB_API static string CallToString(const Identifier &catalog_name, const Identifier &schema_name,
+	                                      const Identifier &name, const vector<LogicalType> &arguments,
 	                                      const named_parameter_type_map_t &named_parameters);
 
-	//! Used in the bind to erase an argument from a function
-	DUCKDB_API static void EraseArgument(SimpleFunction &bound_function, vector<unique_ptr<Expression>> &arguments,
-	                                     idx_t argument_index);
+private:
+	QualifiedName qualified_name;
 };
 
 class SimpleFunction : public Function {
 public:
-	DUCKDB_API SimpleFunction(string name, vector<LogicalType> arguments,
+	DUCKDB_API SimpleFunction(Identifier name, FunctionSignature signature);
+	DUCKDB_API SimpleFunction(Identifier name, vector<LogicalType> arguments, LogicalType return_type,
 	                          LogicalType varargs = LogicalType(LogicalTypeId::INVALID));
 	DUCKDB_API ~SimpleFunction() override;
 
+protected:
+	FunctionSignature signature;
+
+public:
+	DUCKDB_API string ToString() const;
+	DUCKDB_API hash_t Hash() const;
+
+	FunctionSignature &GetSignature() {
+		return signature;
+	}
+	const FunctionSignature &GetSignature() const {
+		return signature;
+	}
+
+	const LogicalType &GetVarArgs() const {
+		return signature.GetVarArgs();
+	}
+
+	void SetVarArgs(LogicalType varargs_p) {
+		signature.SetVarArgs(std::move(varargs_p));
+	}
+
+	DUCKDB_API bool HasVarArgs() const {
+		return signature.HasVarArgs();
+	}
+
+	void SetReturnType(LogicalType return_type_p) {
+		signature.SetReturnType(std::move(return_type_p));
+	}
+	const LogicalType &GetReturnType() const {
+		return signature.GetReturnType();
+	}
+};
+
+class SimpleNamedParameterFunction : public Function {
+public:
+	DUCKDB_API SimpleNamedParameterFunction(Identifier name, vector<LogicalType> arguments,
+	                                        LogicalType varargs = LogicalType(LogicalTypeId::INVALID));
+	DUCKDB_API ~SimpleNamedParameterFunction() override;
+
 	//! The set of arguments of the function
 	vector<LogicalType> arguments;
-	//! The set of original arguments of the function - only set if Function::EraseArgument is called
-	//! Used for (de)serialization purposes
-	vector<LogicalType> original_arguments;
 	//! The type of varargs to support, or LogicalTypeId::INVALID if the function does not accept variable length
 	//! arguments
 	LogicalType varargs;
-
-public:
-	DUCKDB_API virtual string ToString() const;
-
-	DUCKDB_API bool HasVarArgs() const;
-};
-
-class SimpleNamedParameterFunction : public SimpleFunction {
-public:
-	DUCKDB_API SimpleNamedParameterFunction(string name, vector<LogicalType> arguments,
-	                                        LogicalType varargs = LogicalType(LogicalTypeId::INVALID));
-	DUCKDB_API ~SimpleNamedParameterFunction() override;
 
 	//! The named parameters of the function
 	named_parameter_type_map_t named_parameters;
 
 public:
-	DUCKDB_API string ToString() const override;
+	DUCKDB_API virtual string ToString() const;
 	DUCKDB_API bool HasNamedParameters() const;
-};
 
-class BaseScalarFunction : public SimpleFunction {
-public:
-	DUCKDB_API BaseScalarFunction(string name, vector<LogicalType> arguments, LogicalType return_type,
-	                              FunctionStability stability,
-	                              LogicalType varargs = LogicalType(LogicalTypeId::INVALID),
-	                              FunctionNullHandling null_handling = FunctionNullHandling::DEFAULT_NULL_HANDLING,
-	                              FunctionErrors errors = FunctionErrors::CANNOT_ERROR);
-	DUCKDB_API ~BaseScalarFunction() override;
-
-	//! Return type of the function
-	LogicalType return_type;
-	//! The stability of the function (see FunctionStability enum for more info)
-	FunctionStability stability;
-	//! How this function handles NULL values
-	FunctionNullHandling null_handling;
-	//! Whether or not this function can throw an error
-	FunctionErrors errors;
-	//! Collation handling of the function
-	FunctionCollationHandling collation_handling;
-
-	static BaseScalarFunction SetReturnsError(BaseScalarFunction &function) {
-		function.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-		return function;
+	vector<LogicalType> &GetArguments() {
+		return arguments;
+	}
+	const vector<LogicalType> &GetArguments() const {
+		return arguments;
 	}
 
+	const LogicalType &GetVarArgs() const {
+		return varargs;
+	}
+	LogicalType &GetVarArgs() {
+		return varargs;
+	}
+	// TODO: Dont expose mutable accessor
+	void SetVarArgs(LogicalType varargs_p) {
+		varargs = std::move(varargs_p);
+	}
+	bool HasVarArgs() const {
+		return varargs.id() != LogicalTypeId::INVALID;
+	}
+};
+
+class FunctionProperties {
 public:
+	auto GetStability() const -> FunctionStability {
+		return stability;
+	}
+	auto SetStability(FunctionStability value) -> void {
+		stability = value;
+	}
+
+	auto GetNullHandling() const -> FunctionNullHandling {
+		return null_handling;
+	}
+	auto SetNullHandling(FunctionNullHandling value) -> void {
+		null_handling = value;
+	}
+
+	auto GetErrorMode() const -> FunctionErrors {
+		return errors;
+	}
+	auto SetErrorMode(FunctionErrors value) -> void {
+		errors = value;
+	}
+
+	auto GetCollationHandling() const -> FunctionCollationHandling {
+		return collation_handling;
+	}
+	auto SetCollationHandling(FunctionCollationHandling value) -> void {
+		collation_handling = value;
+	}
+
+	auto GetCaptureArgumentAliases() const -> bool {
+		return capture_argument_aliases;
+	}
+	auto SetCaptureArgumentAliases(bool value) -> void {
+		capture_argument_aliases = value;
+	}
+	auto RequiresExpressionNames() const -> bool {
+		return requires_expression_names;
+	}
+	auto SetRequiresExpressionNames(bool value) -> void {
+		requires_expression_names = value;
+	}
+
+	auto RequiresOrderedExecution() const -> bool {
+		return requires_ordered_execution;
+	}
+	auto SetRequiresOrderedExecution(bool value) -> void {
+		requires_ordered_execution = value;
+	}
+
+	// Helpers
+	auto SetFallible() -> void {
+		errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	}
+	auto SetVolatile() -> void {
+		stability = FunctionStability::VOLATILE;
+	}
+
+	bool operator==(const FunctionProperties &rhs) const;
+	bool operator!=(const FunctionProperties &rhs) const;
+
+public:
+	FunctionStability stability = FunctionStability::CONSISTENT;
+	//! How this function handles NULL values
+	FunctionNullHandling null_handling = FunctionNullHandling::DEFAULT_NULL_HANDLING;
+	//! Whether or not this function can throw an error
+	FunctionErrors errors = FunctionErrors::CANNOT_ERROR;
+	//! Collation handling of the function
+	FunctionCollationHandling collation_handling = FunctionCollationHandling::PROPAGATE_COLLATIONS;
+	//! Whether the binder should capture argument expression aliases as named-argument names when binding this
+	//! function. This preserves the legacy behavior of functions such as struct_pack/row, which derived their
+	//! (struct field) names from argument aliases and therefore allowed positional arguments after named ones.
+	bool capture_argument_aliases = false;
+	//! Whether results depend on argument expression names or the call's result alias
+	bool requires_expression_names = false;
+	//! Whether calls to this function must follow input order
+	bool requires_ordered_execution = false;
+};
+
+class BoundSimpleFunction {
+protected:
+	QualifiedName qualified_name;
+	string extra_info;
+
+	//! The set of arguments of the function
+	vector<LogicalType> arguments;
+	//! The number of leading arguments that are matched to the parameters by position
+	idx_t positional_arguments = 0;
+	//! The names of the remaining arguments, which are matched to the parameters by name
+	vector<Identifier> named_arguments;
+	//! Return type of the function
+	LogicalType return_type;
+
+public:
+	void SetName(Identifier name_p) {
+		qualified_name = qualified_name.WithName(std::move(name_p));
+	}
+
+	const Identifier &GetName() const {
+		return qualified_name.Name();
+	}
+	const Identifier &GetSchemaName() const {
+		return qualified_name.Schema();
+	}
+	const Identifier &GetCatalogName() const {
+		return qualified_name.Catalog();
+	}
+
+	const QualifiedName &GetQualifiedName() const {
+		return qualified_name;
+	}
+	void SetQualifiedName(QualifiedName name_p) {
+		qualified_name = std::move(name_p);
+	}
+
+	const string &GetExtraInfo() const {
+		return extra_info;
+	}
+
+	DUCKDB_API string ToString() const;
 	DUCKDB_API hash_t Hash() const;
 
-	DUCKDB_API string ToString() const override;
+	auto GetArguments() const -> const vector<LogicalType> & {
+		return arguments;
+	}
+	auto GetArguments() -> vector<LogicalType> & {
+		return arguments;
+	}
+
+	auto GetPositionalArgumentCount() const -> idx_t {
+		return positional_arguments;
+	}
+	auto GetNamedArguments() const -> const vector<Identifier> & {
+		return named_arguments;
+	}
+	auto SetNamedArguments(idx_t positional_arguments_p, vector<Identifier> named_arguments_p) -> void {
+		positional_arguments = positional_arguments_p;
+		named_arguments = std::move(named_arguments_p);
+	}
+
+protected:
+	//! The arguments are laid out as [standard | *args | keyword-only | **kwargs], these need the signature of the
+	//! function to tell them apart
+	DUCKDB_API auto GetVarArgsCount(const FunctionSignature &signature) const -> idx_t;
+	DUCKDB_API auto GetKwargsCount(const FunctionSignature &signature) const -> idx_t;
+	DUCKDB_API auto GetArgumentParameterKind(const FunctionSignature &signature, idx_t argument_index) const
+	    -> FunctionParameterKind;
+
+public:
+	auto GetReturnType() const -> const LogicalType & {
+		return return_type;
+	}
+	auto GetReturnType() -> LogicalType & {
+		return return_type;
+	}
+	auto SetReturnType(LogicalType return_type_p) -> void {
+		return_type = std::move(return_type_p);
+	}
+};
+
+//! Shared state of the "bind" callback inputs of scalar, aggregate and window functions: the arguments the function
+//! was called with, their resolved names, and helpers to extract constant arguments during binding.
+class BindFunctionInput {
+public:
+	BindFunctionInput(ClientContext &context_p, const BoundSimpleFunction &function_p,
+	                  vector<unique_ptr<Expression>> &arguments_p,
+	                  optional_ptr<const vector<Identifier>> argument_names_p)
+	    : context(context_p), function(function_p), arguments(arguments_p), argument_names(argument_names_p) {
+	}
+
+	ClientContext &GetClientContext() const {
+		return context;
+	}
+	vector<unique_ptr<Expression>> &GetArguments() const {
+		return arguments;
+	}
+	//! The resolved name of every argument, parallel to GetArguments(). Not set if the names are unavailable.
+	optional_ptr<const vector<Identifier>> GetArgumentNames() const {
+		return argument_names;
+	}
+
+	//! Get the constant value of an argument.
+	//! Throws ParameterNotResolvedException if unresolved, and BinderException for non-constant arguments.
+	//! When 'accept_null' is false, also throws if the (constant) value is NULL.
+	DUCKDB_API Value GetConstant(idx_t arg_idx, bool accept_null = true) const;
+	DUCKDB_API Value GetConstant(const Identifier &name, bool accept_null = true) const;
+
+	//! Shorthand for GetConstant(<arg>, false)
+	DUCKDB_API Value GetNonNullConstant(idx_t index) const {
+		return GetConstant(index, false);
+	}
+	DUCKDB_API Value GetNonNullConstant(const Identifier &name) const {
+		return GetConstant(name, false);
+	}
+
+	//! Try to get the constant value of an argument.
+	//! Never throws: returns none if the argument...
+	//! - is not constant (unresolved parameter or a non-foldable expression)
+	//! - index is out of range
+	//! - was not found when looking up by name
+	//! Use this when a non-constant argument should fall back to the runtime value instead of being an error.
+	DUCKDB_API optional<Value> TryGetConstant(idx_t arg_idx) const;
+	DUCKDB_API optional<Value> TryGetConstant(const Identifier &name) const;
+
+private:
+	//! Resolve a named argument to its position, or an empty optional_idx if no argument with that name was provided.
+	optional_idx GetArgumentIndex(const Identifier &name) const;
+
+private:
+	ClientContext &context;
+	const BoundSimpleFunction &function;
+	vector<unique_ptr<Expression>> &arguments;
+	optional_ptr<const vector<Identifier>> argument_names;
 };
 
 } // namespace duckdb

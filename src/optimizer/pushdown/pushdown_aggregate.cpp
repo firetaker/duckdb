@@ -9,26 +9,30 @@ namespace duckdb {
 
 using Filter = FilterPushdown::Filter;
 
-static unique_ptr<Expression> ReplaceGroupBindings(LogicalAggregate &proj, unique_ptr<Expression> expr) {
-	if (expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
-		auto &colref = expr->Cast<BoundColumnRefExpression>();
-		D_ASSERT(colref.binding.table_index == proj.group_index);
-		D_ASSERT(colref.binding.column_index < proj.groups.size());
-		D_ASSERT(colref.depth == 0);
-		// replace the binding with a copy to the expression at the referenced index
-		return proj.groups[colref.binding.column_index]->Copy();
-	}
-	ExpressionIterator::EnumerateChildren(
-	    *expr, [&](unique_ptr<Expression> &child) { child = ReplaceGroupBindings(proj, std::move(child)); });
-	return expr;
+static bool IsVolatile(LogicalAggregate &aggr, const Expression &expr) {
+	bool is_volatile = false;
+	ExpressionIterator::VisitExpression<BoundColumnRefExpression>(expr, [&](const BoundColumnRefExpression &colref) {
+		D_ASSERT(colref.Depth() == 0);
+		if (aggr.GetExpression(colref.Binding()).IsVolatile()) {
+			is_volatile = true;
+		}
+	});
+	return is_volatile;
 }
 
-void FilterPushdown::ExtractFilterBindings(Expression &expr, vector<ColumnBinding> &bindings) {
-	if (expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
-		auto &colref = expr.Cast<BoundColumnRefExpression>();
-		bindings.push_back(colref.binding);
-	}
-	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) { ExtractFilterBindings(child, bindings); });
+static unique_ptr<Expression> ReplaceGroupBindings(LogicalAggregate &aggr, unique_ptr<Expression> root_expr) {
+	ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
+	    root_expr, [&](BoundColumnRefExpression &colref, unique_ptr<Expression> &expr) {
+		    D_ASSERT(colref.Depth() == 0);
+		    // replace the binding with a copy to the expression at the referenced index
+		    expr = aggr.GetExpression(colref.Binding()).Copy();
+	    });
+	return root_expr;
+}
+
+void FilterPushdown::ExtractFilterBindings(const Expression &expr, vector<ColumnBinding> &bindings) {
+	ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+	    expr, [&](const BoundColumnRefExpression &colref) { bindings.push_back(colref.Binding()); });
 }
 
 unique_ptr<LogicalOperator> FilterPushdown::PushdownAggregate(unique_ptr<LogicalOperator> op) {
@@ -37,7 +41,7 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownAggregate(unique_ptr<Logical
 
 	// pushdown into AGGREGATE and GROUP BY
 	// we cannot push expressions that refer to the aggregate
-	FilterPushdown child_pushdown(optimizer, convert_mark_joins);
+	FilterPushdown child_pushdown(optimizer, convert_mark_joins, projection_mode);
 	for (idx_t i = 0; i < filters.size(); i++) {
 		auto &f = *filters[i];
 		if (f.bindings.find(aggr.aggregate_index) != f.bindings.end()) {
@@ -50,8 +54,8 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownAggregate(unique_ptr<Logical
 		}
 		// no aggregate! we are filtering on a group
 		// we can only push this down if the filter is in all grouping sets
-		if (aggr.grouping_sets.empty()) {
-			// empty grouping set - we cannot pushdown the filter
+		if (aggr.groups.empty()) {
+			// empty group - we cannot pushdown the filter
 			continue;
 		}
 
@@ -78,6 +82,9 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownAggregate(unique_ptr<Logical
 		if (!can_pushdown_filter) {
 			continue;
 		}
+		if (IsVolatile(aggr, *f.filter)) {
+			continue;
+		}
 		// no aggregate! we can push this down
 		// rewrite any group bindings within the filter
 		f.filter = ReplaceGroupBindings(aggr, std::move(f.filter));
@@ -93,7 +100,7 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownAggregate(unique_ptr<Logical
 	child_pushdown.GenerateFilters();
 
 	op->children[0] = child_pushdown.Rewrite(std::move(op->children[0]));
-	return FinishPushdown(std::move(op));
+	return PushFinalFilters(std::move(op));
 }
 
 } // namespace duckdb

@@ -1,15 +1,13 @@
 #include "duckdb/parser/parsed_data/alter_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
-#include "duckdb/parser/constraint.hpp"
 
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
 // AlterScalarFunctionInfo
 //===--------------------------------------------------------------------===//
-AlterScalarFunctionInfo::AlterScalarFunctionInfo(AlterScalarFunctionType type, AlterEntryData data)
-    : AlterInfo(AlterType::ALTER_SCALAR_FUNCTION, std::move(data.catalog), std::move(data.schema), std::move(data.name),
-                data.if_not_found),
+AlterScalarFunctionInfo::AlterScalarFunctionInfo(AlterScalarFunctionType type, const AlterEntryData &data)
+    : AlterInfo(AlterType::ALTER_SCALAR_FUNCTION, data.GetQualifiedName(), data.if_not_found),
       alter_scalar_function_type(type) {
 }
 AlterScalarFunctionInfo::~AlterScalarFunctionInfo() {
@@ -22,9 +20,9 @@ CatalogType AlterScalarFunctionInfo::GetCatalogType() const {
 //===--------------------------------------------------------------------===//
 // AddScalarFunctionOverloadInfo
 //===--------------------------------------------------------------------===//
-AddScalarFunctionOverloadInfo::AddScalarFunctionOverloadInfo(AlterEntryData data,
+AddScalarFunctionOverloadInfo::AddScalarFunctionOverloadInfo(const AlterEntryData &data,
                                                              unique_ptr<CreateScalarFunctionInfo> new_overloads_p)
-    : AlterScalarFunctionInfo(AlterScalarFunctionType::ADD_FUNCTION_OVERLOADS, std::move(data)),
+    : AlterScalarFunctionInfo(AlterScalarFunctionType::ADD_FUNCTION_OVERLOADS, data),
       new_overloads(std::move(new_overloads_p)) {
 	this->allow_internal = true;
 }

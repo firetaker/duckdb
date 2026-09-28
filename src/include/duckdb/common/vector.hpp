@@ -17,14 +17,23 @@
 
 namespace duckdb {
 
-template <class DATA_TYPE, bool SAFE = true>
-class vector : public std::vector<DATA_TYPE, std::allocator<DATA_TYPE>> { // NOLINT: matching name of std
+template <class DATA_TYPE, bool SAFE = true, class ALLOCATOR = std::allocator<DATA_TYPE>>
+class vector : public std::vector<DATA_TYPE, ALLOCATOR> { // NOLINT: matching name of std
 public:
-	using original = std::vector<DATA_TYPE, std::allocator<DATA_TYPE>>;
+	using original = std::vector<DATA_TYPE, ALLOCATOR>;
 	using original::original;
+	using value_type = typename original::value_type;
+	using allocator_type = typename original::allocator_type;
 	using size_type = typename original::size_type;
-	using const_reference = typename original::const_reference;
+	using difference_type = typename original::difference_type;
 	using reference = typename original::reference;
+	using const_reference = typename original::const_reference;
+	using pointer = typename original::pointer;
+	using const_pointer = typename original::const_pointer;
+	using iterator = typename original::iterator;
+	using const_iterator = typename original::const_iterator;
+	using reverse_iterator = typename original::reverse_iterator;
+	using const_reverse_iterator = typename original::const_reverse_iterator;
 
 private:
 	static inline void AssertIndexInBounds(idx_t index, idx_t size) {
@@ -32,7 +41,7 @@ private:
 		return;
 #else
 		if (DUCKDB_UNLIKELY(index >= size)) {
-			throw InternalException("Attempted to access index %ld within vector of size %ld", index, size);
+			ThrowVectorIndexOutOfBounds(index, size);
 		}
 #endif
 	}
@@ -89,16 +98,23 @@ public:
 
 	typename original::reference back() { // NOLINT: hiding on purpose
 		if (MemorySafety<SAFE>::ENABLED && original::empty()) {
-			throw InternalException("'back' called on an empty vector!");
+			ThrowVectorBackOnEmpty();
 		}
 		return get<SAFE>(original::size() - 1);
 	}
 
 	typename original::const_reference back() const { // NOLINT: hiding on purpose
 		if (MemorySafety<SAFE>::ENABLED && original::empty()) {
-			throw InternalException("'back' called on an empty vector!");
+			ThrowVectorBackOnEmpty();
 		}
 		return get<SAFE>(original::size() - 1);
+	}
+
+	void pop_back() { // NOLINT: hiding on purpose
+		if (MemorySafety<SAFE>::ENABLED && original::empty()) {
+			ThrowVectorPopBackOnEmpty();
+		}
+		original::pop_back();
 	}
 
 	void unsafe_erase_at(idx_t idx) { // NOLINT: not using camelcase on purpose here

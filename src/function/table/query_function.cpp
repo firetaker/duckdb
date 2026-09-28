@@ -3,17 +3,53 @@
 #include "duckdb/function/table/range.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/statement/multi_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 
 namespace duckdb {
 
 static unique_ptr<SubqueryRef> ParseSubquery(const string &query, const ParserOptions &options, const string &err_msg) {
 	Parser parser(options);
 	parser.ParseQuery(query);
-	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+	if (parser.statements.size() != 1) {
 		throw ParserException(err_msg);
 	}
-	auto select_stmt = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
-	return duckdb::make_uniq<SubqueryRef>(std::move(select_stmt));
+
+	auto &stmt = parser.statements[0];
+
+	if (stmt->type == StatementType::SELECT_STATEMENT) {
+		// Regular SELECT statement
+		auto select_stmt = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(stmt));
+		return duckdb::make_uniq<SubqueryRef>(std::move(select_stmt));
+	} else if (stmt->type == StatementType::MULTI_STATEMENT) {
+		// MultiStatement (e.g., from PIVOT statements that create enum types)
+		throw ParserException(
+		    "PIVOT statements without explicit IN clauses are not supported in query() function. "
+		    "Please specify the pivot values explicitly, e.g.: PIVOT ... ON col IN (val1, val2, ...)");
+	} else {
+		throw ParserException(err_msg);
+	}
+}
+
+//! Whether the argument is a file path or URL rather than a (qualified) table name: a path separator outside of quotes
+static bool IsFilePath(const string &input) {
+	bool quoted = false;
+	for (auto c : input) {
+		if (c == '"') {
+			quoted = !quoted;
+		} else if (!quoted && (c == '/' || c == '\\')) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Renders the argument as a table reference: file paths are passed as string literals, like FROM 'file.parquet'
+static string TableReference(const string &input) {
+	if (IsFilePath(input)) {
+		return SQLString::ToString(input);
+	}
+	return QualifiedName::Parse(input).ToString(QualifiedNameToStringMode::HIDE_DEFAULT_SCHEMA);
 }
 
 static string UnionTablesQuery(TableFunctionBindInput &input) {
@@ -28,9 +64,7 @@ static string UnionTablesQuery(TableFunctionBindInput &input) {
 	                     ? "BY NAME "
 	                     : ""; // 'by_name' variable defaults to false
 	if (input.inputs[0].type().id() == LogicalTypeId::VARCHAR) {
-		auto from_path = input.inputs[0].ToString();
-		auto qualified_name = QualifiedName::Parse(from_path);
-		result += "FROM " + qualified_name.ToString();
+		result += "FROM " + TableReference(input.inputs[0].ToString());
 	} else if (input.inputs[0].type() == LogicalType::LIST(LogicalType::VARCHAR)) {
 		string union_all_clause = " UNION ALL " + by_name + "FROM ";
 		const auto &children = ListValue::GetChildren(input.inputs[0]);
@@ -38,12 +72,9 @@ static string UnionTablesQuery(TableFunctionBindInput &input) {
 		if (children.empty()) {
 			throw InvalidInputException("Input list is empty");
 		}
-		auto qualified_name = QualifiedName::Parse(children[0].ToString());
-		result += "FROM " + qualified_name.ToString();
+		result += "FROM " + TableReference(children[0].ToString());
 		for (size_t i = 1; i < children.size(); ++i) {
-			auto child = children[i].ToString();
-			auto qualified_name = QualifiedName::Parse(child);
-			result += union_all_clause + qualified_name.ToString();
+			result += union_all_clause + TableReference(children[i].ToString());
 		}
 	} else {
 		throw InvalidInputException("Expected a table or a list with tables as input");
@@ -74,10 +105,10 @@ void QueryTableFunction::RegisterFunction(BuiltinFunctions &set) {
 	query_table_function.bind_replace = TableBindReplace;
 	query_table.AddFunction(query_table_function);
 
-	query_table_function.arguments = {LogicalType::LIST(LogicalType::VARCHAR)};
+	query_table_function.GetArguments() = {LogicalType::LIST(LogicalType::VARCHAR)};
 	query_table.AddFunction(query_table_function);
 	// add by_name option
-	query_table_function.arguments.emplace_back(LogicalType::BOOLEAN);
+	query_table_function.GetArguments().emplace_back(LogicalType::BOOLEAN);
 	query_table.AddFunction(query_table_function);
 	set.AddFunction(query_table);
 }

@@ -1,33 +1,41 @@
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
+#include "duckdb/common/enums/on_entry_not_found.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/function/scalar_macro_function.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
+#include "duckdb/parser/parsed_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/planner/expression_binder.hpp"
+#include "duckdb/parser/expression/lambda_expression.hpp"
 
 namespace duckdb {
 
 void ExpressionBinder::ReplaceMacroParametersInLambda(FunctionExpression &function,
-                                                      vector<unordered_set<string>> &lambda_params) {
-
-	for (auto &child : function.children) {
-		if (child->GetExpressionClass() != ExpressionClass::LAMBDA) {
-			ReplaceMacroParameters(child, lambda_params);
+                                                      vector<identifier_set_t> &lambda_params) {
+	for (auto &child : function.GetArgumentsMutable()) {
+		if (child.GetExpression().GetExpressionClass() != ExpressionClass::LAMBDA) {
+			ReplaceMacroParameters(child.GetExpressionMutable(), lambda_params);
 			continue;
 		}
 
 		// Special-handling for LHS lambda parameters.
 		// We do not replace them, and we add them to the lambda_params vector.
-		auto &lambda_expr = child->Cast<LambdaExpression>();
+		auto &lambda_expr = child.GetExpressionMutable()->Cast<LambdaExpression>();
 		string error_message;
 		auto column_ref_expressions = lambda_expr.ExtractColumnRefExpressions(error_message);
 
 		if (!error_message.empty()) {
 			// Possibly a JSON function, replace both LHS and RHS.
-			ReplaceMacroParameters(lambda_expr.lhs, lambda_params);
-			ReplaceMacroParameters(lambda_expr.expr, lambda_params);
+			ReplaceMacroParameters(lambda_expr.LeftMutable(), lambda_params);
+			ReplaceMacroParameters(lambda_expr.RightMutable(), lambda_params);
 			continue;
 		}
 
@@ -39,15 +47,14 @@ void ExpressionBinder::ReplaceMacroParametersInLambda(FunctionExpression &functi
 		}
 
 		// Only replace in the RHS of the expression.
-		ReplaceMacroParameters(lambda_expr.expr, lambda_params);
+		ReplaceMacroParameters(lambda_expr.RightMutable(), lambda_params);
 
 		lambda_params.pop_back();
 	}
 }
 
 void ExpressionBinder::ReplaceMacroParameters(unique_ptr<ParsedExpression> &expr,
-                                              vector<unordered_set<string>> &lambda_params) {
-
+                                              vector<identifier_set_t> &lambda_params) {
 	switch (expr->GetExpressionClass()) {
 	case ExpressionClass::COLUMN_REF: {
 		// If the expression is a column reference, we replace it with its argument.
@@ -58,7 +65,9 @@ void ExpressionBinder::ReplaceMacroParameters(unique_ptr<ParsedExpression> &expr
 
 		bool bind_macro_parameter = false;
 		if (col_ref.IsQualified()) {
-			if (col_ref.GetTableName().find(DummyBinding::DUMMY_NAME) != string::npos) {
+			// the table qualifier is the component directly before the column name
+			auto &names = col_ref.ColumnNames();
+			if (names[names.size() - 2].StartsWith(DummyBinding::DUMMY_NAME)) {
 				bind_macro_parameter = true;
 			}
 		} else {
@@ -80,7 +89,7 @@ void ExpressionBinder::ReplaceMacroParameters(unique_ptr<ParsedExpression> &expr
 		break;
 	}
 	case ExpressionClass::SUBQUERY: {
-		auto &sq = (expr->Cast<SubqueryExpression>()).subquery;
+		auto &sq = (expr->Cast<SubqueryExpression>()).Subquery();
 		ParsedExpressionIterator::EnumerateQueryNodeChildren(
 		    *sq->node, [&](unique_ptr<ParsedExpression> &child) { ReplaceMacroParameters(child, lambda_params); });
 		break;
@@ -93,57 +102,91 @@ void ExpressionBinder::ReplaceMacroParameters(unique_ptr<ParsedExpression> &expr
 	    *expr, [&](unique_ptr<ParsedExpression> &child) { ReplaceMacroParameters(child, lambda_params); });
 }
 
-void ExpressionBinder::UnfoldMacroExpression(FunctionExpression &function, ScalarMacroCatalogEntry &macro_func,
-                                             unique_ptr<ParsedExpression> &expr) {
-	// validate the arguments and separate positional and default arguments
-	vector<unique_ptr<ParsedExpression>> positionals;
-	unordered_map<string, unique_ptr<ParsedExpression>> defaults;
+// Find aggregate expression children
+void ExpressionBinder::FindAggregateExprs(unique_ptr<ParsedExpression> &expr,
+                                          vector<reference<unique_ptr<ParsedExpression>>> &exprs) {
+	if (expr->GetExpressionType() == ExpressionType::FUNCTION) {
+		auto &fn_expr = expr->Cast<FunctionExpression>();
 
-	auto bind_result =
-	    MacroFunction::BindMacroFunction(macro_func.macros, macro_func.name, function, positionals, defaults);
+		// Look up the function in the catalog, check to see if it is actually an aggregate function
+		EntryLookupInfo fn_entry(CatalogType::AGGREGATE_FUNCTION_ENTRY, fn_expr.GetQualifiedName());
+		auto entry = GetCatalogEntry(fn_entry, OnEntryNotFound::RETURN_NULL);
+
+		if (entry && entry->type == CatalogType::AGGREGATE_FUNCTION_ENTRY) {
+			exprs.push_back(expr);
+			return;
+		}
+	}
+
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<ParsedExpression> &child_expr) { FindAggregateExprs(child_expr, exprs); });
+}
+
+void ExpressionBinder::UnfoldWindowMacroExpression(unique_ptr<ParsedExpression> &expr, ScalarMacroFunction &macro_def) {
+	auto macro_copy = macro_def.expression->Copy();
+	vector<reference<unique_ptr<ParsedExpression>>> aggregate_exprs;
+	FindAggregateExprs(macro_copy, aggregate_exprs);
+
+	// Only allowed if the macro body has a single aggregate expression
+	if (aggregate_exprs.size() != 1) {
+		throw BinderException("Window function macro bodies must contain exactly one aggregate function");
+	}
+
+	// The window spec is pushed down to the aggregate function target within the macro body
+	unique_ptr<ParsedExpression> &agg_expr_ref = aggregate_exprs[0];
+	auto &agg_fn_expr = agg_expr_ref->Cast<FunctionExpression>();
+
+	// Transfer the macro function attributes
+	auto &window_expr = expr->Cast<WindowExpression>();
+	window_expr.SetQualifiedName(agg_fn_expr.GetQualifiedName());
+	window_expr.GetArgumentsMutable().clear();
+	for (auto &arg : agg_fn_expr.GetArgumentsMutable()) {
+		window_expr.GetArgumentsMutable().push_back(std::move(arg));
+	}
+	if (!window_expr.Distinct()) {
+		window_expr.DistinctMutable() = agg_fn_expr.Distinct();
+	}
+	if (window_expr.Filter() && agg_fn_expr.Filter()) {
+		// Two FILTER clauses: combine
+		window_expr.FilterMutable() =
+		    make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(window_expr.FilterMutable()),
+		                                     std::move(agg_fn_expr.FilterMutable()));
+	} else if (agg_fn_expr.Filter()) {
+		//	One FILTER from the MACRO
+		window_expr.FilterMutable() = std::move(agg_fn_expr.FilterMutable());
+	}
+	// Transfer argument ORDER BYs
+	if (agg_fn_expr.OrderBy()) {
+		auto clone = agg_fn_expr.OrderBy()->Copy();
+		window_expr.ArgOrdersMutable() = std::move(clone->Cast<OrderModifier>().orders);
+	}
+
+	// Replace the aggregate expression with the new window expression
+	agg_expr_ref = std::move(expr);
+	expr = std::move(macro_copy);
+}
+
+void ExpressionBinder::UnfoldMacroExpression(FunctionExpression &function, ScalarMacroCatalogEntry &macro_func,
+                                             unique_ptr<ParsedExpression> &expr, idx_t depth) {
+	// validate the arguments and separate positional and default arguments
+	vector<unique_ptr<ParsedExpression>> positional_arguments;
+	InsertionOrderPreservingMap<unique_ptr<ParsedExpression>, Identifier, identifier_map_t<idx_t>> named_arguments;
+	binder.lambda_bindings = lambda_bindings;
+	auto bind_result = MacroFunction::BindMacroFunction(binder, macro_func.macros, macro_func.name, function,
+	                                                    positional_arguments, named_arguments, depth);
 	if (!bind_result.error.empty()) {
 		throw BinderException(*expr, bind_result.error);
 	}
 	auto &macro_def = macro_func.macros[bind_result.function_idx.GetIndex()]->Cast<ScalarMacroFunction>();
 
-	// create a MacroBinding to bind this macro's parameters to its arguments
-	vector<LogicalType> types;
-	vector<string> names;
-	// positional parameters
-	for (idx_t i = 0; i < macro_def.parameters.size(); i++) {
-		types.emplace_back(LogicalTypeId::UNKNOWN);
-		auto &param = macro_def.parameters[i]->Cast<ColumnRefExpression>();
-		names.push_back(param.GetColumnName());
-	}
-	// default parameters
-	for (auto it = macro_def.default_parameters.begin(); it != macro_def.default_parameters.end(); it++) {
-		types.emplace_back(LogicalTypeId::UNKNOWN);
-		names.push_back(it->first);
-		// now push the defaults into the positionals
-		positionals.push_back(std::move(defaults[it->first]));
-	}
-	auto new_macro_binding = make_uniq<DummyBinding>(types, names, macro_func.name);
-	new_macro_binding->arguments = &positionals;
+	auto new_macro_binding =
+	    MacroFunction::CreateDummyBinding(macro_def, macro_func.name, positional_arguments, named_arguments);
 	macro_binding = new_macro_binding.get();
 
 	// replace current expression with stored macro expression
 	// special case: If this is a window function, then we need to return a window expression
 	if (expr->GetExpressionClass() == ExpressionClass::WINDOW) {
-		//	Only allowed if the expression is a function
-		if (macro_def.expression->GetExpressionType() != ExpressionType::FUNCTION) {
-			throw BinderException("Window function macros must be functions");
-		}
-		auto macro_copy = macro_def.expression->Copy();
-		auto &macro_expr = macro_copy->Cast<FunctionExpression>();
-		// Transfer the macro function attributes
-		auto &window_expr = expr->Cast<WindowExpression>();
-		window_expr.catalog = macro_expr.catalog;
-		window_expr.schema = macro_expr.schema;
-		window_expr.function_name = macro_expr.function_name;
-		window_expr.children = std::move(macro_expr.children);
-		window_expr.distinct = macro_expr.distinct;
-		window_expr.filter_expr = std::move(macro_expr.filter);
-		// TODO: transfer order_bys when window functions support them
+		UnfoldWindowMacroExpression(expr, macro_def);
 	} else {
 		expr = macro_def.expression->Copy();
 	}
@@ -154,7 +197,7 @@ void ExpressionBinder::UnfoldMacroExpression(FunctionExpression &function, Scala
 	ExpressionBinder::QualifyColumnNames(*dummy_binder, expr);
 
 	// now replace the parameters
-	vector<unordered_set<string>> lambda_params;
+	vector<identifier_set_t> lambda_params;
 	ReplaceMacroParameters(expr, lambda_params);
 }
 
@@ -163,7 +206,7 @@ BindResult ExpressionBinder::BindMacro(FunctionExpression &function, ScalarMacro
 	auto stack_checker = StackCheck(*expr, 3);
 
 	// unfold the macro expression
-	UnfoldMacroExpression(function, macro_func, expr);
+	UnfoldMacroExpression(function, macro_func, expr, depth);
 
 	// bind the unfolded macro
 	return BindExpression(expr, depth);

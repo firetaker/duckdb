@@ -104,6 +104,35 @@ TEST_CASE("Test strcmp() to ensure platform sanity", "[comparison]") {
 	REQUIRE_FALSE(nut != nut);
 }
 
+TEST_CASE("Test common prefix size", "[string_util]") {
+	REQUIRE(StringUtil::GetCommonPrefixSize("", "") == 0);
+	REQUIRE(StringUtil::GetCommonPrefixSize("abc", "") == 0);
+	REQUIRE(StringUtil::GetCommonPrefixSize("abc", "xyz") == 0);
+	REQUIRE(StringUtil::GetCommonPrefixSize("abc", "abc") == 3);
+	REQUIRE(StringUtil::GetCommonPrefixSize("abc", "abcdef") == 3);
+	REQUIRE(StringUtil::GetCommonPrefixSize("abcdef", "abcxyz") == 3);
+	REQUIRE(StringUtil::GetCommonPrefixSize("🦆ab", "🦆ac") == 5);
+}
+
+TEST_CASE("Test next prefix", "[string_util]") {
+	string prefix = "abc";
+	REQUIRE(StringUtil::FindNextPrefix(prefix));
+	REQUIRE(prefix == "abd");
+
+	prefix = "a";
+	prefix.push_back(static_cast<char>(0xFF));
+	prefix.push_back(static_cast<char>(0xFF));
+	REQUIRE(StringUtil::FindNextPrefix(prefix));
+	REQUIRE(prefix == "b");
+
+	prefix.assign(2, static_cast<char>(0xFF));
+	REQUIRE_FALSE(StringUtil::FindNextPrefix(prefix));
+	REQUIRE(prefix == string(2, static_cast<char>(0xFF)));
+
+	prefix.clear();
+	REQUIRE_FALSE(StringUtil::FindNextPrefix(prefix));
+}
+
 TEST_CASE("Test join vector items", "[string_util]") {
 	SECTION("Three string items") {
 		duckdb::vector<std::string> str_items = {"abc", "def", "ghi"};
@@ -143,6 +172,21 @@ TEST_CASE("Test join vector items", "[string_util]") {
 		    StringUtil::Join(int_items, int_items.size(), ", ", [](const int &item) { return to_string(item); });
 		REQUIRE(result == "");
 	}
+}
+
+TEST_CASE("Test replace strings", "[string_util]") {
+	REQUIRE(StringUtil::Replace("abcabc", "ab", "x") == "xcxc");
+	REQUIRE(StringUtil::Replace("aaaa", "aa", "b") == "bb");
+	REQUIRE(StringUtil::Replace("xx", "x", "yx") == "yxyx");
+	REQUIRE(StringUtil::Replace("aaa{SNAPSHOT_ID}bbb{SNAPSHOT_ID}", "{SNAPSHOT_ID}", "1") == "aaa1bbb1");
+	REQUIRE(StringUtil::Replace("", "x", "y") == "");
+
+// Replace throws an InternalException if the search string is empty.
+// In CI, when DUCKDB_CRASH_ON_ASSERT is set this fails the test even when
+// surrounded by REQUIRE_THROWS
+#ifndef DUCKDB_CRASH_ON_ASSERT
+	REQUIRE_THROWS(StringUtil::Replace("abc", "", "x"));
+#endif
 }
 
 TEST_CASE("Test SplitWithParentheses", "[string_util]") {
@@ -309,6 +353,26 @@ TEST_CASE("Test split quoted strings", "[string_util]") {
 	}
 }
 
+TEST_CASE("Test RTrim preserves trailing UTF-8", "[string_util]") {
+	string value = "abcé";
+	StringUtil::RTrim(value);
+	REQUIRE(value == "abcé");
+
+	value = "abcé   ";
+	StringUtil::RTrim(value);
+	REQUIRE(value == "abcé");
+}
+
+TEST_CASE("Test custom RTrim preserves UTF-8 paths", "[string_util]") {
+	string path = "/tmp/café";
+	StringUtil::RTrim(path, "/");
+	REQUIRE(path == "/tmp/café");
+
+	path = "/tmp/café///";
+	StringUtil::RTrim(path, "/");
+	REQUIRE(path == "/tmp/café");
+}
+
 TEST_CASE("Test path utilities", "[string_util]") {
 	SECTION("File name") {
 		REQUIRE("bin" == StringUtil::GetFileName("/usr/bin/"));
@@ -368,4 +432,145 @@ TEST_CASE("Test path utilities", "[string_util]") {
 		REQUIRE("/tmp" == StringUtil::GetFilePath("/tmp//test.txt"));
 		REQUIRE("\\tmp" == StringUtil::GetFilePath("\\tmp\\\\test.txt"));
 	}
+}
+
+TEST_CASE("Test JSON Parsing", "[string_util]") {
+	auto json_map = StringUtil::ParseJSONMap(R"JSON_LITERAL(
+	{
+    "crs": {
+        "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
+        "type": "GeographicCRS",
+        "name": "WGS 84",
+        "datum_ensemble": {
+            "name": "World Geodetic System 1984 ensemble",
+            "members": [
+                {
+                    "name": "World Geodetic System 1984 (Transit)",
+                    "id": {
+                        "authority": "EPSG",
+                        "code": 1166
+                    }
+                },
+                {
+                    "name": "World Geodetic System 1984 (G730)",
+                    "id": {
+                        "authority": "EPSG",
+                        "code": 1152
+                    }
+                },
+                {
+                    "name": "World Geodetic System 1984 (G873)",
+                    "id": {
+                        "authority": "EPSG",
+                        "code": 1153
+                    }
+                },
+                {
+                    "name": "World Geodetic System 1984 (G1150)",
+                    "id": {
+                        "authority": "EPSG",
+                        "code": 1154
+                    }
+                },
+                {
+                    "name": "World Geodetic System 1984 (G1674)",
+                    "id": {
+                        "authority": "EPSG",
+                        "code": 1155
+                    }
+                },
+                {
+                    "name": "World Geodetic System 1984 (G1762)",
+                    "id": {
+                        "authority": "EPSG",
+                        "code": 1156
+                    }
+                },
+                {
+                    "name": "World Geodetic System 1984 (G2139)",
+                    "id": {
+                        "authority": "EPSG",
+                        "code": 1309
+                    }
+                },
+                {
+                    "name": "World Geodetic System 1984 (G2296)",
+                    "id": {
+                        "authority": "EPSG",
+                        "code": 1383
+                    }
+                }
+            ],
+            "ellipsoid": {
+                "name": "WGS 84",
+                "semi_major_axis": 6378137,
+                "inverse_flattening": 298.257223563
+            },
+            "accuracy": "2.0",
+            "id": {
+                "authority": "EPSG",
+                "code": 6326
+            }
+        },
+        "coordinate_system": {
+            "subtype": "ellipsoidal",
+            "axis": [
+                {
+                    "name": "Geodetic latitude",
+                    "abbreviation": "Lat",
+                    "direction": "north",
+                    "unit": "degree"
+                },
+                {
+                    "name": "Geodetic longitude",
+                    "abbreviation": "Lon",
+                    "direction": "east",
+                    "unit": "degree"
+                }
+            ]
+        },
+        "scope": "Horizontal component of 3D system.",
+        "area": "World.",
+        "bbox": {
+            "south_latitude": -90,
+            "west_longitude": -180,
+            "north_latitude": 90,
+            "east_longitude": 180
+        },
+        "id": {
+            "authority": "EPSG",
+            "code": 4326
+        }
+    },
+    "crs_type": "projjson"
+}	)JSON_LITERAL");
+
+	json_map = StringUtil::ParseJSONMap(R"JSON_LITERAL(
+	{
+		"int": 42,
+		"signed_int": -42,
+		"real": 1.5,
+		"null_val": null,
+		"arr": [1, 2, 3],
+		"obj": {
+			"str_val": "val"
+		},
+		"empty_arr": [],
+		"bool_t": true,
+		"bool_f": false
+	}
+	)JSON_LITERAL");
+}
+
+TEST_CASE("Test CIHash is independent of char signedness", "[string_util]") {
+	// bytes >= 0x80 must be zero-extended before hashing so the result is identical
+	// on platforms where char is signed (x86) and where it is unsigned (ARM)
+	const char high_byte[] = {(char)0xC3, 0};
+	REQUIRE(StringUtil::CIHash(high_byte, 1) == 2242087697ULL);
+
+	const char cafe_utf8[] = "Caf\xC3\xA9";
+	REQUIRE(StringUtil::CIHash(cafe_utf8, strlen(cafe_utf8)) == 2425794034ULL);
+
+	// ASCII is unaffected
+	REQUIRE(StringUtil::CIHash("hello") == StringUtil::CIHash("HeLLo"));
 }

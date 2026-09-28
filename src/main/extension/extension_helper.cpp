@@ -1,6 +1,9 @@
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/common/multi_file/multi_file_list.hpp"
+#include "duckdb/main/extension/linked_extension_registry.hpp"
 
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/local_file_system.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/buffered_file_reader.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -8,122 +11,87 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/database_file_opener.hpp"
 #include "duckdb/main/extension.hpp"
 #include "duckdb/main/extension_install_info.hpp"
-
-// Note that c++ preprocessor doesn't have a nice way to clean this up so we need to set the defines we use to false
-// explicitly when they are undefined
-#ifndef DUCKDB_EXTENSION_CORE_FUNCTIONS_LINKED
-#define DUCKDB_EXTENSION_CORE_FUNCTIONS_LINKED false
-#endif
-
-#ifndef DUCKDB_EXTENSION_ICU_LINKED
-#define DUCKDB_EXTENSION_ICU_LINKED false
-#endif
-
-#ifndef DUCKDB_EXTENSION_EXCEL_LINKED
-#define DUCKDB_EXTENSION_EXCEL_LINKED false
-#endif
-
-#ifndef DUCKDB_EXTENSION_PARQUET_LINKED
-#define DUCKDB_EXTENSION_PARQUET_LINKED false
-#endif
-
-#ifndef DUCKDB_EXTENSION_TPCH_LINKED
-#define DUCKDB_EXTENSION_TPCH_LINKED false
-#endif
-
-#ifndef DUCKDB_EXTENSION_TPCDS_LINKED
-#define DUCKDB_EXTENSION_TPCDS_LINKED false
-#endif
-
-#ifndef DUCKDB_EXTENSION_HTTPFS_LINKED
-#define DUCKDB_EXTENSION_HTTPFS_LINKED false
-#endif
-
-#ifndef DUCKDB_EXTENSION_JSON_LINKED
-#define DUCKDB_EXTENSION_JSON_LINKED false
-#endif
-
-#ifndef DUCKDB_EXTENSION_JEMALLOC_LINKED
-#define DUCKDB_EXTENSION_JEMALLOC_LINKED false
-#endif
-
-#ifndef DUCKDB_EXTENSION_AUTOCOMPLETE_LINKED
-#define DUCKDB_EXTENSION_AUTOCOMPLETE_LINKED false
-#endif
-
-// Load the generated header file containing our list of extension headers
-#if defined(GENERATED_EXTENSION_HEADERS) && GENERATED_EXTENSION_HEADERS && !defined(DUCKDB_AMALGAMATION)
-#include "duckdb/main/extension/generated_extension_loader.hpp"
-#else
-// TODO: rewrite package_build.py to allow also loading out-of-tree extensions in non-cmake builds, after that
-//		 these can be removed
-#if DUCKDB_EXTENSION_CORE_FUNCTIONS_LINKED
-#include "core_functions_extension.hpp"
-#endif
-
-#if DUCKDB_EXTENSION_ICU_LINKED
-#include "icu_extension.hpp"
-#endif
-
-#if DUCKDB_EXTENSION_PARQUET_LINKED
-#include "parquet_extension.hpp"
-#endif
-
-#if DUCKDB_EXTENSION_TPCH_LINKED
-#include "tpch_extension.hpp"
-#endif
-
-#if DUCKDB_EXTENSION_TPCDS_LINKED
-#include "tpcds_extension.hpp"
-#endif
-
-#if DUCKDB_EXTENSION_JSON_LINKED
-#include "json_extension.hpp"
-#endif
-
-#if DUCKDB_EXTENSION_JEMALLOC_LINKED
-#include "jemalloc_extension.hpp"
-#endif
-
-#if DUCKDB_EXTENSION_AUTOCOMPLETE_LINKED
-#include "autocomplete_extension.hpp"
-#endif
-
-#endif
+#include "duckdb/main/extension_repository_manager.hpp"
+#include "duckdb/main/settings.hpp"
 
 namespace duckdb {
+
+void ExtensionHelper::RegisterLinkedExtensions(DBConfig &config) {
+	for (auto &linked : LinkedExtensionRegistry::Get()) {
+		bool present = false;
+		for (auto &existing : config.linked_extensions) {
+			if (StringUtil::CIEquals(existing.name, linked.name)) {
+				present = true;
+				break;
+			}
+		}
+		if (!present) {
+			config.linked_extensions.push_back(linked);
+		}
+	}
+}
+
+//! Loads an extension that was linked into the binary, via the registry the config carries. This is
+//! deliberately not generated code: an extension with its own copy of DuckDB links no generated
+//! loader, so a compile-time list would be invisible to it, while the config is data it can read.
+ExtensionLoadResult ExtensionHelper::LoadExtension(DuckDB &db, const std::string &extension) {
+	auto &config = DBConfig::GetConfig(*db.instance);
+	for (auto &linked : config.linked_extensions) {
+		if (StringUtil::CIEquals(linked.name, extension)) {
+			linked.load(db);
+			return ExtensionLoadResult::LOADED_EXTENSION;
+		}
+	}
+	return ExtensionLoadResult::NOT_LOADED;
+}
+
+void ExtensionHelper::LoadAllExtensions(DuckDB &db) {
+	// registration order, so a binary loads its extensions the same way on every run
+	auto &config = DBConfig::GetConfig(*db.instance);
+	auto linked = config.linked_extensions;
+	for (auto &entry : linked) {
+		entry.load(db);
+	}
+}
 
 //===--------------------------------------------------------------------===//
 // Default Extensions
 //===--------------------------------------------------------------------===//
 static const DefaultExtension internal_extensions[] = {
-    {"core_functions", "Core function library", DUCKDB_EXTENSION_CORE_FUNCTIONS_LINKED},
-    {"icu", "Adds support for time zones and collations using the ICU library", DUCKDB_EXTENSION_ICU_LINKED},
-    {"excel", "Adds support for Excel-like format strings", DUCKDB_EXTENSION_EXCEL_LINKED},
-    {"parquet", "Adds support for reading and writing parquet files", DUCKDB_EXTENSION_PARQUET_LINKED},
-    {"tpch", "Adds TPC-H data generation and query support", DUCKDB_EXTENSION_TPCH_LINKED},
-    {"tpcds", "Adds TPC-DS data generation and query support", DUCKDB_EXTENSION_TPCDS_LINKED},
-    {"httpfs", "Adds support for reading and writing files over a HTTP(S) connection", DUCKDB_EXTENSION_HTTPFS_LINKED},
-    {"json", "Adds support for JSON operations", DUCKDB_EXTENSION_JSON_LINKED},
-    {"jemalloc", "Overwrites system allocator with JEMalloc", DUCKDB_EXTENSION_JEMALLOC_LINKED},
-    {"autocomplete", "Adds support for autocomplete in the shell", DUCKDB_EXTENSION_AUTOCOMPLETE_LINKED},
-    {"motherduck", "Enables motherduck integration with the system", false},
-    {"mysql_scanner", "Adds support for connecting to a MySQL database", false},
-    {"sqlite_scanner", "Adds support for reading and writing SQLite database files", false},
-    {"postgres_scanner", "Adds support for connecting to a Postgres database", false},
-    {"inet", "Adds support for IP-related data types and functions", false},
-    {"spatial", "Geospatial extension that adds support for working with spatial data and functions", false},
-    {"aws", "Provides features that depend on the AWS SDK", false},
-    {"azure", "Adds a filesystem abstraction for Azure blob storage to DuckDB", false},
-    {"encodings", "All unicode encodings to UTF-8", false},
-    {"iceberg", "Adds support for Apache Iceberg", false},
-    {"vss", "Adds indexing support to accelerate Vector Similarity Search", false},
-    {"delta", "Adds support for Delta Lake", false},
-    {"fts", "Adds support for Full-Text Search Indexes", false},
-    {"ui", "Adds local UI for DuckDB", false},
-    {nullptr, nullptr, false}};
+    {"core_functions", "Core function library"},
+    {"icu", "Adds support for time zones and collations using the ICU library"},
+    {"excel", "Adds support for Excel-like format strings"},
+    {"parquet", "Adds support for reading and writing parquet files"},
+    {"tpch", "Adds TPC-H data generation and query support"},
+    {"tpcds", "Adds TPC-DS data generation and query support"},
+    {"httpfs", "Adds support for reading and writing files over a HTTP(S) connection"},
+    {"json", "Adds support for JSON operations"},
+    {"autocomplete", "Adds support for autocomplete in the shell"},
+    {"motherduck", "Enables motherduck integration with the system"},
+    {"mysql_scanner", "Adds support for connecting to a MySQL database"},
+    {"odbc_scanner", "Adds support for connecting to remote databases over ODBC"},
+    {"sqlite_scanner", "Adds support for reading and writing SQLite database files"},
+    {"postgres_scanner", "Adds support for connecting to a Postgres database"},
+    {"inet", "Adds support for IP-related data types and functions"},
+    {"spatial", "Geospatial extension that adds support for working with spatial data and functions"},
+    {"aws", "Provides features that depend on the AWS SDK"},
+    {"azure", "Adds a filesystem abstraction for Azure blob storage to DuckDB"},
+    {"encodings", "All unicode encodings to UTF-8"},
+    {"iceberg", "Adds support for Apache Iceberg"},
+    {"vss", "Adds indexing support to accelerate Vector Similarity Search"},
+    {"delta", "Adds support for Delta Lake"},
+    {"fts", "Adds support for Full-Text Search Indexes"},
+    {"ui", "Adds local UI for DuckDB"},
+    {"ducklake", "Adds support for DuckLake, SQL as a Lakehouse Format"},
+    {"quack", "The DuckDB 'Quack' Client/Server Protocol"},
+    {"vortex", "Adds support for reading and writing files using the Vortex file format"},
+    {"lance", "Adds support for querying Lance datasets"},
+    {"avro", "Adds support for reading Avro files"},
+    {"unity_catalog", "Adds support for connecting to Unity Catalog"},
+    {nullptr, nullptr}};
 
 idx_t ExtensionHelper::DefaultExtensionCount() {
 	idx_t index;
@@ -140,9 +108,10 @@ DefaultExtension ExtensionHelper::GetDefaultExtension(idx_t index) {
 //===--------------------------------------------------------------------===//
 // Allow Auto-Install Extensions
 //===--------------------------------------------------------------------===//
-static const char *const auto_install[] = {"motherduck", "postgres_scanner", "mysql_scanner", "sqlite_scanner",
-                                           "delta",      "iceberg",          "uc_catalog",    "ui",
-                                           nullptr};
+static const char *const auto_install[] = {
+    "motherduck", "postgres_scanner", "mysql_scanner", "odbc_scanner", "sqlite_scanner",
+    "delta",      "iceberg",          "unity_catalog", "ui",           "ducklake",
+    nullptr};
 
 // TODO: unify with new autoload mechanism
 bool ExtensionHelper::AllowAutoInstall(const string &extension) {
@@ -173,25 +142,22 @@ bool ExtensionHelper::CanAutoloadExtension(const string &ext_name) {
 
 string ExtensionHelper::AddExtensionInstallHintToErrorMsg(ClientContext &context, const string &base_error,
                                                           const string &extension_name) {
-
 	return AddExtensionInstallHintToErrorMsg(DatabaseInstance::GetDatabase(context), base_error, extension_name);
 }
 string ExtensionHelper::AddExtensionInstallHintToErrorMsg(DatabaseInstance &db, const string &base_error,
                                                           const string &extension_name) {
 	string install_hint;
 
-	auto &config = db.config;
-
 	if (!ExtensionHelper::CanAutoloadExtension(extension_name)) {
 		install_hint = "Please try installing and loading the " + extension_name + " extension:\nINSTALL " +
 		               extension_name + ";\nLOAD " + extension_name + ";\n\n";
-	} else if (!config.options.autoload_known_extensions) {
+	} else if (!Settings::Get<AutoloadKnownExtensionsSetting>(db)) {
 		install_hint =
 		    "Please try installing and loading the " + extension_name + " extension by running:\nINSTALL " +
 		    extension_name + ";\nLOAD " + extension_name +
 		    ";\n\nAlternatively, consider enabling auto-install "
 		    "and auto-load by running:\nSET autoinstall_known_extensions=1;\nSET autoload_known_extensions=1;";
-	} else if (!config.options.autoinstall_known_extensions) {
+	} else if (!Settings::Get<AutoinstallKnownExtensionsSetting>(db)) {
 		install_hint =
 		    "Please try installing the " + extension_name + " extension by running:\nINSTALL " + extension_name +
 		    ";\n\nAlternatively, consider enabling autoinstall by running:\nSET autoinstall_known_extensions=1;";
@@ -204,31 +170,36 @@ string ExtensionHelper::AddExtensionInstallHintToErrorMsg(DatabaseInstance &db, 
 	return base_error;
 }
 
+// autoloading only ever targets core extensions, so it trusts the core keys exclusively
+static ExtensionLoadOptions AutoLoadOptions(const string &extension_name) {
+	ExtensionLoadOptions options(extension_name);
+	options.core_only = true;
+	return options;
+}
+
 bool ExtensionHelper::TryAutoLoadExtension(ClientContext &context, const string &extension_name) noexcept {
 	if (context.db->ExtensionIsLoaded(extension_name)) {
 		return true;
 	}
-	auto &dbconfig = DBConfig::GetConfig(context);
 	try {
-		if (dbconfig.options.autoinstall_known_extensions) {
-			auto &config = DBConfig::GetConfig(context);
-			auto autoinstall_repo = ExtensionRepository::GetRepositoryByUrl(
-			    StringValue::Get(config.GetSetting<AutoinstallExtensionRepositorySetting>(context)));
+		if (Settings::Get<AutoinstallKnownExtensionsSetting>(context)) {
+			auto autoinstall_repo_setting = Settings::Get<AutoinstallExtensionRepositorySetting>(context);
+			auto autoinstall_repo = ExtensionRepository::GetRepositoryByUrl(autoinstall_repo_setting);
 			ExtensionInstallOptions options;
 			options.repository = autoinstall_repo;
 			ExtensionHelper::InstallExtension(context, extension_name, options);
 		}
-		ExtensionHelper::LoadExternalExtension(context, extension_name);
+		ExtensionHelper::LoadExternalExtension(context, AutoLoadOptions(extension_name));
 		return true;
 	} catch (...) {
 		return false;
 	}
 }
 
-static string GetAutoInstallExtensionsRepository(const DBConfigOptions &options) {
-	string repository_url = options.autoinstall_extension_repo;
+static string GetAutoInstallExtensionsRepository(const DBConfig &config) {
+	string repository_url = Settings::Get<AutoinstallExtensionRepositorySetting>(config);
 	if (repository_url.empty()) {
-		repository_url = options.custom_extension_repo;
+		repository_url = Settings::Get<CustomExtensionRepositorySetting>(config);
 	}
 	return repository_url;
 }
@@ -240,14 +211,30 @@ bool ExtensionHelper::TryAutoLoadExtension(DatabaseInstance &instance, const str
 	auto &dbconfig = DBConfig::GetConfig(instance);
 	try {
 		auto &fs = FileSystem::GetFileSystem(instance);
-		if (dbconfig.options.autoinstall_known_extensions) {
-			auto repository_url = GetAutoInstallExtensionsRepository(dbconfig.options);
+		if (Settings::Get<AutoinstallKnownExtensionsSetting>(instance)) {
+			auto repository_url = GetAutoInstallExtensionsRepository(dbconfig);
 			auto autoinstall_repo = ExtensionRepository::GetRepositoryByUrl(repository_url);
 			ExtensionInstallOptions options;
 			options.repository = autoinstall_repo;
 			ExtensionHelper::InstallExtension(instance, fs, extension_name, options);
 		}
-		ExtensionHelper::LoadExternalExtension(instance, fs, extension_name);
+		if (Settings::Get<AutoloadKnownExtensionsSetting>(instance)) {
+			ExtensionHelper::LoadExternalExtension(instance, fs, AutoLoadOptions(extension_name));
+			return true;
+		}
+		return false;
+	} catch (...) {
+		return false;
+	}
+}
+
+bool ExtensionHelper::TryAutoLoadAvailableExtension(DatabaseInstance &instance, const string &extension_name) noexcept {
+	if (instance.ExtensionIsLoaded(extension_name)) {
+		return true;
+	}
+	try {
+		auto &fs = FileSystem::GetFileSystem(instance);
+		ExtensionHelper::LoadExternalExtension(instance, fs, AutoLoadOptions(extension_name));
 		return true;
 	} catch (...) {
 		return false;
@@ -258,8 +245,6 @@ static ExtensionUpdateResult UpdateExtensionInternal(ClientContext &context, Dat
                                                      const string &full_extension_path, const string &extension_name) {
 	ExtensionUpdateResult result;
 	result.extension_name = extension_name;
-
-	auto &config = DBConfig::GetConfig(db);
 
 	if (!fs.FileExists(full_extension_path)) {
 		result.tag = ExtensionUpdateResultTag::NOT_INSTALLED;
@@ -276,7 +261,7 @@ static ExtensionUpdateResult UpdateExtensionInternal(ClientContext &context, Dat
 	// Parse the version of the extension before updating
 	auto ext_binary_handle = fs.OpenFile(full_extension_path, FileOpenFlags::FILE_FLAGS_READ);
 	auto parsed_metadata = ExtensionHelper::ParseExtensionMetaData(*ext_binary_handle);
-	if (!parsed_metadata.AppearsValid() && !config.options.allow_extensions_metadata_mismatch) {
+	if (!parsed_metadata.AppearsValid() && !Settings::Get<AllowExtensionsMetadataMismatchSetting>(context)) {
 		throw IOException(
 		    "Failed to update extension: '%s', the metadata of the extension appears invalid! To resolve this, either "
 		    "reinstall the extension using 'FORCE INSTALL %s', manually remove the file '%s', or enable '"
@@ -301,7 +286,12 @@ static ExtensionUpdateResult UpdateExtensionInternal(ClientContext &context, Dat
 		return result;
 	}
 
+	// update the extension from the repository it was installed from, so that it is verified against the same keys
 	auto repository_from_info = ExtensionRepository::GetRepositoryByUrl(extension_install_info->repository_url);
+	repository_from_info.type = extension_install_info->repository_type;
+	if (!extension_install_info->repository_name.empty()) {
+		repository_from_info.name = extension_install_info->repository_name;
+	}
 	result.repository = repository_from_info.ToReadableString();
 
 	// Force install the full url found in this file, enabling etags to ensure efficient updating
@@ -338,7 +328,7 @@ vector<ExtensionUpdateResult> ExtensionHelper::UpdateExtensions(ClientContext &c
 	DatabaseInstance &db = DatabaseInstance::GetDatabase(context);
 
 #ifndef WASM_LOADABLE_EXTENSIONS
-	case_insensitive_set_t seen_extensions;
+	identifier_set_t seen_extensions;
 
 	// scan the install directory for installed extensions
 	auto ext_directory = ExtensionHelper::ExtensionDirectory(db, fs);
@@ -350,7 +340,7 @@ vector<ExtensionUpdateResult> ExtensionHelper::UpdateExtensions(ClientContext &c
 		auto extension_file_name = StringUtil::GetFileName(path);
 		auto extension_name = StringUtil::Split(extension_file_name, ".")[0];
 
-		seen_extensions.insert(extension_name);
+		seen_extensions.insert(Identifier(extension_name));
 
 		result.push_back(UpdateExtensionInternal(context, db, fs, fs.JoinPath(ext_directory, path), extension_name));
 	});
@@ -388,17 +378,17 @@ void ExtensionHelper::AutoLoadExtension(DatabaseInstance &db, const string &exte
 	}
 	auto &dbconfig = DBConfig::GetConfig(db);
 	try {
-		auto fs = FileSystem::CreateLocal();
+		auto &fs = FileSystem::GetLocal(db);
 #ifndef DUCKDB_WASM
-		if (dbconfig.options.autoinstall_known_extensions) {
-			auto repository_url = GetAutoInstallExtensionsRepository(dbconfig.options);
+		if (Settings::Get<AutoinstallKnownExtensionsSetting>(db)) {
+			auto repository_url = GetAutoInstallExtensionsRepository(dbconfig);
 			auto autoinstall_repo = ExtensionRepository::GetRepositoryByUrl(repository_url);
 			ExtensionInstallOptions options;
 			options.repository = autoinstall_repo;
-			ExtensionHelper::InstallExtension(db, *fs, extension_name, options);
+			ExtensionHelper::InstallExtension(db, fs, extension_name, options);
 		}
 #endif
-		ExtensionHelper::LoadExternalExtension(db, *fs, extension_name);
+		ExtensionHelper::LoadExternalExtension(db, fs, AutoLoadOptions(extension_name));
 		DUCKDB_LOG_INFO(db, "Loaded extension '%s'", extension_name);
 	} catch (std::exception &e) {
 		ErrorData error(e);
@@ -406,155 +396,7 @@ void ExtensionHelper::AutoLoadExtension(DatabaseInstance &db, const string &exte
 	}
 }
 
-//===--------------------------------------------------------------------===//
-// Load Statically Compiled Extension
-//===--------------------------------------------------------------------===//
-void ExtensionHelper::LoadAllExtensions(DuckDB &db) {
-	// The in-tree extensions that we check. Non-cmake builds are currently limited to these for static linking
-	// TODO: rewrite package_build.py to allow also loading out-of-tree extensions in non-cmake builds, after that
-	//		 these can be removed
-	vector<string> extensions {"parquet", "icu",  "tpch",     "tpcds",        "httpfs",        "json",
-	                           "excel",   "inet", "jemalloc", "autocomplete", "core_functions"};
-	for (auto &ext : extensions) {
-		LoadExtensionInternal(db, ext, true);
-	}
-
-#if defined(GENERATED_EXTENSION_HEADERS) && GENERATED_EXTENSION_HEADERS
-	for (const auto &ext : LinkedExtensions()) {
-		LoadExtensionInternal(db, ext, true);
-	}
-#endif
-}
-
-ExtensionLoadResult ExtensionHelper::LoadExtension(DuckDB &db, const std::string &extension) {
-	return LoadExtensionInternal(db, extension, false);
-}
-
-ExtensionLoadResult ExtensionHelper::LoadExtensionInternal(DuckDB &db, const std::string &extension,
-                                                           bool initial_load) {
-#ifdef DUCKDB_TEST_REMOTE_INSTALL
-	if (!initial_load && StringUtil::Contains(DUCKDB_TEST_REMOTE_INSTALL, extension)) {
-		Connection con(db);
-		auto result = con.Query("INSTALL " + extension);
-		if (result->HasError()) {
-			result->Print();
-			return ExtensionLoadResult::EXTENSION_UNKNOWN;
-		}
-		result = con.Query("LOAD " + extension);
-		if (result->HasError()) {
-			result->Print();
-			return ExtensionLoadResult::EXTENSION_UNKNOWN;
-		}
-		return ExtensionLoadResult::LOADED_EXTENSION;
-	}
-#endif
-
-#ifdef DUCKDB_EXTENSIONS_TEST_WITH_LOADABLE
-	// Note: weird comma's are on purpose to do easy string contains on a list of extension names
-	if (!initial_load && StringUtil::Contains(DUCKDB_EXTENSIONS_TEST_WITH_LOADABLE, "," + extension + ",")) {
-		Connection con(db);
-		auto result = con.Query((string) "LOAD '" + DUCKDB_EXTENSIONS_BUILD_PATH + "/" + extension + "/" + extension +
-		                        ".duckdb_extension'");
-		if (result->HasError()) {
-			result->Print();
-			return ExtensionLoadResult::EXTENSION_UNKNOWN;
-		}
-		return ExtensionLoadResult::LOADED_EXTENSION;
-	}
-#endif
-
-	// This is the main extension loading mechanism that loads the extension that are statically linked.
-#if defined(GENERATED_EXTENSION_HEADERS) && GENERATED_EXTENSION_HEADERS
-	if (TryLoadLinkedExtension(db, extension)) {
-		return ExtensionLoadResult::LOADED_EXTENSION;
-	} else {
-		return ExtensionLoadResult::NOT_LOADED;
-	}
-#endif
-
-	// This is the fallback to the "old" extension loading mechanism for non-cmake builds
-	// TODO: rewrite package_build.py to allow also loading out-of-tree extensions in non-cmake builds
-	if (extension == "parquet") {
-#if DUCKDB_EXTENSION_PARQUET_LINKED
-		db.LoadStaticExtension<ParquetExtension>();
-#else
-		// parquet extension required but not build: skip this test
-		return ExtensionLoadResult::NOT_LOADED;
-#endif
-	} else if (extension == "icu") {
-#if DUCKDB_EXTENSION_ICU_LINKED
-		db.LoadStaticExtension<IcuExtension>();
-#else
-		// icu extension required but not build: skip this test
-		return ExtensionLoadResult::NOT_LOADED;
-#endif
-	} else if (extension == "tpch") {
-#if DUCKDB_EXTENSION_TPCH_LINKED
-		db.LoadStaticExtension<TpchExtension>();
-#else
-		// icu extension required but not build: skip this test
-		return ExtensionLoadResult::NOT_LOADED;
-#endif
-	} else if (extension == "tpcds") {
-#if DUCKDB_EXTENSION_TPCDS_LINKED
-		db.LoadStaticExtension<TpcdsExtension>();
-#else
-		// icu extension required but not build: skip this test
-		return ExtensionLoadResult::NOT_LOADED;
-#endif
-	} else if (extension == "httpfs") {
-#if DUCKDB_EXTENSION_HTTPFS_LINKED
-		db.LoadStaticExtension<HttpfsExtension>();
-#else
-		return ExtensionLoadResult::NOT_LOADED;
-#endif
-	} else if (extension == "json") {
-#if DUCKDB_EXTENSION_JSON_LINKED
-		db.LoadStaticExtension<JsonExtension>();
-#else
-		// json extension required but not build: skip this test
-		return ExtensionLoadResult::NOT_LOADED;
-#endif
-	} else if (extension == "excel") {
-#if DUCKDB_EXTENSION_EXCEL_LINKED
-		db.LoadStaticExtension<ExcelExtension>();
-#else
-		// excel extension required but not build: skip this test
-		return ExtensionLoadResult::NOT_LOADED;
-#endif
-	} else if (extension == "jemalloc") {
-#if DUCKDB_EXTENSION_JEMALLOC_LINKED
-		db.LoadStaticExtension<JemallocExtension>();
-#else
-		// jemalloc extension required but not build: skip this test
-		return ExtensionLoadResult::NOT_LOADED;
-#endif
-	} else if (extension == "autocomplete") {
-#if DUCKDB_EXTENSION_AUTOCOMPLETE_LINKED
-		db.LoadStaticExtension<AutocompleteExtension>();
-#else
-		// autocomplete extension required but not build: skip this test
-		return ExtensionLoadResult::NOT_LOADED;
-#endif
-	} else if (extension == "inet") {
-#if DUCKDB_EXTENSION_INET_LINKED
-		db.LoadStaticExtension<InetExtension>();
-#else
-		// inet extension required but not build: skip this test
-		return ExtensionLoadResult::NOT_LOADED;
-#endif
-	} else if (extension == "core_functions") {
-#if DUCKDB_EXTENSION_CORE_FUNCTIONS_LINKED
-		db.LoadStaticExtension<CoreFunctionsExtension>();
-#else
-		// core_functions extension required but not build: skip this test
-		return ExtensionLoadResult::NOT_LOADED;
-#endif
-	}
-
-	return ExtensionLoadResult::LOADED_EXTENSION;
-}
-
+// typos:off
 static const char *const public_keys[] = {
     R"(
 -----BEGIN PUBLIC KEY-----
@@ -988,6 +830,7 @@ k9EbTcRNnxCvab/oqjvgyRuSmIES00v8jZOGQZQUpw02RN6yCBeX2i8GPsGjj/T9
 -----END PUBLIC KEY-----
 )", nullptr};
 
+// typos:on
 const vector<string> ExtensionHelper::GetPublicKeys(bool allow_community_extensions) {
 	vector<string> keys;
 	for (idx_t i = 0; public_keys[i]; i++) {
@@ -999,6 +842,63 @@ const vector<string> ExtensionHelper::GetPublicKeys(bool allow_community_extensi
 		}
 	}
 	return keys;
+}
+
+vector<string> ExtensionHelper::GetTrustedPublicKeys(DatabaseInstance &db, ExtensionRepositoryType repository_type,
+                                                     const string &repository_name) {
+	vector<string> keys;
+	switch (repository_type) {
+	case ExtensionRepositoryType::COMMUNITY:
+		if (!Settings::Get<AllowCommunityExtensionsSetting>(db)) {
+			return keys;
+		}
+		for (idx_t i = 0; community_public_keys[i]; i++) {
+			keys.emplace_back(community_public_keys[i]);
+		}
+		return keys;
+	case ExtensionRepositoryType::USER_PROVIDED: {
+		// when adding repositories has been forbidden, the user repositories are distrusted entirely: their keys are
+		// no longer trusted, so extensions installed from them can no longer be loaded. Note that 'undecided' still
+		// trusts existing repositories - only 'forbidden' distrusts them
+		if (ExtensionRepositoryManager::GetAccess(db) == ExtensionRepositoryAccess::FORBIDDEN) {
+			return keys;
+		}
+		// only the keys of the repository the extension came from are trusted
+		ExtensionRepository repository;
+		auto &fs = FileSystem::GetLocal(db);
+		if (ExtensionRepositoryManager::TryGetRepository(db, fs, repository_name, repository)) {
+			for (auto &public_key : repository.public_keys) {
+				keys.push_back(ExtensionRepositoryManager::ToPEMPublicKey(public_key));
+			}
+		}
+		return keys;
+	}
+	default:
+		// the core signing keys - note that these are the only keys that are ever trusted for extensions that come
+		// from the repositories maintained by DuckDB, or from any other origin we don't know
+		for (idx_t i = 0; public_keys[i]; i++) {
+			keys.emplace_back(public_keys[i]);
+		}
+		return keys;
+	}
+}
+
+ExtensionRepositoryType ExtensionHelper::ResolveTrustedSignatureOrigin(bool has_from_clause, bool core_only,
+                                                                       ExtensionRepositoryType recorded_origin) {
+	if (has_from_clause) {
+		// an explicit FROM names the origin, so its keys are the ones to trust
+		return recorded_origin;
+	}
+	if (core_only) {
+		// autoloading only ever targets core extensions - not even community keys are trusted
+		return ExtensionRepositoryType::CORE;
+	}
+	// a plain bare load trusts the fixed core and community keys: a community extension keeps its community keys, every
+	// other origin (including a user-provided repository) is verified against the core keys, never its own
+	if (recorded_origin == ExtensionRepositoryType::COMMUNITY) {
+		return ExtensionRepositoryType::COMMUNITY;
+	}
+	return ExtensionRepositoryType::CORE;
 }
 
 } // namespace duckdb

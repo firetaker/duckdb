@@ -17,10 +17,18 @@ class GZipFileSystem : public CompressedFileSystem {
 	static constexpr const idx_t BUFFER_SIZE = 1u << 15;
 
 public:
-	unique_ptr<FileHandle> OpenCompressedFile(unique_ptr<FileHandle> handle, bool write) override;
+	unique_ptr<FileHandle> OpenCompressedFile(QueryContext context, unique_ptr<FileHandle> handle, bool write) override;
 
 	std::string GetName() const override {
 		return "GZipFileSystem";
+	}
+
+	FileCompressionType GetCompressionType() override {
+		return FileCompressionType::GZIP;
+	}
+
+	bool CanHandleFile(const string &fpath) override {
+		return IsFileCompressed(fpath, FileCompressionType::GZIP);
 	}
 
 	//! Verifies that a buffer contains a valid GZIP header

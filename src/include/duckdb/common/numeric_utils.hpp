@@ -8,12 +8,31 @@
 
 #pragma once
 
+#include <cmath>
 #include <type_traits>
 
 #include "duckdb/common/hugeint.hpp"
 #include "duckdb/common/limits.hpp"
 
 namespace duckdb {
+
+template <class T>
+T RoundToNearestEven(T value) {
+	static_assert(std::is_floating_point<T>::value, "RoundToNearestEven requires a floating point type");
+	if (!std::isfinite(value)) {
+		return value;
+	}
+	const T truncated = std::trunc(value);
+	const T fraction = std::fabs(value - truncated);
+	if (fraction < static_cast<T>(0.5)) {
+		return truncated;
+	}
+	const T next = value < 0 ? truncated - static_cast<T>(1) : truncated + static_cast<T>(1);
+	if (fraction > static_cast<T>(0.5)) {
+		return next;
+	}
+	return std::fmod(truncated, static_cast<T>(2)) == 0 ? truncated : next;
+}
 
 template <class T>
 struct MakeSigned {
@@ -151,5 +170,62 @@ TO ExactNumericCast(float val) {
 #endif
 	return res;
 }
+
+template <class T>
+struct NextUnsigned {};
+
+template <>
+struct NextUnsigned<uint8_t> {
+	using type = uint16_t;
+};
+
+template <>
+struct NextUnsigned<uint16_t> {
+	using type = uint32_t;
+};
+
+template <>
+struct NextUnsigned<uint32_t> {
+	using type = uint64_t;
+};
+
+template <>
+struct NextUnsigned<uint64_t> {
+#if ((__GNUC__ >= 5) || defined(__clang__)) && defined(__SIZEOF_INT128__)
+	using type = __uint128_t;
+#else
+	using type = uhugeint_t;
+#endif
+};
+
+template <class TYPE>
+class FastMod {
+	using NEXT_TYPE = typename NextUnsigned<TYPE>::type;
+	static_assert(sizeof(NEXT_TYPE) != 0, "NextUnsigned not available for this type");
+
+public:
+	explicit FastMod(TYPE divisor_p) : divisor(divisor_p), multiplier((static_cast<TYPE>(-1) / divisor) + 1) {
+	}
+
+	TYPE Div(const TYPE &val) const {
+		return static_cast<TYPE>((static_cast<NEXT_TYPE>(val) * multiplier) >> (sizeof(TYPE) * 8)); // NOLINT
+	}
+
+	TYPE Mod(const TYPE &val, const TYPE &quotient) const {
+		return val - quotient * divisor;
+	}
+
+	TYPE Mod(const TYPE &val) const {
+		return Mod(val, Div(val));
+	}
+
+	const TYPE &GetDivisor() const {
+		return divisor;
+	}
+
+private:
+	const TYPE divisor;
+	const TYPE multiplier;
+};
 
 } // namespace duckdb

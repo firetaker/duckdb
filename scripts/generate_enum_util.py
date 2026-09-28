@@ -7,7 +7,74 @@ import glob
 os.chdir(os.path.dirname(__file__))
 
 # Dont generate serialization for these enums
-blacklist = ["RegexOptions", "Flags", "ContainerType", "Type", "DictionaryAppendState", "DictFSSTMode"]
+blacklist = [
+    "CMExpressionType",
+    "RegexOptions",
+    "Flags",
+    "ContainerType",
+    "Type",
+    "DictionaryAppendState",
+    "DictFSSTMode",
+    "DictFSSTCompressResult",
+    "ComplexJSONType",
+    "UnavailableReason",
+    "VirtualColumnBindingType",
+    "Slot",
+    "State",
+    "ScheduleMode",
+    "MemoryUpdateMode",
+    "SchedulePolicy",
+    "BatchDrainMode",
+    "AccountedWriteAdoption",
+    "FileWritePublicationState",
+    "IdleFilter",
+    "CreateDirectoryMode",
+    "RemoveDirectoryMode",
+    "CopyOutputOwnership",
+    "CopyOutputPublicationState",
+    "PendingTaskCountMode",
+    "PartitionKeyTrackerState",
+    "ClaimState",
+    "MoveBufferResult",
+    "CSVBufferResidency",
+    "AppendAdmission",
+    "AppendReservationState",
+    "BufferedPushState",
+    "CTEPipelineSelectionState",
+    "ConsumerLifecycle",
+    "ConsumerMode",
+    "ConsumerReadState",
+    "DataflowDependencyMode",
+    "ExchangeLogEvent",
+    "ExternalInputEventState",
+    "MetaPipelineDependencyMode",
+    "PipelineBroadcastExchangeCompletionMode",
+    "PipelineBroadcastExchangeDirectPushState",
+    "PipelineBroadcastExchangeLocalMode",
+    "PipelineDependencyType",
+    "PipelineInputChunkMode",
+    "PendingBatchAdvanceState",
+    "PipelineExternalInputCost",
+    "PipelineExternalInputSupport",
+    "PipelineSourceConsumption",
+    "ProducerState",
+    "ProjectionMode",
+    "ReaderWakeMode",
+    "RecursiveDependencyMode",
+    "ReservationKind",
+    "RowGroupBatchType",
+    "RuntimeFilterCastMode",
+    "SkippedTo",
+    "SourceFinishNotificationState",
+    "WatermarkState",
+    "WriterWakeMode",
+    # Internal to the Variant binary encoding; ParquetVariantNode::Kind is a nested enum,
+    # which this script would emit unqualified.
+    "Kind",
+    "ParquetGroupKind",
+    "VariantBasicType",
+    "VariantPrimitiveType",
+]
 
 enum_util_header_file = os.path.join("..", "src", "include", "duckdb", "common", "enum_util.hpp")
 enum_util_source_file = os.path.join("..", "src", "common", "enum_util.cpp")
@@ -19,6 +86,7 @@ overrides = {
         "TIMESTAMP_TZ": "TIMESTAMP WITH TIME ZONE",
         "TIME_TZ": "TIME WITH TIME ZONE",
         "TIMESTAMP_SEC": "TIMESTAMP_S",
+        "TIMESTAMP_TZ_NS": "TIMESTAMPTZ_NS",
     },
     "JoinType": {"OUTER": "FULL"},
     "OrderType": {
@@ -26,16 +94,26 @@ overrides = {
         "DESCENDING": ["DESCENDING", "DESC"],
         "ASCENDING": ["ASCENDING", "ASC"],
     },
+    "AllowParserOverride": {
+        "DEFAULT_OVERRIDE": "DEFAULT",
+        "FALLBACK_OVERRIDE": "FALLBACK",
+        "STRICT_OVERRIDE": "STRICT",
+    },
     "OrderByNullType": {
         "ORDER_DEFAULT": ["ORDER_DEFAULT", "DEFAULT"],
-        "NULLS_FIRST": ["NULLS_FIRST", "NULLS FIRST"],
-        "NULLS_LAST": ["NULLS_LAST", "NULLS LAST"],
+        "NULLS_FIRST": ["NULLS FIRST", "NULLS_FIRST"],
+        "NULLS_LAST": ["NULLS LAST", "NULLS_LAST"],
     },
     "CheckpointAbort": {
         "NO_ABORT": "NONE",
         "DEBUG_ABORT_BEFORE_TRUNCATE": "BEFORE_TRUNCATE",
         "DEBUG_ABORT_BEFORE_HEADER": "BEFORE_HEADER",
         "DEBUG_ABORT_AFTER_FREE_LIST_WRITE": "AFTER_FREE_LIST_WRITE",
+        "DEBUG_ABORT_BEFORE_WAL_FINISH": "BEFORE_WAL_FINISH",
+        "DEBUG_ABORT_BEFORE_MOVING_RECOVERY": "BEFORE_MOVING_RECOVERY",
+        "DEBUG_ABORT_BEFORE_DELETING_CHECKPOINT_WAL": "BEFORE_DELETING_CHECKPOINT_WAL",
+        "DEBUG_ABORT_BEFORE_HEADER_NON_FATAL": "BEFORE_HEADER_NON_FATAL",
+        "DEBUG_ABORT_IN_MEMORY_CHECKPOINT": "IN_MEMORY_CHECKPOINT",
     },
     "SampleMethod": {"SYSTEM_SAMPLE": "System", "BERNOULLI_SAMPLE": "Bernoulli", "RESERVOIR_SAMPLE": "Reservoir"},
     "TableReferenceType": {"EMPTY_FROM": "EMPTY"},
@@ -43,7 +121,7 @@ overrides = {
         "LOG_TRACE": "TRACE",
         "LOG_DEBUG": "DEBUG",
         "LOG_INFO": "INFO",
-        "LOG_WARN": "WARN",
+        "LOG_WARNING": "WARNING",
         "LOG_ERROR": "ERROR",
         "LOG_FATAL": "FATAL",
     },
@@ -53,7 +131,30 @@ overrides = {
         "HEAD_REQUEST": "HEAD",
         "DELETE_REQUEST": "DELETE",
         "POST_REQUEST": "POST",
+        "OPTIONS_REQUEST": "OPTIONS",
     },
+    "CompressionType": {
+        "COMPRESSION_AUTO": "AUTO",
+        "COMPRESSION_UNCOMPRESSED": "UNCOMPRESSED",
+        "COMPRESSION_CONSTANT": "CONSTANT",
+        "COMPRESSION_RLE": "RLE",
+        "COMPRESSION_DICTIONARY": "DICTIONARY",
+        "COMPRESSION_PFOR_DELTA": "PFOR",
+        "COMPRESSION_BITPACKING": "BITPACKING",
+        "COMPRESSION_FSST": "FSST",
+        "COMPRESSION_CHIMP": "CHIMP",
+        "COMPRESSION_PATAS": "PATAS",
+        "COMPRESSION_ALP": "ALP",
+        "COMPRESSION_ALPRD": "ALPRD",
+        "COMPRESSION_ZSTD": "ZSTD",
+        "COMPRESSION_ROARING": "ROARING",
+        "COMPRESSION_EMPTY": "EMPTY",
+        "COMPRESSION_DICT_FSST": "DICT_FSST",
+    },
+    "ArrowFormatVersion": {"V1_0": "1.0", "V1_1": "1.1", "V1_2": "1.2", "V1_3": "1.3", "V1_4": "1.4", "V1_5": "1.5"},
+    "TriggerTiming": {"BEFORE": "BEFORE", "AFTER": "AFTER", "INSTEAD_OF": "INSTEAD OF"},
+    "TriggerEventType": {"INSERT_EVENT": "INSERT", "DELETE_EVENT": "DELETE", "UPDATE_EVENT": "UPDATE"},
+    "TriggerForEach": {"STATEMENT": "STATEMENT", "ROW": "ROW"},
 }
 
 # get all the headers
@@ -62,8 +163,6 @@ for root, dirs, files in os.walk(os.path.join("..", "src")):
     for file in files:
         # Dont include the generated header itself recursively
         if file == "enum_util.hpp":
-            continue
-        if 'amalgamation' in root:
             continue
 
         if file.endswith(".hpp"):
@@ -220,6 +319,11 @@ with open(enum_util_source_file, "w") as f:
         f.write("\n\t};")
         f.write("\n\treturn values;")
         f.write("\n}\n\n")
+        # An enum whose last member is ENUM_SIZE counts itself: the sentinel is not one of the values,
+        # and appending a member no longer changes the generated count.
+        last_member = enum_members[-1][0] if enum_members else ""
+        if last_member == "ENUM_SIZE":
+            member_count = f"static_cast<uint32_t>({enum_name}::{last_member})"
         f.write(f"template<>\nconst char* EnumUtil::ToChars<{enum_name}>({enum_name} value) {{\n")
         f.write(
             f"\treturn StringUtil::EnumToString({enum_string_array}, {member_count}, \"{enum_name}\", static_cast<uint32_t>(value));\n"

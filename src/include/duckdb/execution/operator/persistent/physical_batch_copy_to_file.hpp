@@ -22,8 +22,11 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::BATCH_COPY_TO_FILE;
 
 public:
-	PhysicalBatchCopyToFile(vector<LogicalType> types, CopyFunction function, unique_ptr<FunctionData> bind_data,
-	                        idx_t estimated_cardinality);
+	PhysicalBatchCopyToFile(PhysicalPlan &physical_plan, vector<LogicalType> types, CopyFunction function,
+	                        unique_ptr<FunctionData> bind_data, idx_t estimated_cardinality);
+
+public:
+	InsertionOrderPreservingMap<string> ParamsToString() const override;
 
 	CopyFunction function;
 	unique_ptr<FunctionData> bind_data;
@@ -32,9 +35,14 @@ public:
 	CopyFunctionReturnType return_type;
 	bool write_empty_file;
 
+	//! Fine-grained control over writes
+	optional_idx batch_size;
+	optional_idx batch_size_bytes;
+
 public:
 	// Source interface
-	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override;
 
 	bool IsSource() const override {
 		return true;
@@ -49,10 +57,9 @@ public:
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	SinkNextBatchType NextBatch(ExecutionContext &context, OperatorSinkNextBatchInput &input) const override;
+	SinkNextBatchType UpdateMinBatchIndex(ExecutionContext &context, OperatorSinkNextBatchInput &input) const override;
 
-	OperatorPartitionInfo RequiredPartitionInfo() const override {
-		return OperatorPartitionInfo::BatchIndex();
-	}
+	OperatorPartitionInfo RequiredPartitionInfo() const override;
 
 	bool IsSink() const override {
 		return true;
@@ -60,6 +67,10 @@ public:
 
 	bool ParallelSink() const override {
 		return true;
+	}
+
+	PipelineExternalInputSupport GetExternalInputSupport() const override {
+		return PipelineExternalInputSupport::SUPPORTED;
 	}
 
 public:

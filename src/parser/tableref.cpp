@@ -1,19 +1,18 @@
 #include "duckdb/parser/tableref.hpp"
 
 #include "duckdb/common/printer.hpp"
-#include "duckdb/parser/tableref/list.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
-#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/to_string.hpp"
 
 namespace duckdb {
 
 string TableRef::BaseToString(string result) const {
-	vector<string> column_name_alias;
+	vector<Identifier> column_name_alias;
 	return BaseToString(std::move(result), column_name_alias);
 }
 
-string TableRef::AliasToString(const vector<string> &column_name_alias) const {
+string TableRef::AliasToString(const vector<Identifier> &column_name_alias) const {
 	string result;
 	if (!alias.empty()) {
 		result += StringUtil::Format(" AS %s", SQLIdentifier(alias));
@@ -25,7 +24,7 @@ string TableRef::AliasToString(const vector<string> &column_name_alias) const {
 			if (i > 0) {
 				result += ", ";
 			}
-			result += KeywordHelper::WriteOptionallyQuoted(column_name_alias[i]);
+			result += SQLIdentifier(column_name_alias[i]);
 		}
 		result += ")";
 	}
@@ -44,7 +43,7 @@ string TableRef::SampleToString() const {
 	return result;
 }
 
-string TableRef::BaseToString(string result, const vector<string> &column_name_alias) const {
+string TableRef::BaseToString(string result, const vector<Identifier> &column_name_alias) const {
 	result += AliasToString(column_name_alias);
 	result += SampleToString();
 	return result;

@@ -8,12 +8,12 @@
 
 #pragma once
 
+#include "duckdb/common/identifier.hpp"
 #include "duckdb/parser/tableref.hpp"
 
 namespace duckdb {
 
 class DelimGetRef : public TableRef {
-
 public:
 	explicit DelimGetRef(const vector<LogicalType> &types_p) : TableRef(TableReferenceType::DELIM_GET), types(types_p) {
 		for (idx_t i = 0; i < types.size(); i++) {
@@ -22,7 +22,7 @@ public:
 		}
 	}
 
-	vector<string> internal_aliases;
+	vector<Identifier> internal_aliases;
 	vector<LogicalType> types;
 
 public:

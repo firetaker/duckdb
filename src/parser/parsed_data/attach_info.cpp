@@ -1,74 +1,59 @@
 #include "duckdb/parser/parsed_data/attach_info.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
 
-#include "duckdb/storage/storage_info.hpp"
-#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/sql_identifier.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/main/config.hpp"
 
 namespace duckdb {
-
-StorageOptions AttachInfo::GetStorageOptions() const {
-	StorageOptions storage_options;
-	string storage_version_user_provided = "";
-	for (auto &entry : options) {
-		if (entry.first == "block_size") {
-			// Extract the block allocation size. This is NOT the actual memory available on a block (block_size),
-			// even though the corresponding option we expose to the user is called "block_size".
-			storage_options.block_alloc_size = entry.second.GetValue<uint64_t>();
-		} else if (entry.first == "encryption_key") {
-			storage_options.block_header_size = DEFAULT_ENCRYPTION_BLOCK_HEADER_SIZE;
-			storage_options.encryption = true;
-		} else if (entry.first == "row_group_size") {
-			storage_options.row_group_size = entry.second.GetValue<uint64_t>();
-		} else if (entry.first == "storage_version") {
-			storage_version_user_provided = entry.second.ToString();
-			storage_options.storage_version =
-			    SerializationCompatibility::FromString(entry.second.ToString()).serialization_version;
-		}
-	}
-	if (storage_options.encryption && (!storage_options.storage_version.IsValid() ||
-	                                   storage_options.storage_version.GetIndex() <
-	                                       SerializationCompatibility::FromString("v1.3.0").serialization_version)) {
-		if (!storage_version_user_provided.empty()) {
-			throw InvalidInputException(
-			    "Explicit provided STORAGE_VERSION (\"%s\") and ENCRYPTION_KEY (storage >= v1.3.0) are not compatible",
-			    storage_version_user_provided);
-		}
-		// set storage version to v1.3.0
-		storage_options.storage_version = SerializationCompatibility::FromString("v1.3.0").serialization_version;
-	}
-	return storage_options;
-}
 
 unique_ptr<AttachInfo> AttachInfo::Copy() const {
 	auto result = make_uniq<AttachInfo>();
 	result->name = name;
 	result->path = path;
+	if (parsed_path) {
+		result->parsed_path = parsed_path->Copy();
+	}
 	result->options = options;
+	for (auto &entry : parsed_options) {
+		result->parsed_options[entry.first] = entry.second->Copy();
+	}
 	result->on_conflict = on_conflict;
+	if (external_resource) {
+		result->external_resource = external_resource->Copy();
+	}
 	return result;
 }
 
 string AttachInfo::ToString() const {
 	string result = "";
+	// `ATTACH TO [NEW TEMPORARY] EXTERNAL RESOURCE <resource> [(create opts)] AS name [(attach opts)]`
+	if (external_resource) {
+		// No IF NOT EXISTS / OR REPLACE: AttachToExternalResource has no slot for either, so rendering
+		// one would produce SQL that cannot be parsed back.
+		result += "ATTACH TO " + external_resource->ToString();
+		if (!name.empty()) {
+			result += " AS " + SQLIdentifier(name);
+		}
+		result += RenderOptionList(parsed_options, options);
+		result += ";";
+		return result;
+	}
 	result += "ATTACH";
 	if (on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 		result += " IF NOT EXISTS";
 	} else if (on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
 		result += " OR REPLACE";
 	}
-	result += " DATABASE";
-	result += KeywordHelper::WriteQuoted(path, '\'');
+	result += " DATABASE ";
+	if (parsed_path) {
+		result += parsed_path->ToString();
+	} else {
+		result += SQLString(path);
+	}
 	if (!name.empty()) {
-		result += " AS " + KeywordHelper::WriteOptionallyQuoted(name);
+		result += " AS " + SQLIdentifier(name);
 	}
-	if (!options.empty()) {
-		vector<string> stringified;
-		for (auto &opt : options) {
-			stringified.push_back(StringUtil::Format("%s %s", opt.first, opt.second.ToSQLString()));
-		}
-		result += " (" + StringUtil::Join(stringified, ", ") + ")";
-	}
+	result += RenderOptionList(parsed_options, options);
 	result += ";";
 	return result;
 }

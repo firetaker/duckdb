@@ -1,4 +1,6 @@
 #include "duckdb/execution/operator/csv_scanner/encode/csv_encoder.hpp"
+#include "duckdb/catalog/catalog.hpp"
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/function/encoding_function.hpp"
@@ -8,7 +10,7 @@ namespace duckdb {
 
 void CSVEncoderBuffer::Initialize(idx_t encoded_size) {
 	encoded_buffer_size = encoded_size;
-	encoded_buffer = std::unique_ptr<char[]>(new char[encoded_size]);
+	encoded_buffer = duckdb::unique_ptr<char[]>(new char[encoded_size]);
 }
 
 char *CSVEncoderBuffer::Ptr() const {
@@ -37,19 +39,16 @@ void CSVEncoderBuffer::Reset() {
 	actual_encoded_buffer_size = 0;
 }
 
-CSVEncoder::CSVEncoder(ClientContext &context, const string &encoding_name_to_find, idx_t buffer_size)
-    : pass_on_byte(0) {
-	auto &config = DBConfig::GetConfig(context);
+CSVEncoder::CSVEncoder(ClientContext &context_p, const string &encoding_name_to_find, idx_t buffer_size)
+    : context(context_p), pass_on_byte(0) {
+	auto &config = DBConfig::GetConfig(context_p);
 	encoding_name = StringUtil::Lower(encoding_name_to_find);
 	auto function = config.GetEncodeFunction(encoding_name_to_find);
 	if (!function) {
-		if (!context.db->ExtensionIsLoaded("encodings")) {
-			// Maybe we can try to auto-load from our encodings extension, if this somehow fails, we just error.
-			auto extension_loaded = ExtensionHelper::TryAutoLoadExtension(context, "encodings");
-			if (extension_loaded) {
-				// If it successfully loaded, we can try to get our function again
-				function = config.GetEncodeFunction(encoding_name_to_find);
-			}
+		// Maybe we can try to auto-load from our encodings extension, if this somehow fails, we just error.
+		if (Catalog::TryAutoLoad(context_p, "encodings")) {
+			// If it successfully loaded, we can try to get our function again
+			function = config.GetEncodeFunction(encoding_name_to_find);
 		}
 	}
 	if (!function) {
@@ -57,7 +56,7 @@ CSVEncoder::CSVEncoder(ClientContext &context, const string &encoding_name_to_fi
 		auto loaded_encodings = config.GetLoadedEncodedFunctions();
 		std::ostringstream error;
 		error << "The CSV Reader does not support the encoding: \"" << encoding_name_to_find << "\"\n";
-		if (!context.db->ExtensionIsLoaded("encodings")) {
+		if (!context_p.db->ExtensionIsLoaded("encodings")) {
 			error << "It is possible that the encoding exists in the encodings extension. You can try \"INSTALL "
 			         "encodings; LOAD encodings\""
 			      << "\n";
@@ -69,16 +68,18 @@ CSVEncoder::CSVEncoder(ClientContext &context, const string &encoding_name_to_fi
 		throw InvalidInputException(error.str());
 	}
 
-	// We ensure that the encoded buffer size is an even number to make the two byte lookup on utf-16 work
-	idx_t encoded_buffer_size = buffer_size % 2 != 0 ? buffer_size - 1 : buffer_size;
-	if (encoded_buffer_size == 0) {
-		// This might happen if buffer size = 1
-		encoded_buffer_size = 2;
-	}
-	D_ASSERT(encoded_buffer_size > 0);
-	encoded_buffer.Initialize(encoded_buffer_size);
+	// The encoded buffer is even for the two byte lookup of utf-16, and fits a full lookup plus the probe byte
+	const idx_t lookup_bytes = function->GetLookupBytes();
+	encoded_buffer.Initialize(MaxValue<idx_t>(buffer_size - buffer_size % 2, lookup_bytes + lookup_bytes % 2));
 	remaining_bytes_buffer.Initialize(function->GetBytesPerIteration());
 	encoding_function = function;
+}
+
+void CSVEncoder::Reset() {
+	encoded_buffer.Reset();
+	encoded_buffer.last_buffer = false;
+	remaining_bytes_buffer.Reset();
+	has_pass_on_byte = false;
 }
 
 idx_t CSVEncoder::Encode(FileHandle &file_handle_input, char *output_buffer, const idx_t decoded_buffer_size) {
@@ -107,8 +108,7 @@ idx_t CSVEncoder::Encode(FileHandle &file_handle_input, char *output_buffer, con
 		    encoding_function->GetLookupBytes() > encoded_buffer.GetSize() - encoded_buffer.cur_pos) {
 			// We don't have enough lookup bytes for it, if that's the case, we need to set off these bytes to the next
 			// buffer
-			for (idx_t i = encoded_buffer.GetSize() - encoded_buffer.cur_pos; i < encoding_function->GetLookupBytes();
-			     i++) {
+			for (idx_t i = encoded_buffer.cur_pos; i < encoded_buffer.GetSize(); i++) {
 				pass_on_buffer.push_back(encoded_buffer.Ptr()[i]);
 			}
 		}
@@ -119,15 +119,15 @@ idx_t CSVEncoder::Encode(FileHandle &file_handle_input, char *output_buffer, con
 		if (has_pass_on_byte) {
 			encoded_buffer.Ptr()[pass_on_buffer.size()] = pass_on_byte;
 		}
-		auto actual_encoded_bytes = static_cast<idx_t>(
-		    file_handle_input.Read(encoded_buffer.Ptr() + pass_on_buffer.size() + has_pass_on_byte,
-		                           encoded_buffer.GetCapacity() - pass_on_buffer.size() - has_pass_on_byte));
+		const idx_t bytes_to_read = encoded_buffer.GetCapacity() - pass_on_buffer.size() - has_pass_on_byte;
+		auto actual_encoded_bytes = static_cast<idx_t>(file_handle_input.Read(
+		    context, encoded_buffer.Ptr() + pass_on_buffer.size() + has_pass_on_byte, bytes_to_read));
 		encoded_buffer.SetSize(actual_encoded_bytes + pass_on_buffer.size() + has_pass_on_byte);
-		if (actual_encoded_bytes < encoded_buffer.GetCapacity() - pass_on_buffer.size()) {
+		if (actual_encoded_bytes < bytes_to_read) {
 			encoded_buffer.last_buffer = true;
 			has_pass_on_byte = false;
 		} else {
-			auto bytes_read = static_cast<idx_t>(file_handle_input.Read(&pass_on_byte, 1));
+			auto bytes_read = static_cast<idx_t>(file_handle_input.Read(context, &pass_on_byte, 1));
 			if (bytes_read == 0) {
 				encoded_buffer.last_buffer = true;
 				has_pass_on_byte = false;

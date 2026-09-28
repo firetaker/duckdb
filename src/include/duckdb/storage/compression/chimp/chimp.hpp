@@ -9,12 +9,6 @@
 #pragma once
 
 #include "duckdb/storage/compression/chimp/algorithm/chimp128.hpp"
-#include "duckdb/common/assert.hpp"
-#include "duckdb/common/exception.hpp"
-#include "duckdb/common/helper.hpp"
-#include "duckdb/common/limits.hpp"
-#include "duckdb/common/types/validity_mask.hpp"
-#include "duckdb/function/compression_function.hpp"
 
 namespace duckdb {
 
@@ -35,9 +29,11 @@ struct ChimpType<float> {
 
 class ChimpPrimitives {
 public:
+	using METADATA_POINTER_TYPE = uint32_t;
+
 	static constexpr uint32_t CHIMP_SEQUENCE_SIZE = 1024;
 	static constexpr uint8_t MAX_BYTES_PER_VALUE = sizeof(double) + 1; // extra wiggle room
-	static constexpr uint8_t HEADER_SIZE = sizeof(uint32_t);
+	static constexpr uint8_t HEADER_SIZE = sizeof(METADATA_POINTER_TYPE);
 	static constexpr uint8_t FLAG_BIT_SIZE = 2;
 	static constexpr uint32_t LEADING_ZERO_BLOCK_BUFFERSIZE = 1 + (CHIMP_SEQUENCE_SIZE / 8) * 3;
 };

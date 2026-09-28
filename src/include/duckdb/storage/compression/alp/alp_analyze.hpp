@@ -9,13 +9,12 @@
 #pragma once
 
 #include "duckdb/function/compression_function.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/compression/alp/algorithm/alp.hpp"
 #include "duckdb/storage/compression/alp/alp_constants.hpp"
 #include "duckdb/storage/compression/alp/alp_utils.hpp"
 #include "duckdb/storage/compression/patas/patas.hpp"
 #include "duckdb/storage/table/column_data.hpp"
-
-#include <cmath>
 
 namespace duckdb {
 
@@ -24,7 +23,7 @@ struct AlpAnalyzeState : public AnalyzeState {
 public:
 	using EXACT_TYPE = typename FloatingToExact<T>::TYPE;
 
-	explicit AlpAnalyzeState(const CompressionInfo &info) : AnalyzeState(info), state() {
+	explicit AlpAnalyzeState(BlockManager &block_manager) : AnalyzeState(block_manager), compression_data() {
 	}
 
 	idx_t total_bytes_used = 0;
@@ -34,7 +33,8 @@ public:
 	idx_t vectors_count = 0;
 	vector<vector<T>> rowgroup_sample;
 	vector<vector<T>> complete_vectors_sampled;
-	alp::AlpCompressionState<T, true> state;
+	alp::AlpCompressionData<T, true> compression_data;
+	StorageVersion storage_version = StorageVersion::INVALID;
 
 public:
 	// Returns the required space to hyphotetically store the compressed segment
@@ -44,23 +44,14 @@ public:
 		current_bytes_used_in_segment = 0;
 	}
 
-	// Returns the required space to hyphotetically store the compressed vector
-	idx_t RequiredSpace() const {
-		idx_t required_space =
-		    state.bp_size + state.exceptions_count * (sizeof(EXACT_TYPE) + AlpConstants::EXCEPTION_POSITION_SIZE) +
-		    AlpConstants::EXPONENT_SIZE + AlpConstants::FACTOR_SIZE + AlpConstants::EXCEPTIONS_COUNT_SIZE +
-		    AlpConstants::FOR_SIZE + AlpConstants::BIT_WIDTH_SIZE + AlpConstants::METADATA_POINTER_SIZE;
-		return required_space;
-	}
-
-	void FlushVector() {
-		current_bytes_used_in_segment += RequiredSpace();
-		state.Reset();
+	void FlushVector(idx_t vector_size) {
+		current_bytes_used_in_segment += vector_size;
+		compression_data.Reset();
 	}
 
 	// Check if we have enough space in the segment to hyphotetically store the compressed vector
-	bool HasEnoughSpace() {
-		idx_t bytes_to_be_used = AlignValue(current_bytes_used_in_segment + RequiredSpace());
+	bool HasEnoughSpace(idx_t vector_size) {
+		idx_t bytes_to_be_used = AlignValue(current_bytes_used_in_segment + vector_size);
 		// We have enough space if the already used space + the required space for a new vector
 		// does not exceed the space of the block - the segment header (the pointer to the metadata)
 		return bytes_to_be_used <= (info.GetBlockSize() - AlpConstants::METADATA_POINTER_SIZE);
@@ -73,16 +64,30 @@ public:
 
 template <class T>
 unique_ptr<AnalyzeState> AlpInitAnalyze(ColumnData &col_data, PhysicalType type) {
-	CompressionInfo info(col_data.GetBlockManager());
-	return make_uniq<AlpAnalyzeState<T>>(info);
+	auto &storage_manager = col_data.GetStorageManager();
+	auto &block_manager = col_data.GetBlockManager();
+	const auto storage_version = storage_manager.GetStorageVersion();
+
+	if (block_manager.GetBlockSize() + block_manager.GetBlockHeaderSize() < DEFAULT_BLOCK_ALLOC_SIZE) {
+		if (StorageManager::IsPriorToVersion(StorageVersion::V1_5_0, storage_version)) {
+			// Before v1.5.0, blocks cannot use uncompressed-vector fallback
+			return nullptr;
+		}
+	}
+
+	auto state = make_uniq<AlpAnalyzeState<T>>(block_manager);
+	state->storage_version = storage_version;
+	return unique_ptr<AnalyzeState>(std::move(state));
 }
 
 /*
  * ALP Analyze step only pushes the needed samples to estimate the compression size in the finalize step
  */
 template <class T>
-bool AlpAnalyze(AnalyzeState &state, Vector &input, idx_t count) {
-	auto &analyze_state = (AlpAnalyzeState<T> &)state;
+bool AlpAnalyze(AnalyzeState &state, const Vector &input) {
+	auto &analyze_state = state.Cast<AlpAnalyzeState<T>>();
+
+	const auto count = input.size();
 	bool must_skip_current_vector = alp::AlpUtils::MustSkipSamplingFromCurrentVector(
 	    analyze_state.vectors_count, analyze_state.vectors_sampled_count, count);
 	analyze_state.vectors_count += 1;
@@ -92,7 +97,7 @@ bool AlpAnalyze(AnalyzeState &state, Vector &input, idx_t count) {
 	}
 
 	UnifiedVectorFormat vdata;
-	input.ToUnifiedFormat(count, vdata);
+	input.ToUnifiedFormat(vdata);
 	auto data = UnifiedVectorFormat::GetData<T>(vdata);
 
 	alp::AlpSamplingParameters sampling_params = alp::AlpUtils::GetSamplingParameters(count);
@@ -105,7 +110,7 @@ bool AlpAnalyze(AnalyzeState &state, Vector &input, idx_t count) {
 	//! We need to store the entire sampled vector to perform the 'analyze' compression in it
 	idx_t nulls_idx = 0;
 	// We optimize by doing a different loop when there are no nulls
-	if (vdata.validity.AllValid()) {
+	if (vdata.validity.CannotHaveNull()) {
 		for (idx_t i = 0; i < sampling_params.n_lookup_values; i++) {
 			auto idx = vdata.sel->get_index(i);
 			T value = data[idx];
@@ -146,20 +151,29 @@ bool AlpAnalyze(AnalyzeState &state, Vector &input, idx_t count) {
  */
 template <class T>
 idx_t AlpFinalAnalyze(AnalyzeState &state) {
-	auto &analyze_state = (AlpAnalyzeState<T> &)state;
+	auto &analyze_state = state.Cast<AlpAnalyzeState<T>>();
 
 	// Finding the Top K combinations of Exponent and Factor
-	alp::AlpCompression<T, true>::FindTopKCombinations(analyze_state.rowgroup_sample, analyze_state.state);
+	alp::AlpCompression<T, true>::FindTopKCombinations(analyze_state.rowgroup_sample, analyze_state.compression_data);
 
 	// Encode the entire sampled vectors to estimate a compression size
 	idx_t compressed_values = 0;
 	for (auto &vector_to_compress : analyze_state.complete_vectors_sampled) {
 		alp::AlpCompression<T, true>::Compress(vector_to_compress.data(), vector_to_compress.size(),
-		                                       analyze_state.state);
-		if (!analyze_state.HasEnoughSpace()) {
+		                                       analyze_state.compression_data);
+		const idx_t uncompressed_size = AlpConstants::EXPONENT_SIZE + sizeof(T) * vector_to_compress.size();
+		const idx_t compressed_size = analyze_state.compression_data.RequiredSpace();
+		const bool should_compress =
+		    compressed_size < uncompressed_size ||
+		    StorageManager::IsPriorToVersion(StorageVersion::V1_5_0, analyze_state.storage_version);
+
+		const idx_t vector_size = should_compress ? compressed_size : uncompressed_size;
+
+		if (!analyze_state.HasEnoughSpace(vector_size)) {
 			analyze_state.FlushSegment();
 		}
-		analyze_state.FlushVector();
+		analyze_state.FlushVector(vector_size);
+
 		compressed_values += vector_to_compress.size();
 	}
 

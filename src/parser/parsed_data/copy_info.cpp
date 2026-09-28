@@ -1,18 +1,27 @@
 #include "duckdb/parser/parsed_data/copy_info.hpp"
+
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/parser/query_node.hpp"
 
 namespace duckdb {
 
+CopyInfo::CopyInfo()
+    : ParseInfo(TYPE), is_from(false), is_format_auto_detected(true),
+      qualified_name({Identifier::DefaultSchema()}, Identifier()) {
+}
+
 unique_ptr<CopyInfo> CopyInfo::Copy() const {
 	auto result = make_uniq<CopyInfo>();
-	result->catalog = catalog;
-	result->schema = schema;
-	result->table = table;
+	result->qualified_name = qualified_name;
 	result->select_list = select_list;
+	result->file_path_expression = file_path_expression ? file_path_expression->Copy() : nullptr;
 	result->file_path = file_path;
 	result->is_from = is_from;
 	result->format = format;
 	result->is_format_auto_detected = is_format_auto_detected;
+	for (auto &entry : parsed_options) {
+		result->parsed_options[entry.first] = entry.second ? entry.second->Copy() : nullptr;
+	}
 	result->options = options;
 	if (select_statement) {
 		result->select_statement = select_statement->Copy();
@@ -20,11 +29,38 @@ unique_ptr<CopyInfo> CopyInfo::Copy() const {
 	return result;
 }
 
-string CopyInfo::CopyOptionsToString(const string &format, bool is_format_auto_detected,
-                                     const case_insensitive_map_t<vector<Value>> &options) {
+bool CopyInfo::Equals(const CopyInfo &other) const {
+	if (qualified_name != other.qualified_name || select_list != other.select_list || is_from != other.is_from ||
+	    format != other.format || is_format_auto_detected != other.is_format_auto_detected ||
+	    file_path != other.file_path || options.size() != other.options.size() ||
+	    parsed_options.size() != other.parsed_options.size()) {
+		return false;
+	}
+	if (!ParsedExpression::Equals(file_path_expression, other.file_path_expression)) {
+		return false;
+	}
+	for (auto &entry : options) {
+		auto other_entry = other.options.find(entry.first);
+		if (other_entry == other.options.end() || entry.second != other_entry->second) {
+			return false;
+		}
+	}
+	for (auto &entry : parsed_options) {
+		auto other_entry = other.parsed_options.find(entry.first);
+		if (other_entry == other.parsed_options.end() || !ParsedExpression::Equals(entry.second, other_entry->second)) {
+			return false;
+		}
+	}
+	if (select_statement && other.select_statement) {
+		return select_statement->Equals(other.select_statement.get());
+	}
+	return !select_statement && !other.select_statement;
+}
+
+string CopyInfo::CopyOptionsToString() const {
 	// We only output the format if there is a format, and it was manually set.
 	const bool output_format = !format.empty() && !is_format_auto_detected;
-	if (!output_format && options.empty()) {
+	if (!output_format && options.empty() && parsed_options.empty()) {
 		return string();
 	}
 	string result;
@@ -32,13 +68,22 @@ string CopyInfo::CopyOptionsToString(const string &format, bool is_format_auto_d
 	result += " (";
 	vector<string> stringified;
 	if (!format.empty() && !is_format_auto_detected) {
-		stringified.push_back(StringUtil::Format(" FORMAT %s", format));
+		stringified.push_back(StringUtil::Format(" FORMAT %s", SQLString(format)));
+	}
+	for (auto &opt : parsed_options) {
+		auto &name = opt.first;
+		auto &expr = opt.second;
+		string option_string = StringUtil::Format("%s", name);
+		if (expr) {
+			option_string += " " + expr->ToString();
+		}
+		stringified.push_back(option_string);
 	}
 	for (auto &opt : options) {
 		auto &name = opt.first;
 		auto &values = opt.second;
 
-		auto option = name + " ";
+		auto option = StringUtil::Format("%s ", name);
 		if (values.empty()) {
 			// Options like HEADER don't need an explicit value
 			// just providing the name already sets it to true
@@ -61,14 +106,14 @@ string CopyInfo::CopyOptionsToString(const string &format, bool is_format_auto_d
 string CopyInfo::TablePartToString() const {
 	string result;
 
-	D_ASSERT(!table.empty());
-	result += QualifierToString(catalog, schema, table);
+	D_ASSERT(!GetQualifiedName().Name().empty());
+	result += qualified_name.ToString(QualifiedNameToStringMode::HIDE_DEFAULT_SCHEMA);
 
 	// (c1, c2, ..)
 	if (!select_list.empty()) {
 		vector<string> options;
 		for (auto &option : select_list) {
-			options.push_back(KeywordHelper::WriteOptionallyQuoted(option));
+			options.push_back(SQLIdentifier::ToString(option));
 		}
 		result += " (";
 		result += StringUtil::Join(options, ", ");
@@ -84,8 +129,6 @@ string CopyInfo::ToString() const {
 		D_ASSERT(!select_statement);
 		result += TablePartToString();
 		result += " FROM";
-		result += StringUtil::Format(" %s", SQLString(file_path));
-		result += CopyOptionsToString(format, is_format_auto_detected, options);
 	} else {
 		if (select_statement) {
 			// COPY (select-node) TO ...
@@ -94,9 +137,15 @@ string CopyInfo::ToString() const {
 			result += TablePartToString();
 		}
 		result += " TO ";
-		result += StringUtil::Format("%s", SQLString(file_path));
-		result += CopyOptionsToString(format, is_format_auto_detected, options);
 	}
+	if (file_path_expression && file_path.empty()) {
+		result += "(";
+		result += file_path_expression->ToString();
+		result += ")";
+	} else {
+		result += StringUtil::Format(" %s", SQLString(file_path));
+	}
+	result += CopyOptionsToString();
 	result += ";";
 	return result;
 }

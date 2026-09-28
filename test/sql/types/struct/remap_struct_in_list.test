@@ -2,9 +2,6 @@
 # description: Test struct remapping
 # group: [struct]
 
-statement ok
-PRAGMA enable_verification
-
 # Remapping operations:
 # - rename 'list.i' -> 'list.v1'
 # - rename 'list.j' -> 'list.v2'
@@ -56,3 +53,52 @@ SELECT remap_struct(
 ); -- defaults
 ----
 [{'v1': 1, 'v2': {'x': 42, 'y': NULL, 'z': 100}, 'v3': NULL}]
+
+# remap large list
+statement ok
+CREATE TABLE large_list(s STRUCT(i INTEGER)[]);
+
+statement ok
+INSERT INTO large_list (SELECT LIST(CASE WHEN i%2=0 THEN {'i': i} ELSE NULL END) FROM range(5000) t(i));
+
+query III
+SELECT COUNT(*), COUNT(j), SUM(j)
+FROM (
+	SELECT UNNEST(remap_struct(s, NULL::ROW(j INTEGER)[], {'list': ROW('list', {'j': 'i'})}, NULL), recursive := True) FROM large_list
+)
+----
+5000	2500	6247500
+
+# NULL-typed list elements can become nested types without changing the list length.
+query II
+SELECT typeof(mapped) = typeof(NULL::STRUCT(a INTEGER)[]), mapped
+FROM (SELECT remap_struct(
+    [NULL::"NULL", NULL::"NULL"],
+    NULL::STRUCT(a INTEGER)[],
+    {'list': 'list'},
+    NULL
+) AS mapped);
+----
+true	[NULL, NULL]
+
+query II
+SELECT typeof(mapped) = typeof(NULL::INTEGER[][]), mapped
+FROM (SELECT remap_struct(
+    [NULL::"NULL", NULL::"NULL"],
+    NULL::INTEGER[][],
+    {'list': 'list'},
+    NULL
+) AS mapped);
+----
+true	[NULL, NULL]
+
+query II
+SELECT typeof(mapped) = typeof(NULL::MAP(VARCHAR, INTEGER)[]), mapped
+FROM (SELECT remap_struct(
+    [NULL::"NULL", NULL::"NULL"],
+    NULL::MAP(VARCHAR, INTEGER)[],
+    {'list': 'list'},
+    NULL
+) AS mapped);
+----
+true	[NULL, NULL]

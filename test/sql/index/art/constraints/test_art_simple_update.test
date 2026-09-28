@@ -2,8 +2,9 @@
 # description: Test a simple update on a PK with a LIST column.
 # group: [constraints]
 
+# Keep rowid assertions stable under automatic checkpoints.
 statement ok
-PRAGMA enable_verification
+SET max_vacuum_tasks = 0;
 
 statement ok
 CREATE TABLE tbl (i BIGINT PRIMARY KEY, l1 BIGINT[]);

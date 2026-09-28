@@ -63,7 +63,7 @@
     },
     {
         "name": "format",
-        "parameters": "format,parameters...",
+        "parameters": "format,...",
         "description": "Formats a string using the fmt syntax.",
         "example": "format('Benchmark \"{}\" took {} seconds', 'CSV', 42)",
         "categories": ["string"],
@@ -77,6 +77,14 @@
         "categories": ["string", "numeric"],
         "type": "scalar_function",
         "aliases": ["formatReadableSize"]
+    },
+    {
+        "name": "parse_formatted_bytes",
+        "parameters": "string",
+        "description": "Parses a human-readable representation of a size in bytes into an integer.",
+        "example": "parse_formatted_bytes('16 KiB')",
+        "categories": ["string", "numeric"],
+        "type": "scalar_function"
     },
     {
         "name": "formatReadableDecimalSize",
@@ -241,7 +249,7 @@
     },
     {
         "name": "printf",
-        "parameters": "format,parameters...",
+        "parameters": "format,...",
         "description": "Formats a `string` using printf syntax.",
         "example": "printf('Benchmark \"%s\" took %d seconds', 'CSV', 42)",
         "categories": ["string"],

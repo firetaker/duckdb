@@ -4,6 +4,7 @@ add_subdirectory(pragma)
 add_subdirectory(scalar)
 add_subdirectory(table)
 add_subdirectory(window)
+add_subdirectory(variant)
 
 if(GENERATE_EXTENSION_ENTRIES)
   add_definitions(-DGENERATE_EXTENSION_ENTRIES)
@@ -13,8 +14,11 @@ add_library_unity(
   duckdb_function
   OBJECT
   aggregate_function.cpp
+  aggregate_state_serialization.cpp
+  builtin_function_lookup.cpp
   built_in_functions.cpp
   cast_rules.cpp
+  combine_types_rules.cpp
   compression_config.cpp
   copy_function.cpp
   encoding_function.cpp
@@ -29,7 +33,9 @@ add_library_unity(
   table_macro_function.cpp
   scalar_function.cpp
   table_function.cpp
-  udf_function.cpp)
+  type_constructor.cpp
+  window_function.cpp
+  copy_blob.cpp)
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_function>
     PARENT_SCOPE)

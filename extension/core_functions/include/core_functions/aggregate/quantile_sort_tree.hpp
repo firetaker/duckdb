@@ -9,8 +9,11 @@
 #pragma once
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
 #include "core_functions/aggregate/quantile_helpers.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/common/operator/interpolate.hpp"
 #include "duckdb/common/operator/multiply.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/function/window/window_index_tree.hpp"
@@ -24,12 +27,15 @@ namespace duckdb {
 template <typename INPUT_TYPE>
 struct QuantileCursor {
 	explicit QuantileCursor(const WindowPartitionInput &partition) : inputs(*partition.inputs) {
-		D_ASSERT(partition.column_ids.size() == 1);
-		inputs.InitializeScan(scan, partition.column_ids);
+		// the quantile parameter is folded into the bind data by the bind, but stays part of the expression tree -
+		// only the leading input column is paged in
+		D_ASSERT(!partition.column_ids.empty());
+		vector<column_t> input_ids {partition.column_ids[0]};
+		inputs.InitializeScan(scan, input_ids);
 		inputs.InitializeScanChunk(scan, page);
 
-		D_ASSERT(partition.all_valid.size() == 1);
-		all_valid = partition.all_valid[0];
+		D_ASSERT(!partition.all_valid.empty());
+		cannot_have_null = partition.all_valid[0];
 	}
 
 	inline sel_t RowOffset(idx_t row_idx) const {
@@ -45,7 +51,7 @@ struct QuantileCursor {
 		if (!RowIsVisible(row_idx)) {
 			inputs.Seek(row_idx, scan, page);
 			data = FlatVector::GetData<INPUT_TYPE>(page.data[0]);
-			validity = &FlatVector::Validity(page.data[0]);
+			validity = &FlatVector::ValidityMutable(page.data[0]);
 		}
 		return RowOffset(row_idx);
 	}
@@ -60,8 +66,8 @@ struct QuantileCursor {
 		return validity->RowIsValid(offset);
 	}
 
-	inline bool AllValid() {
-		return all_valid;
+	inline bool CannotHaveNull() {
+		return cannot_have_null;
 	}
 
 	//! Windowed paging
@@ -75,7 +81,7 @@ struct QuantileCursor {
 	//! The validity mask
 	const ValidityMask *validity = nullptr;
 	//! Paged chunks do not track this but it is really necessary for performance
-	bool all_valid;
+	bool cannot_have_null;
 };
 
 // Direct access
@@ -144,41 +150,26 @@ struct QuantileCompare {
 		const auto lval = accessor_l(lhs);
 		const auto rval = accessor_r(rhs);
 
-		return desc ? (rval < lval) : (lval < rval);
+		return desc ? LessThan::Operation(rval, lval) : LessThan::Operation(lval, rval);
 	}
 };
 
-struct CastInterpolation {
+struct QuantileCast {
 	template <class INPUT_TYPE, class TARGET_TYPE>
-	static inline TARGET_TYPE Cast(const INPUT_TYPE &src, Vector &result) {
+	static inline TARGET_TYPE Operation(const INPUT_TYPE &src, Vector &result) {
 		return Cast::Operation<INPUT_TYPE, TARGET_TYPE>(src);
 	}
-	template <typename TARGET_TYPE>
-	static inline TARGET_TYPE Interpolate(const TARGET_TYPE &lo, const double d, const TARGET_TYPE &hi) {
-		const auto delta = hi - lo;
-		return LossyNumericCast<TARGET_TYPE>(lo + delta * d);
-	}
 };
 
 template <>
-interval_t CastInterpolation::Cast(const dtime_t &src, Vector &result);
+interval_t QuantileCast::Operation(const dtime_t &src, Vector &result);
 template <>
-double CastInterpolation::Interpolate(const double &lo, const double d, const double &hi);
-template <>
-dtime_t CastInterpolation::Interpolate(const dtime_t &lo, const double d, const dtime_t &hi);
-template <>
-timestamp_t CastInterpolation::Interpolate(const timestamp_t &lo, const double d, const timestamp_t &hi);
-template <>
-hugeint_t CastInterpolation::Interpolate(const hugeint_t &lo, const double d, const hugeint_t &hi);
-template <>
-interval_t CastInterpolation::Interpolate(const interval_t &lo, const double d, const interval_t &hi);
-template <>
-string_t CastInterpolation::Cast(const string_t &src, Vector &result);
+string_t QuantileCast::Operation(const string_t &src, Vector &result);
 
 // Continuous interpolation
 template <bool DISCRETE>
-struct Interpolator {
-	Interpolator(const QuantileValue &q, const idx_t n_p, const bool desc_p)
+struct QuantileInterpolator {
+	QuantileInterpolator(const QuantileValue &q, const idx_t n_p, const bool desc_p)
 	    : desc(desc_p), RN((double)(n_p - 1) * q.dbl), FRN(ExactNumericCast<idx_t>(floor(RN))),
 	      CRN(ExactNumericCast<idx_t>(ceil(RN))), begin(0), end(n_p) {
 	}
@@ -187,11 +178,11 @@ struct Interpolator {
 	TARGET_TYPE Interpolate(INPUT_TYPE lidx, INPUT_TYPE hidx, Vector &result, const ACCESSOR &accessor) const {
 		using ACCESS_TYPE = typename ACCESSOR::RESULT_TYPE;
 		if (lidx == hidx) {
-			return CastInterpolation::Cast<ACCESS_TYPE, TARGET_TYPE>(accessor(lidx), result);
+			return QuantileCast::Operation<ACCESS_TYPE, TARGET_TYPE>(accessor(lidx), result);
 		} else {
-			auto lo = CastInterpolation::Cast<ACCESS_TYPE, TARGET_TYPE>(accessor(lidx), result);
-			auto hi = CastInterpolation::Cast<ACCESS_TYPE, TARGET_TYPE>(accessor(hidx), result);
-			return CastInterpolation::Interpolate<TARGET_TYPE>(lo, RN - FRN, hi);
+			auto lo = QuantileCast::Operation<ACCESS_TYPE, TARGET_TYPE>(accessor(lidx), result);
+			auto hi = QuantileCast::Operation<ACCESS_TYPE, TARGET_TYPE>(accessor(hidx), result);
+			return InterpolateOperator::Operation<TARGET_TYPE>(lo, RN - FRN, hi);
 		}
 	}
 
@@ -201,24 +192,24 @@ struct Interpolator {
 		QuantileCompare<ACCESSOR> comp(accessor, desc);
 		if (CRN == FRN) {
 			std::nth_element(v_t + begin, v_t + FRN, v_t + end, comp);
-			return CastInterpolation::Cast<ACCESS_TYPE, TARGET_TYPE>(accessor(v_t[FRN]), result);
+			return QuantileCast::Operation<ACCESS_TYPE, TARGET_TYPE>(accessor(v_t[FRN]), result);
 		} else {
 			std::nth_element(v_t + begin, v_t + FRN, v_t + end, comp);
 			std::nth_element(v_t + FRN, v_t + CRN, v_t + end, comp);
-			auto lo = CastInterpolation::Cast<ACCESS_TYPE, TARGET_TYPE>(accessor(v_t[FRN]), result);
-			auto hi = CastInterpolation::Cast<ACCESS_TYPE, TARGET_TYPE>(accessor(v_t[CRN]), result);
-			return CastInterpolation::Interpolate<TARGET_TYPE>(lo, RN - FRN, hi);
+			auto lo = QuantileCast::Operation<ACCESS_TYPE, TARGET_TYPE>(accessor(v_t[FRN]), result);
+			auto hi = QuantileCast::Operation<ACCESS_TYPE, TARGET_TYPE>(accessor(v_t[CRN]), result);
+			return InterpolateOperator::Operation<TARGET_TYPE>(lo, RN - FRN, hi);
 		}
 	}
 
 	template <class INPUT_TYPE, class TARGET_TYPE>
 	inline TARGET_TYPE Extract(const INPUT_TYPE *dest, Vector &result) const {
 		if (CRN == FRN) {
-			return CastInterpolation::Cast<INPUT_TYPE, TARGET_TYPE>(dest[0], result);
+			return QuantileCast::Operation<INPUT_TYPE, TARGET_TYPE>(dest[0], result);
 		} else {
-			auto lo = CastInterpolation::Cast<INPUT_TYPE, TARGET_TYPE>(dest[0], result);
-			auto hi = CastInterpolation::Cast<INPUT_TYPE, TARGET_TYPE>(dest[1], result);
-			return CastInterpolation::Interpolate<TARGET_TYPE>(lo, RN - FRN, hi);
+			auto lo = QuantileCast::Operation<INPUT_TYPE, TARGET_TYPE>(dest[0], result);
+			auto hi = QuantileCast::Operation<INPUT_TYPE, TARGET_TYPE>(dest[1], result);
+			return InterpolateOperator::Operation<TARGET_TYPE>(lo, RN - FRN, hi);
 		}
 	}
 
@@ -233,7 +224,7 @@ struct Interpolator {
 
 // Discrete "interpolation"
 template <>
-struct Interpolator<true> {
+struct QuantileInterpolator<true> {
 	static inline idx_t Index(const QuantileValue &q, const idx_t n) {
 		idx_t floored;
 		switch (q.val.type().id()) {
@@ -257,14 +248,14 @@ struct Interpolator<true> {
 		return MaxValue<idx_t>(1, n - floored) - 1;
 	}
 
-	Interpolator(const QuantileValue &q, const idx_t n_p, bool desc_p)
+	QuantileInterpolator(const QuantileValue &q, const idx_t n_p, bool desc_p)
 	    : desc(desc_p), FRN(Index(q, n_p)), CRN(FRN), begin(0), end(n_p) {
 	}
 
 	template <class INPUT_TYPE, class TARGET_TYPE, typename ACCESSOR = QuantileDirect<INPUT_TYPE>>
 	TARGET_TYPE Interpolate(INPUT_TYPE lidx, INPUT_TYPE hidx, Vector &result, const ACCESSOR &accessor) const {
 		using ACCESS_TYPE = typename ACCESSOR::RESULT_TYPE;
-		return CastInterpolation::Cast<ACCESS_TYPE, TARGET_TYPE>(accessor(lidx), result);
+		return QuantileCast::Operation<ACCESS_TYPE, TARGET_TYPE>(accessor(lidx), result);
 	}
 
 	template <class INPUT_TYPE, typename ACCESSOR = QuantileDirect<INPUT_TYPE>>
@@ -277,12 +268,12 @@ struct Interpolator<true> {
 	template <class INPUT_TYPE, class TARGET_TYPE, typename ACCESSOR = QuantileDirect<INPUT_TYPE>>
 	TARGET_TYPE Operation(INPUT_TYPE *v_t, Vector &result, const ACCESSOR &accessor = ACCESSOR()) const {
 		using ACCESS_TYPE = typename ACCESSOR::RESULT_TYPE;
-		return CastInterpolation::Cast<ACCESS_TYPE, TARGET_TYPE>(InterpolateInternal(v_t, accessor), result);
+		return QuantileCast::Operation<ACCESS_TYPE, TARGET_TYPE>(InterpolateInternal(v_t, accessor), result);
 	}
 
 	template <class INPUT_TYPE, class TARGET_TYPE>
 	TARGET_TYPE Extract(const INPUT_TYPE *dest, Vector &result) const {
-		return CastInterpolation::Cast<INPUT_TYPE, TARGET_TYPE>(dest[0], result);
+		return QuantileCast::Operation<INPUT_TYPE, TARGET_TYPE>(dest[0], result);
 	}
 
 	const bool desc;
@@ -305,8 +296,11 @@ struct QuantileIncluded {
 		return fmask.RowIsValid(idx) && dmask.RowIsValid(idx);
 	}
 
+	inline bool CannotHaveNull() {
+		return fmask.CannotHaveNull() && dmask.CannotHaveNull();
+	}
 	inline bool AllValid() {
-		return fmask.AllValid() && dmask.AllValid();
+		return CannotHaveNull();
 	}
 
 	const ValidityMask &fmask;
@@ -314,15 +308,18 @@ struct QuantileIncluded {
 };
 
 struct QuantileSortTree {
-
 	unique_ptr<WindowIndexTree> index_tree;
 
 	QuantileSortTree(AggregateInputData &aggr_input_data, const WindowPartitionInput &partition) {
 		// TODO: Two pass parallel sorting using Build
 		auto &inputs = *partition.inputs;
+		auto &interrupt = partition.interrupt_state;
 		ColumnDataScanState scan;
 		DataChunk sort;
-		inputs.InitializeScan(scan, partition.column_ids);
+		// only the leading input column is sorted on - see QuantileCursor
+		D_ASSERT(!partition.column_ids.empty());
+		vector<column_t> input_ids {partition.column_ids[0]};
+		inputs.InitializeScan(scan, input_ids);
 		inputs.InitializeScanChunk(scan, sort);
 
 		// Sort on the single argument
@@ -334,8 +331,8 @@ struct QuantileSortTree {
 		vector<column_t> sort_idx(1, 0);
 		const auto count = partition.count;
 
-		index_tree = make_uniq<WindowIndexTree>(partition.context, order_bys, sort_idx, count);
-		auto index_state = index_tree->GetLocalState();
+		index_tree = make_uniq<WindowIndexTree>(partition.context.client, order_bys, sort_idx, count);
+		auto index_state = index_tree->GetLocalState(partition.context);
 		auto &local_state = index_state->Cast<WindowIndexTreeLocalState>();
 
 		//	Build the indirection array by scanning the valid indices
@@ -343,21 +340,21 @@ struct QuantileSortTree {
 		SelectionVector filter_sel(STANDARD_VECTOR_SIZE);
 		while (inputs.Scan(scan, sort)) {
 			const auto row_idx = scan.current_row_index;
-			if (!filter_mask.AllValid() || !partition.all_valid[0]) {
+			if (filter_mask.CanHaveNull() || !partition.all_valid[0]) {
 				auto &key = sort.data[0];
-				auto &validity = FlatVector::Validity(key);
+				auto &validity = FlatVector::ValidityMutable(key);
 				idx_t filtered = 0;
 				for (sel_t i = 0; i < sort.size(); ++i) {
 					if (filter_mask.RowIsValid(i + row_idx) && validity.RowIsValid(i)) {
 						filter_sel[filtered++] = i;
 					}
 				}
-				local_state.SinkChunk(sort, row_idx, filter_sel, filtered);
+				local_state.Sink(partition.context, sort, row_idx, filter_sel, filtered, interrupt);
 			} else {
-				local_state.SinkChunk(sort, row_idx, nullptr, 0);
+				local_state.Sink(partition.context, sort, row_idx, nullptr, 0, interrupt);
 			}
 		}
-		local_state.Sort();
+		local_state.Finalize(partition.context, interrupt);
 	}
 
 	inline idx_t SelectNth(const SubFrames &frames, size_t n) const {
@@ -372,8 +369,8 @@ struct QuantileSortTree {
 		//	Thread safe and idempotent.
 		index_tree->Build();
 
-		//	Find the interpolated indicies within the frame
-		Interpolator<DISCRETE> interp(q, n, false);
+		//	Find the interpolated indices within the frame
+		QuantileInterpolator<DISCRETE> interp(q, n, false);
 		const auto lo_data = SelectNth(frames, interp.FRN);
 		auto hi_data = lo_data;
 		if (interp.CRN != interp.FRN) {
@@ -395,21 +392,21 @@ struct QuantileSortTree {
 		index_tree->Build();
 
 		// Result is a constant LIST<CHILD_TYPE> with a fixed length
-		auto ldata = FlatVector::GetData<list_entry_t>(list);
+		auto ldata = FlatVector::GetDataMutable<list_entry_t>(list);
 		auto &lentry = ldata[lidx];
 		lentry.offset = ListVector::GetListSize(list);
 		lentry.length = bind_data.quantiles.size();
 
 		ListVector::Reserve(list, lentry.offset + lentry.length);
 		ListVector::SetListSize(list, lentry.offset + lentry.length);
-		auto &result = ListVector::GetEntry(list);
-		auto rdata = FlatVector::GetData<CHILD_TYPE>(result);
+		auto &result = ListVector::GetChildMutable(list);
+		auto rdata = FlatVector::GetDataMutable<CHILD_TYPE>(result);
 
 		using ID = QuantileIndirect<INPUT_TYPE>;
 		ID indirect(data);
 		for (const auto &q : bind_data.order) {
 			const auto &quantile = bind_data.quantiles[q];
-			Interpolator<DISCRETE> interp(quantile, n, false);
+			QuantileInterpolator<DISCRETE> interp(quantile, n, false);
 
 			const auto lo_data = SelectNth(frames, interp.FRN);
 			auto hi_data = lo_data;

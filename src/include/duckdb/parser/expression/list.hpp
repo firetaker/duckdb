@@ -1,5 +1,4 @@
 #include "duckdb/parser/expression/between_expression.hpp"
-#include "duckdb/parser/expression/bound_expression.hpp"
 #include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/collate_expression.hpp"
@@ -17,3 +16,4 @@
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
+#include "duckdb/parser/expression/type_expression.hpp"
